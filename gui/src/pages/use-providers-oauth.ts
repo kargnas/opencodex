@@ -84,7 +84,6 @@ export function useProvidersOAuth({
       if (data.url || data.instructions || data.deviceCode) {
         setLoginInfo({ provider, url: data.url, instructions: data.instructions, deviceCode: data.deviceCode });
       }
-      const baselineCount = accountSets[provider]?.accounts.length ?? 0;
       let finished = false;
       for (let i = 0; i < 150 && aliveRef.current && oauthLoginGenerationRef.current!.get(provider) === generation; i++) {
         await new Promise(r => setTimeout(r, 2000));
@@ -107,9 +106,13 @@ export function useProvidersOAuth({
           finished = true;
           break;
         }
-        const completed = addAccount || reauthTargetId
-          ? ((s.accounts?.length ?? 0) > baselineCount || s.done === true)
-          : (s.loggedIn || s.done === true);
+        // `done` is the only authoritative completion signal: the server flips the
+        // flow state to done=false on start and done=true (with `error` on failure)
+        // when it settles. The old `s.loggedIn` / accounts-count-over-baseline
+        // heuristics fired instantly for an already-logged-in provider (stale
+        // client cache race), closing the login modal before the user could even
+        // read the URL or device code.
+        const completed = s.done === true;
         if (completed) {
           setOauthStatus(prev => ({ ...prev, [provider]: s }));
           const target = reauthTargetId

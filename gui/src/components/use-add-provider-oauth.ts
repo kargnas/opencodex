@@ -57,14 +57,17 @@ export function useAddProviderOAuth({
         await new Promise(r => setTimeout(r, OAUTH_LOGIN_POLL_INTERVAL_MS));
         if (!aliveRef.current) return;
         const sRes = await fetch(`${apiBase}/api/oauth/status?provider=${providerId}`).catch(() => null);
-        const s = sRes ? await readJsonIfOk<{ loggedIn?: boolean; error?: string }>(sRes) : null;
+        const s = sRes ? await readJsonIfOk<{ loggedIn?: boolean; done?: boolean; error?: string }>(sRes) : null;
         if (!aliveRef.current) return;
         if (s?.error) {
           setOauthMsgTone("warn");
           setOauthMsg(t("modal.loginError", { error: s.error }));
           return;
         }
-        if (s?.loggedIn) { onAdded(providerId); return; }
+        // `done` (flow settled), not `loggedIn`: a pre-existing credential makes
+        // loggedIn true on the very first poll, which closed this pane before the
+        // user could act on the auth URL.
+        if (s?.done) { onAdded(providerId); return; }
       }
       setOauthMsgTone("warn");
       setOauthMsg(t("modal.loginTimeout"));

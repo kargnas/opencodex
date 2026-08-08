@@ -19,6 +19,7 @@ import {
 import CodexAccountPool from "../CodexAccountPool";
 import AnthropicAccountPoolSettings from "./AnthropicAccountPoolSettings";
 import { LoginUrlBlock } from "../login-url-block";
+import { ManualLoginCodeInput } from "../manual-login-code-input";
 import QuotaBars from "../QuotaBars";
 import { useCopyFeedback } from "../use-copy-feedback";
 import type { CodexAccountPoolController } from "../../hooks/useCodexAccountPool";
@@ -171,6 +172,13 @@ export default function ProviderAuthPanel({
                     </div>
                   )}
                   <LoginUrlBlock url={hintForThis.url ?? ""} />
+                  {/* Loopback-callback providers (e.g. Anthropic's fixed localhost:54545)
+                      can never reach a remote proxy — the pasted redirect URL is the only
+                      completion path there. Device-code flows finish on the provider site,
+                      so the paste field would be dead weight. */}
+                  {hintForThis.url && !hintForThis.deviceCode && (
+                    <ManualLoginCodeInput apiBase={apiBase} provider={item.name} />
+                  )}
                   {authHandlers.onCancelLogin && (
                     <button type="button" className="btn btn-ghost btn-sm" onClick={() => void authHandlers.onCancelLogin?.(item.name)}>
                       {t("common.cancel")}

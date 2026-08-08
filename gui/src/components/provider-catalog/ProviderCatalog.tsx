@@ -6,6 +6,8 @@
  */
 import { useMemo, useState } from "react";
 import { useT } from "../../i18n/shared";
+import { LoginUrlBlock } from "../login-url-block";
+import { ManualLoginCodeInput } from "../manual-login-code-input";
 import {
   bucketPresets,
   filterPresets,
@@ -13,6 +15,7 @@ import {
 } from "./provider-presets";
 
 export type AccountLoginStatus = { loggedIn: boolean; email?: string; error?: string; needsReauth?: boolean };
+export type AccountLoginHint = { provider: string; url?: string; instructions?: string; deviceCode?: string };
 export type AccountLoginRow = {
   id: string;
   label: string;
@@ -38,6 +41,8 @@ export default function ProviderCatalog({
   accountRows = EMPTY_ACCOUNT_ROWS,
   accountStatus = EMPTY_ACCOUNT_STATUS,
   busyProvider = null,
+  loginHint = null,
+  apiBase,
   onLogin,
   onCancelLogin,
   onLogout,
@@ -52,6 +57,13 @@ export default function ProviderCatalog({
   accountRows?: AccountLoginRow[];
   accountStatus?: Record<string, AccountLoginStatus>;
   busyProvider?: string | null;
+  /** In-flight OAuth login response (auth URL / device code) for a row on this tab.
+   * Without it the Accounts tab used to swallow the login start entirely — the
+   * URL/device code only ever rendered on the provider detail card, so logging in
+   * from this modal looked like a no-op. */
+  loginHint?: AccountLoginHint | null;
+  /** Needed by the manual redirect-URL paste fallback (POST /api/oauth/login/code). */
+  apiBase?: string;
   onLogin?: (provider: string) => void;
   onCancelLogin?: (provider: string) => void;
   onLogout?: (provider: string) => void;
@@ -149,11 +161,32 @@ export default function ProviderCatalog({
           const statusText = loggedIn
             ? (status?.email ?? row.statusLabel ?? t("modal.accountLoggedIn"))
             : (status?.error ?? row.statusLabel ?? t("modal.accountLoggedOut"));
+          const hintForRow = row.kind === "oauth" && busy && loginHint?.provider === row.id ? loginHint : null;
           return (
             <div key={row.id} className="list-row provider-catalog-account-row">
-              <div>
+              <div style={{ minWidth: 0, flex: 1 }}>
                 <div className="title">{row.label}</div>
                 <div className="sub">{statusText}</div>
+                {/* An already-logged-in row keeps its "Add account" login path here in
+                    the modal, so the in-flight URL/device code must render here too —
+                    the detail card that used to own this hint isn't on screen. */}
+                {hintForRow && (
+                  <div style={{ display: "flex", flexDirection: "column", gap: 8, marginTop: 8 }}>
+                    {hintForRow.deviceCode && (
+                      <div className="pwi-device-code-wrap">
+                        <span>{t("prov.deviceCode")}</span>
+                        <code className="pwi-device-code">{hintForRow.deviceCode}</code>
+                      </div>
+                    )}
+                    {hintForRow.instructions && (
+                      <div className="muted text-label">{hintForRow.instructions}</div>
+                    )}
+                    <LoginUrlBlock url={hintForRow.url ?? ""} />
+                    {apiBase && hintForRow.url && !hintForRow.deviceCode && (
+                      <ManualLoginCodeInput apiBase={apiBase} provider={row.id} />
+                    )}
+                  </div>
+                )}
               </div>
               <div className="provider-catalog-badges">
                 {row.kind === "key" ? null : row.kind === "codex" ? (
@@ -171,10 +204,15 @@ export default function ProviderCatalog({
                       </button>
                     )}
                   </>
-                ) : loggedIn ? (
-                  onLogout && <button type="button" className="btn btn-ghost" onClick={() => onLogout(row.id)}>{t("modal.accountLogout")}</button>
                 ) : busy ? (
                   onCancelLogin && <button type="button" className="btn btn-ghost" onClick={() => onCancelLogin(row.id)}>{t("common.cancel")}</button>
+                ) : loggedIn ? (
+                  <>
+                    {onLogin && (
+                      <button type="button" className="btn btn-ghost" onClick={() => onLogin(row.id)}>{t("modal.accountAdd")}</button>
+                    )}
+                    {onLogout && <button type="button" className="btn btn-ghost" onClick={() => onLogout(row.id)}>{t("modal.accountLogout")}</button>}
+                  </>
                 ) : (
                   onLogin && <button type="button" className="btn btn-primary" onClick={() => onLogin(row.id)}>{t("modal.accountLogin")}</button>
                 )}

@@ -11,7 +11,7 @@ import {
 import { oauthTosRisk } from "../oauth-tos-risk";
 import OAuthTosWarningModal from "./OAuthTosWarningModal";
 import ProviderCatalog from "./provider-catalog/ProviderCatalog";
-import type { AccountLoginRow, AccountLoginStatus } from "./provider-catalog/ProviderCatalog";
+import type { AccountLoginHint, AccountLoginRow, AccountLoginStatus } from "./provider-catalog/ProviderCatalog";
 import type { CatalogPreset } from "./provider-catalog/provider-presets";
 import { baseUrlForChoice, matchChoiceId, resolvedBaseUrlForChoice } from "../base-url-choice";
 import { AddProviderOAuthPane } from "./add-provider-oauth-pane";
@@ -28,7 +28,7 @@ type Preset = CatalogPreset;
 
 export default function AddProviderModal({
   apiBase, existingNames, onClose, onAdded, initialTier, initialCustom = false,
-  accountRows, accountStatus, accountBusy, onAccountLogin, onAccountCancelLogin, onAccountLogout, onOpen,
+  accountRows, accountStatus, accountBusy, accountLoginHint, onAccountLogin, onAccountCancelLogin, onAccountLogout, onOpen,
 }: {
   apiBase: string;
   existingNames: string[];
@@ -39,6 +39,8 @@ export default function AddProviderModal({
   accountRows?: AccountLoginRow[];
   accountStatus?: Record<string, AccountLoginStatus>;
   accountBusy?: string | null;
+  /** In-flight OAuth login (URL/device code) started from an Accounts-tab row. */
+  accountLoginHint?: AccountLoginHint | null;
   onAccountLogin?: (provider: string) => void;
   onAccountCancelLogin?: (provider: string) => void;
   onAccountLogout?: (provider: string) => void;
@@ -246,6 +248,8 @@ export default function AddProviderModal({
             accountRows={accountRows}
             accountStatus={accountStatus}
             busyProvider={accountBusy}
+            loginHint={accountLoginHint}
+            apiBase={apiBase}
             onLogin={onAccountLogin}
             onCancelLogin={onAccountCancelLogin}
             onLogout={onAccountLogout}

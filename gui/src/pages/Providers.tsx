@@ -253,7 +253,9 @@ export default function Providers({ apiBase }: { apiBase: string }) {
     }
     // API-key rows have no OAuth login path (catalog hides the button).
     if (config.providers[provider]?.authMode === "oauth" || oauthProviders.includes(provider)) {
-      requestLoginOAuth(provider);
+      // Logged-in row → this click means "add another account": force a fresh
+      // browser identity, or the server would just re-import the existing token.
+      requestLoginOAuth(provider, accountLoginStatus[provider]?.loggedIn === true);
     }
   };
 
@@ -345,6 +347,7 @@ export default function Providers({ apiBase }: { apiBase: string }) {
         busy={busy}
         addModalAccountRows={addModalAccountRows}
         accountLoginStatus={accountLoginStatus}
+        accountLoginHint={loginInfo}
         removeConfirmName={removeConfirmName}
         removeDefaultProvider={removeConfirmName === config.defaultProvider
           ? Object.entries(config.providers).find(([name, provider]) => name !== removeConfirmName && provider.disabled !== true)?.[0] ?? null
