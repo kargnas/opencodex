@@ -438,6 +438,14 @@ function readLinuxProcStartMs(pid: number): number | null {
   }
 }
 
+/**
+ * `LC_ALL=C` is load-bearing, not hygiene: `ps lstart` renders through `LC_TIME`,
+ * so a non-English locale emits e.g. `2026년 8월 8일 토요일 19시 22분 50초`, which
+ * `Date.parse` returns NaN for. Every start time then reads as null and the caller
+ * degrades to `unknown`, permanently suppressing v2 spawn_agent model guidance.
+ */
+const psCLocaleEnv = (): NodeJS.ProcessEnv => ({ ...process.env, LC_ALL: "C" });
+
 /** `ps` lstart → epoch ms, or null (macOS). */
 function readDarwinProcStartMs(pid: number): number | null {
   try {
@@ -445,6 +453,7 @@ function readDarwinProcStartMs(pid: number): number | null {
       encoding: "utf-8",
       stdio: ["ignore", "pipe", "ignore"],
       timeout: 4_000,
+      env: psCLocaleEnv(),
     }).trim();
     if (!out) return null;
     const parsed = Date.parse(out);
@@ -494,6 +503,7 @@ export function readProcessStartMsBatch(
         encoding: "utf-8",
         stdio: ["ignore", "pipe", "ignore"],
         timeout: 3_000,
+        env: psCLocaleEnv(),
       });
       const byPid = new Map<number, number>();
       for (const raw of stdout.split(/\r?\n/)) {

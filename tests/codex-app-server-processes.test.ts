@@ -11,6 +11,7 @@ import {
   isWindowsCodexCandidateCommandLine,
   listCodexAppServerProcesses,
   listWindowsSnapshots,
+  readProcessStartMsBatch,
   resetCodexAppServerCatalogStateCache,
   restartCodexAppServers,
   STALE_CODEX_APP_SERVER_HINT,
@@ -105,6 +106,30 @@ describe("collectCodexAppServerCatalogState (#857)", () => {
     });
     expect(status.state).toBe("stale");
   });
+
+  // `ps lstart` renders through LC_TIME. Under ko_KR/ja_JP/zh_CN the output is
+  // `2026년 8월 8일 토요일 19시 22분 50초`, which Date.parse rejects — every start
+  // time reads null, the state degrades to `unknown`, and v2 spawn_agent guidance
+  // stays permanently suppressed on non-English macOS.
+  test.skipIf(process.platform !== "darwin")(
+    "reads a real start time regardless of the host LC_TIME locale",
+    () => {
+      const previous = { LC_ALL: process.env.LC_ALL, LANG: process.env.LANG, LC_TIME: process.env.LC_TIME };
+      process.env.LC_ALL = "ko_KR.UTF-8";
+      process.env.LANG = "ko_KR.UTF-8";
+      process.env.LC_TIME = "ko_KR.UTF-8";
+      try {
+        const own = readProcessStartMsBatch([process.pid], "darwin").get(process.pid);
+        expect(own).not.toBeNull();
+        expect(Number.isFinite(own!)).toBe(true);
+      } finally {
+        for (const [key, value] of Object.entries(previous)) {
+          if (value === undefined) delete process.env[key];
+          else process.env[key] = value;
+        }
+      }
+    },
+  );
 });
 
 describe("Codex app-server process matching (#476)", () => {
