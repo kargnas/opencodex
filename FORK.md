@@ -18,6 +18,13 @@ upstream을 주기적으로 merge해서 버전을 따라간다. upstream이 고�
   완료 오탐(`loggedIn`/계정수 baseline)으로 모달 즉사 → `done` 판정으로 교체
   ③ loopback 콜백(Anthropic localhost:54545) 리다이렉트 URL 수동 paste 입력을
   워크스페이스 패널·모달 계정 행에 추가.
+- `fix(codex): keep Darwin ps timestamps locale-independent` — macOS의 `/bin/ps lstart`
+  출력을 `LC_ALL=C`로 고정해서 비영어 locale에서도 Codex 프로세스 시작 시각을 읽는다.
+
+## 동기화 이력
+
+- 2026-08-11 — upstream `v2.12.0`을 병합했다. OAuth GUI 패치는 새 계정 관리 UI와
+  결합했고, macOS locale 패치는 그대로 유지했다.
 
 ## upstream 동기화 절차
 
