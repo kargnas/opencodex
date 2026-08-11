@@ -91,14 +91,18 @@ export function codexWsUpstreamFetch(
     }, UPGRADE_DEADLINE_MS);
 
     const onAbort = () => {
-      try { ws.close(); } catch { /* already closing */ }
       if (!opened) {
         if (settledPreOpen) return;
+        // Settle BEFORE close(): the close handler treats a pre-open close as
+        // an upgrade rejection and would dial the SSE fallback for a request
+        // the caller just cancelled.
         settledPreOpen = true;
         clearTimeout(upgradeTimer);
+        try { ws.close(); } catch { /* already closing */ }
         reject(signal?.reason ?? new DOMException("The operation was aborted.", "AbortError"));
         return;
       }
+      try { ws.close(); } catch { /* already closing */ }
       if (controller && !terminal) {
         terminal = true;
         // Mirror an aborted fetch: the body read rejects with the abort reason.
