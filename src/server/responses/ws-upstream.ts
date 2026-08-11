@@ -46,7 +46,7 @@ export function codexWsUpstreamFetch(
     // The WS create frame is implicitly streaming; the backend rejects the
     // HTTP-only `stream` flag inside a frame.
     delete body.stream;
-    frameText = JSON.stringify({ type: "response.create", ...body });
+    frameText = JSON.stringify({ ...body, type: "response.create" });
   } catch {
     return sseFallback(url, init);
   }
