@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { buildCatalogEntries } from "../src/codex/catalog";
-import { getJawcodeModelMetadata, resolveJawcodeProvider } from "../src/generated/jawcode-model-metadata";
+import { getModelMetadata, resolveMetadataProvider } from "../src/generated/model-metadata";
 import { buildInitProviders } from "../src/cli/init";
 import { OAUTH_PROVIDERS } from "../src/oauth";
 import { enrichProviderFromCatalog, KEY_LOGIN_PROVIDERS } from "../src/oauth/key-providers";
@@ -31,7 +31,7 @@ function nativeTemplate(): Record<string, unknown> {
 
 const EXPECTED_KEY_PROVIDER_IDS = [
   "anthropic-apikey", "openai-apikey", "umans", "opencode-go", "neuralwatt", "openrouter", "cline-pass", "cline", "orcarouter", "bizrouter", "groq", "google", "google-vertex", "azure-openai",
-  "deepseek", "cerebras", "deepinfra", "hyperbolic", "nscale", "vultr", "baseten", "commandcode", "sambanova", "nebius", "digitalocean", "scaleway", "together", "fireworks", "firepass", "moonshot",
+  "deepseek", "cerebras", "chutes", "deepinfra", "hyperbolic", "nscale", "vultr", "baseten", "commandcode", "sambanova", "nebius", "digitalocean", "scaleway", "featherless", "together", "fireworks", "firepass", "moonshot",
   "huggingface", "nvidia", "venice", "zai", "zhipu-bigmodel", "zhipu-bigmodel-coding", "nanogpt", "synthetic", "siliconflow", "qwen-cloud", "tencent-coding-plan",
   "volcengine", "volcengine-coding-plan", "volcengine-agent-plan", "qianfan", "alibaba", "alibaba-token-plan", "alibaba-token-plan-intl", "parallel", "zenmux", "litellm", "ollama-cloud", "mistral",
   "minimax", "minimax-cn", "kimi-code", "opencode-zen", "vercel-ai-gateway",
@@ -234,8 +234,8 @@ describe("provider registry parity", () => {
       baseUrl: "https://api.deepseek.com",
       defaultModel: "deepseek-v4-flash",
       modelContextWindows: {
-        "deepseek-v4-flash": 1_000_000,
-        "deepseek-v4-pro": 1_000_000,
+        "deepseek-v4-flash": 1_048_576,
+        "deepseek-v4-pro": 1_048_576,
       },
     });
 
@@ -290,8 +290,9 @@ describe("provider registry parity", () => {
         "qwen3.7-max": ["text", "image"],
       },
       modelReasoningEfforts: {
-        "qwen3.8-max": ["low", "medium", "high", "xhigh", "max"],
+        "qwen3.8-max": ["low", "medium", "xhigh"],
       },
+      modelDefaultReasoningEfforts: { "qwen3.8-max": "xhigh" },
       modelContextWindows: {
         "qwen3.8-max": 983_616,
         "qwen3.7-max": 1_000_000,
@@ -300,8 +301,12 @@ describe("provider registry parity", () => {
       noVisionModels: ["glm-5.2", "deepseek-v4-pro"],
       preserveReasoningContentModels: expect.arrayContaining(["qwen3.8-max", "qwen3.7-max", "qwen3.7-plus"]),
     });
+    expect(PROVIDER_REGISTRY.find(entry => entry.id === "alibaba-token-plan")?.directReasoningEffortModels)
+      .toEqual(["qwen3.8-max"]);
     expect(KEY_LOGIN_PROVIDERS["alibaba-token-plan"].thinkingBudgetModels)
-      .toContain("qwen3.8-max");
+      .not.toContain("qwen3.8-max");
+    expect(KEY_LOGIN_PROVIDERS["alibaba-token-plan"].thinkingBudgetModels)
+      .toContain("qwen3.7-max");
   });
 
   test("aggregator defaults and Neuralwatt seeds match the audited live catalogs", () => {
@@ -640,9 +645,9 @@ describe("provider registry parity", () => {
     expect(OAUTH_PROVIDERS.xai.providerConfig.modelReasoningEfforts?.["grok-4.5"]).toEqual(["low", "medium", "high"]);
     expect(OAUTH_PROVIDERS.xai.providerConfig.noVisionModels).toContain("grok-build-0.1");
     const antigravityRegistry = PROVIDER_REGISTRY.find(entry => entry.id === "google-antigravity");
-    expect(antigravityRegistry?.liveModels).toBe(false);
-    expect(providerConfigSeed(antigravityRegistry!).liveModels).toBe(false);
-    expect(OAUTH_PROVIDERS["google-antigravity"].providerConfig.liveModels).toBe(false);
+    expect(antigravityRegistry?.liveModels).toBe(true);
+    expect(providerConfigSeed(antigravityRegistry!).liveModels).toBe(true);
+    expect(OAUTH_PROVIDERS["google-antigravity"].providerConfig.liveModels).toBe(true);
     expect(OAUTH_PROVIDERS["google-antigravity"].providerConfig.defaultModel).toBe("gemini-3.6-flash");
     // Collapsed picker: base models only, no effort-suffix variants.
     expect(OAUTH_PROVIDERS["google-antigravity"].providerConfig.models).toContain("gemini-3.6-flash");
@@ -761,14 +766,18 @@ describe("provider registry parity", () => {
       "google-antigravity": "google",
       "antigravity": "google",
       "gemini-antigravity": "google",
+      deepseek: "deepseek",
       moonshot: "moonshot",
       minimax: "minimax",
       "minimax-cn": "minimax",
       "zhipu-bigmodel": "zai",
       "zhipu-bigmodel-coding": "zai",
     });
-    expect(resolveJawcodeProvider("gemini")).toBe("google");
-    expect(resolveJawcodeProvider("minimax-cn")).toBe("minimax");
+    expect(resolveMetadataProvider("gemini")).toBe("google");
+    expect(resolveMetadataProvider("minimax-cn")).toBe("minimax");
+    expect(resolveMetadataProvider("deepseek")).toBe("deepseek");
+    // User-saved provider keys can be title-cased ("DeepSeek"); alias lookup folds case.
+    expect(resolveMetadataProvider("DeepSeek")).toBe("deepseek");
   });
 
   test("legacy azure adapter spelling remains accepted", () => {
@@ -782,8 +791,8 @@ describe("provider registry parity", () => {
   });
 
   test("MiniMax metadata lookup tolerates routed lowercase ids", () => {
-    expect(getJawcodeModelMetadata("minimax", "MiniMax-M2.5")?.contextWindow).toBe(204_800);
-    expect(getJawcodeModelMetadata("minimax", "minimax-m2.5")).toBeUndefined();
+    expect(getModelMetadata("minimax", "MiniMax-M2.5")?.contextWindow).toBe(204_800);
+    expect(getModelMetadata("minimax", "minimax-m2.5")).toBeUndefined();
 
     const entries = buildCatalogEntries(nativeTemplate(), [], [
       { provider: "minimax", id: "minimax-m2.5" },

@@ -2,7 +2,11 @@
 import { spawn } from "node:child_process";
 import { currentExternalCodexModelProvider, restoreNativeCodex, restoreNativeCodexAsync, shouldInjectApiAuthHeader } from "../codex/inject";
 import { stripGrokConfig } from "../grok/inject";
-import { resolveCodexHistoryJobTarget, runCodexHistoryJob } from "../codex/history-job";
+import {
+  describeHistoryJobFailure,
+  resolveCodexHistoryJobTarget,
+  runCodexHistoryJob,
+} from "../codex/history-job";
 import { reconcileJournal } from "../codex/journal";
 import {
   codexAutoStartEnabled,
@@ -36,7 +40,7 @@ import { findAvailablePort, isAddrInUse, PortUnavailableError, shouldPersistSele
 import { findLiveProxy, probeHostname, type LiveProxy } from "../server/proxy-liveness";
 import { createReadinessGate } from "../server/readiness";
 import { parseReadyArgs, runReady, type ReadyArgs } from "./ready";
-import { stopProxy } from "../lib/process-control";
+import { ProxyOwnershipRefusedError, stopProxy } from "../lib/process-control";
 import { loadServiceTokenFromFile } from "../lib/service-secrets";
 import { diagnoseService, isServiceOwnershipError, serviceCommand, serviceEnvironmentOwnedHere, serviceStartableFromTray, serviceStatusSummary, stopServiceIfInstalled, uninstallServiceIfInstalled } from "../service";
 import { startupHealthSummary } from "../codex/autostart-health";
@@ -215,6 +219,22 @@ async function chooseListenPort(requestedPort?: number): Promise<number> {
   }
 }
 
+async function findProxyOwnerBeforeJournalRecovery(
+  options: { probeConfiguredPort?: boolean } = {},
+): Promise<{ live: LiveProxy | null; pidSnapshot: number | null }> {
+  const pidSnapshot = readPidFileValue();
+  const hasRuntimeOwner = readRuntimePort() !== null;
+  const shouldProbe = pidSnapshot !== null || hasRuntimeOwner || options.probeConfiguredPort === true;
+  const live = shouldProbe ? await findLiveProxy() : null;
+  if (live) return { live, pidSnapshot };
+
+  // The probe established that the snapshotted owner is stale. Compare before
+  // deleting so a concurrent start that rewrote the PID file keeps its state.
+  removePidIfValueIs(pidSnapshot);
+  if (!currentExternalCodexModelProvider()) reconcileJournal();
+  return { live: null, pidSnapshot };
+}
+
 async function handleStart(options: { block?: boolean } = {}) {
   // Native (WinSW) service mode has no batch wrapper to read the service token file
   // into the environment, so the app loads it here before the server binds. The server
@@ -222,15 +242,10 @@ async function handleStart(options: { block?: boolean } = {}) {
   const serviceToken = loadServiceTokenFromFile(process.env);
   if (serviceToken) process.env.OPENCODEX_API_AUTH_TOKEN = serviceToken;
   const requestedPort = parsePortOption();
-  if (!currentExternalCodexModelProvider()) reconcileJournal();
-  const existingPid = readPid();
-  if (existingPid) {
-    const live = await findLiveProxy();
-    if (live) {
-      console.error(`⚠️  Proxy already running (PID ${live.pid ?? existingPid}, port ${live.port}). Use 'ocx stop' first.`);
-      process.exit(1);
-    }
-    removePid(existingPid);
+  const owner = await findProxyOwnerBeforeJournalRecovery();
+  if (owner.live) {
+    console.error(`⚠️  Proxy already running (PID ${owner.live.pid ?? owner.pidSnapshot ?? "unknown"}, port ${owner.live.port}). Use 'ocx stop' first.`);
+    process.exit(1);
   }
 
   // Interactive-only update prompt. Must run BEFORE we bind a port / write a
@@ -438,13 +453,13 @@ function detachedStartEnvironment(): NodeJS.ProcessEnv {
 }
 
 async function handleEnsure(options: { existingIsSuccess?: boolean } = {}): Promise<boolean> {
-  if (!currentExternalCodexModelProvider()) reconcileJournal();
+  const owner = await findProxyOwnerBeforeJournalRecovery({ probeConfiguredPort: true });
   const config = loadConfig();
   if (!codexAutoStartEnabled(config)) {
     console.log("Codex autostart is disabled.");
     return false;
   }
-  const live = await findLiveProxy();
+  const live = owner.live;
   if (live) {
     if (options.existingIsSuccess === false) {
       console.error("Proxy appeared while restart was confirming absence; no start was attempted.");
@@ -675,6 +690,10 @@ async function handleStop() {
       // exact teardown the refusal exists to prevent.
       const detail = err instanceof Error ? err.message : String(err);
       if (detail) console.error(`   ${detail}`);
+      if (err instanceof ProxyOwnershipRefusedError) {
+        ownershipBlocked = true;
+        console.error("   Skipping shared teardown (native Codex restore, Grok config): the foreign proxy is still running.");
+      }
     }
   } else {
     // Snapshot the stale on-disk state BEFORE the async probe: a concurrent `ocx start`
@@ -693,6 +712,10 @@ async function handleStop() {
         console.error(`❌ Failed to stop proxy (PID ${live.pid}).`);
         const detail = err instanceof Error ? err.message : String(err);
         if (detail) console.error(`   ${detail}`);
+        if (err instanceof ProxyOwnershipRefusedError) {
+          ownershipBlocked = true;
+          console.error("   Skipping shared teardown (native Codex restore, Grok config): the foreign proxy is still running.");
+        }
       }
     } else if (!stoppedService) {
       console.log("No running proxy found.");
@@ -899,7 +922,7 @@ async function handleRecoverHistory() {
     : { rows: 0, files: 0, failed: true as const };
   if (r.failed) {
     console.error(
-      "⚠️  Recovery SKIPPED: the Codex history DB is locked (Codex app/IDE open?). Close it and rerun this command.",
+      `⚠️  Recovery SKIPPED: ${describeHistoryJobFailure(outcome, "recover-legacy")}`,
     );
     process.exit(1);
   }
@@ -1148,11 +1171,16 @@ switch (command) {
     break;
   }
   case "codex-shim": {
-    const { codexShimStatus, installCodexShim, uninstallCodexShim } = await import("../codex/shim");
+    const { codexShimStatus, diagnoseCodexShim, installCodexShim, uninstallCodexShim } = await import("../codex/shim");
     switch (args[1]) {
       case "install": {
         const r = installCodexShim();
-        console.log(r.installed ? `✅ ${r.message}` : `⚠️  ${r.message}`);
+        const { collectCodexShimReadinessWarnings } = await import("./codex-shim-readiness");
+        const warnings = diagnoseCodexShim().healthy
+          ? collectCodexShimReadinessWarnings()
+          : [];
+        console.log(`${r.installed && warnings.length === 0 ? "✅ " : "⚠️  "}${r.message}`);
+        for (const warning of warnings) console.warn(`   ${warning}`);
         break;
       }
       case "status":
@@ -1337,6 +1365,11 @@ switch (command) {
   case "config": {
     const { handleConfigCommand } = await import("./config-command");
     process.exitCode = await handleConfigCommand(args.slice(1));
+    break;
+  }
+  case "lab": {
+    const { handleLabCommand } = await import("./lab");
+    process.exitCode = await handleLabCommand(args.slice(1));
     break;
   }
   case "claude": {

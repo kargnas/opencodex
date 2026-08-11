@@ -28,7 +28,7 @@ type Preset = CatalogPreset;
 
 export default function AddProviderModal({
   apiBase, existingNames, onClose, onAdded, initialTier, initialCustom = false,
-  accountRows, accountStatus, accountBusy, accountLoginHint, onAccountLogin, onAccountCancelLogin, onAccountLogout, onOpen,
+  accountRows, accountStatus, accountBusy, accountLoginHint, onAccountLogin, onAccountCancelLogin, onAccountLogout, onAccountManage, onOpen,
 }: {
   apiBase: string;
   existingNames: string[];
@@ -41,9 +41,10 @@ export default function AddProviderModal({
   accountBusy?: string | null;
   /** In-flight OAuth login (URL/device code) started from an Accounts-tab row. */
   accountLoginHint?: AccountLoginHint | null;
-  onAccountLogin?: (provider: string) => void;
+  onAccountLogin?: (provider: string, addAccount?: boolean) => void;
   onAccountCancelLogin?: (provider: string) => void;
   onAccountLogout?: (provider: string) => void;
+  onAccountManage?: (provider: string) => void;
   onOpen?: () => void;
 }) {
   const t = useT();
@@ -253,6 +254,7 @@ export default function AddProviderModal({
             onLogin={onAccountLogin}
             onCancelLogin={onAccountCancelLogin}
             onLogout={onAccountLogout}
+            onManage={onAccountManage}
           />
         ) : form && (
           preset.auth === "oauth" && form.authMode === "oauth" ? (

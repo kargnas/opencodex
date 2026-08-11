@@ -25,12 +25,11 @@ import { getCodexHome } from "../codex/paths";
 import { shouldSyncCodexOnStart } from "../codex/desired-state";
 import { inspectNativeCodexOwnership } from "../integrations/native/ownership-preflight";
 import { registerCodexCooldownRecoveryProbeWorker } from "../codex/auth-api";
-import { startMemoryWatchdog } from "./memory-watchdog";
 import {
   reconcileLiveStateStores,
   setLiveStateStoreConfig,
 } from "../lib/state-store-registrations";
-import { startStateStoreSweeper } from "../lib/state-store-sweeper";
+import { startUserCostOverlayReconciler } from "../usage/user-cost-overlay-reconciler";
 import {
   configureAppOwnedMemoryBudget,
   enforceAppOwnedMemoryBudget,
@@ -41,9 +40,7 @@ import {
   registerDefaultAppOwnedMemoryStores,
   registerDefaultAppOwnedObservedBuffers,
 } from "../lib/app-owned-memory-stores";
-import { setStorageCleanupPolicyLiveSink } from "../storage/policy";
-import { setStorageCleanupPolicyJobLiveApply } from "../storage/policy-job";
-import { scheduleStorageCleanupStartupRun, startStorageCleanupScheduler } from "../storage/policy-scheduler";
+import { acquireServerBackgroundLifecycle } from "./background-lifecycle";
 import { runOpenAiTierStartupMigration } from "../providers/openai-tier-startup";
 import { runAlibabaRegionStartupMigration } from "../providers/alibaba-region-startup";
 import { isCanonicalOpenAiForwardProvider } from "../providers/openai-tiers";
@@ -189,10 +186,41 @@ import {
 import { SYSTEM_RESTART_CAPABILITY_VERSION } from "../lib/system-restart-contract";
 import { createReadinessGate, type ReadinessGate } from "./readiness";
 
-const MAX_WS_FRAME_BYTES = 50 * 1024 * 1024;
+export const MAX_WS_FRAME_BYTES = 50 * 1024 * 1024;
 const WEBSOCKET_IDLE_TIMEOUT_SECONDS = 0;
 const LIVE_SIDEBAND_PENDING_MAX = 32;
+const LIVE_SIDEBAND_PENDING_BYTES_MAX = 1024 * 1024;
 const LIVE_SIDEBAND_CLOSE_FALLBACK_MS = 1_000;
+
+export function exceedsLiveSidebandFrameByteLimit(frameBytes: number): boolean {
+  return frameBytes > MAX_WS_FRAME_BYTES;
+}
+
+export function exceedsLiveSidebandPendingByteLimit(pendingBytes: number, incomingBytes: number): boolean {
+  return incomingBytes > LIVE_SIDEBAND_PENDING_BYTES_MAX - pendingBytes;
+}
+
+function webSocketFrameBytes(frame: string | ArrayBuffer | ArrayBufferView | Blob | Buffer): number {
+  if (typeof frame === "string") return Buffer.byteLength(frame);
+  if (frame instanceof ArrayBuffer || ArrayBuffer.isView(frame)) return frame.byteLength;
+  return frame.size;
+}
+
+export type LiveSidebandPendingEnqueueResult = "queued" | "too-many-frames" | "too-many-bytes";
+
+export function enqueueLiveSidebandPendingFrame(
+  data: Pick<WsData, "livePending" | "livePendingBytes">,
+  frame: string | Buffer,
+  frameBytes = webSocketFrameBytes(frame),
+): LiveSidebandPendingEnqueueResult {
+  const pending = data.livePending ?? (data.livePending = []);
+  if (pending.length >= LIVE_SIDEBAND_PENDING_MAX) return "too-many-frames";
+  const pendingBytes = data.livePendingBytes ?? 0;
+  if (exceedsLiveSidebandPendingByteLimit(pendingBytes, frameBytes)) return "too-many-bytes";
+  pending.push(frame);
+  data.livePendingBytes = pendingBytes + frameBytes;
+  return "queued";
+}
 
 type LiveSidebandWebSocketFactory = (
   url: string,
@@ -204,6 +232,22 @@ function releaseLiveSidebandAdmission(ws: ServerWebSocket<WsData>): void {
   ws.data.liveTurnAdmissionLease = undefined;
 }
 
+/**
+ * Send one live-sideband frame to the upstream socket.
+ *
+ * Bun's `WebSocket.send` accepts `string | Blob | BufferSource`, but the DOM-lib
+ * `Buffer` can be backed by a `SharedArrayBuffer`, which `BufferSource` rejects.
+ * `Uint8Array.from` copies into a fresh `ArrayBuffer`-backed view, so a frame
+ * arriving from `node:buffer` still round-trips byte-for-byte.
+ */
+function sendUpstreamFrame(upstream: WebSocket, frame: string | Buffer): void {
+  if (typeof frame === "string") {
+    upstream.send(frame);
+    return;
+  }
+  upstream.send(Uint8Array.from(frame));
+}
+
 function finalizeLiveSideband(ws: ServerWebSocket<WsData>, upstream?: WebSocket): void {
   if (upstream && ws.data.liveUpstream !== upstream) return;
   if (ws.data.liveCloseFallback !== undefined) {
@@ -212,6 +256,7 @@ function finalizeLiveSideband(ws: ServerWebSocket<WsData>, upstream?: WebSocket)
   }
   ws.data.liveUpstream = undefined;
   ws.data.livePending = undefined;
+  ws.data.livePendingBytes = undefined;
   ws.data.cancel = undefined;
   releaseLiveSidebandAdmission(ws);
 }
@@ -236,7 +281,10 @@ function armLiveSidebandCloseFallback(ws: ServerWebSocket<WsData>, upstream: Web
     // close event. That is still an observed CLOSED transport and is safe to
     // finalize. CONNECTING/CLOSING peers keep the lease so profile switching
     // fails at its own bounded drain deadline instead of racing live traffic.
-    if (upstream.readyState === WebSocket.CLOSED) finalizeLiveSideband(ws, upstream);
+    // The earlier CLOSED check narrowed `readyState` to 0|1|2 in the type
+    // system, but the socket can still transition to CLOSED (3) before this
+    // fallback fires; the cast keeps the runtime-identical check.
+    if ((upstream.readyState as number) === 3) finalizeLiveSideband(ws, upstream);
   }, LIVE_SIDEBAND_CLOSE_FALLBACK_MS);
 }
 
@@ -244,9 +292,12 @@ function closeLiveSideband(ws: ServerWebSocket<WsData>, code = 1000, reason = ""
   if (ws.data.liveClosing) return;
   ws.data.liveClosing = true;
   ws.data.livePending = undefined;
+  ws.data.livePendingBytes = undefined;
   ws.data.cancel = undefined;
   const upstream = ws.data.liveUpstream;
-  if (!upstream || upstream.readyState === WebSocket.CLOSED) {
+  // Bun's `WebSocket` type narrows `readyState` to 0|1|2 even though the DOM
+  // constant CLOSED is 3; the numeric literal is the runtime-identical check.
+  if (!upstream || upstream.readyState === 3) {
     finalizeLiveSideband(ws, upstream);
   } else {
     // The sideband holds a native-main admission lease. Do not release it just
@@ -297,9 +348,10 @@ function attachLiveSidebandUpstream(
     ws.data.liveOpened = true;
     const pending = ws.data.livePending ?? [];
     ws.data.livePending = undefined;
+    ws.data.livePendingBytes = undefined;
     for (const frame of pending) {
       try {
-        upstream.send(frame);
+        sendUpstreamFrame(upstream, frame);
       } catch {
         closeLiveSideband(ws, 1011, "upstream send failed");
         return;
@@ -309,6 +361,10 @@ function attachLiveSidebandUpstream(
   upstream.addEventListener("message", (event) => {
     if (ws.data.liveUpstream !== upstream || ws.data.liveClosing) return;
     try {
+      if (exceedsLiveSidebandFrameByteLimit(webSocketFrameBytes(event.data))) {
+        closeLiveSideband(ws, 1009, "message too large");
+        return;
+      }
       logLiveSidebandFrame("u2c", event.data);
       if (typeof event.data === "string") ws.send(event.data);
       else if (event.data instanceof ArrayBuffer) ws.send(event.data);
@@ -405,6 +461,7 @@ export function startServer(port?: number, deps: StartServerDeps = {}): Server<W
   applyProxyEnv(config);
   assertServerAuthConfig(config);
   const managementAuth = deps.managementAuthState ?? initializeManagementAuthState(config);
+  let userCostOverlayReconciler: { stop(): void } | null = null;
   // Arm synchronously before listen. A pending journal therefore makes __main__ unusable
   // before any request can resolve its physical credential, while health/management/Pool stay live.
   // Refresh OAuth provider presets (models/noReasoningModels) from the registry so a proxy update
@@ -465,16 +522,12 @@ export function startServer(port?: number, deps: StartServerDeps = {}): Server<W
   // usage.jsonl already persists every request; rehydrate the in-memory Logs ring so
   // /api/logs (and the GUI) survive `ocx stop` / `ocx start` process restarts.
   hydrateRequestLogsFromDisk();
-  // #314: warn-only RSS observability (unref'd, idempotent — safe under repeated
-  // startServer(0) in tests). Snapshot surfaces via GET /api/system/memory.
-  startMemoryWatchdog();
   registerDefaultAppOwnedMemoryStores();
   registerDefaultAppOwnedObservedBuffers();
   registerAppOwnedMemorySweepFallback();
   configureAppOwnedMemoryBudget(resolveAppOwnedMemoryBudgetBytes(config.appOwnedMemoryBudgetMb));
   enforceAppOwnedMemoryBudget();
   registerCodexCooldownRecoveryProbeWorker(config);
-  startStateStoreSweeper();
   // Issue #42 Phase 3: opt-in archived auto-cleanup (default OFF). Unref'd hourly
   // tick for daily/weekly; startup evaluation is fire-and-forget after listen.
   // Heavy work runs in a Worker via the single-flight job controller.
@@ -482,9 +535,6 @@ export function startServer(port?: number, deps: StartServerDeps = {}): Server<W
   const applyPolicy = (policy: StorageCleanupPolicy) => {
     config.storageCleanupPolicy = policy;
   };
-  setStorageCleanupPolicyLiveSink(applyPolicy);
-  setStorageCleanupPolicyJobLiveApply(applyPolicy);
-  startStorageCleanupScheduler();
 
   const listenPort = port ?? config.port ?? 10100;
   setCorsOrigin(listenPort);
@@ -611,7 +661,14 @@ export function startServer(port?: number, deps: StartServerDeps = {}): Server<W
     };
   let server: Server<WsData>;
   let loopbackServer: Server<WsData> | null = null;
+  let backgroundLifecycle: ReturnType<typeof acquireServerBackgroundLifecycle> | null = null;
   try {
+    backgroundLifecycle = acquireServerBackgroundLifecycle(applyPolicy);
+    // External `ocx config set` / direct config.json edits run in other
+    // processes; poll the file so Logs/Usage display prices follow them live.
+    // Started inside the guarded startup transaction so the catch below can
+    // release the owner-scoped lease on any listener failure.
+    userCostOverlayReconciler = startUserCostOverlayReconciler({ liveConfig: config });
     const serveOptions = {
       idleTimeout: 255,
       async fetch(req: Request, requestServer: Server<WsData>): Promise<Response> {
@@ -794,12 +851,14 @@ export function startServer(port?: number, deps: StartServerDeps = {}): Server<W
           }
           throw error;
         }
-        const { applyNativeVisibility, buildCatalogEntries, disabledNativeSlugs, exactComboCatalogSlugs, loadCatalogTemplate, NATIVE_OPENAI_MODELS, nativeOpenAiSlugs, nativeReasoningEfforts, nativeDefaultReasoningEffort, orderForSubagents, filterCatalogVisibleModels, shouldIncludeAccountBoundNativeOpenAi, shouldIncludeNativeOpenAi, uniqueCatalogModelsForRawPublicList, visibleCodexAccountSelectors, visibleNativeSlugs, desktopVisibleNativeSlugs } = await import("../codex/catalog");
+        const { applyNativeVisibility, buildCatalogEntries, configuredNativeAliasSlugs, desktopAllowlistSuppressedNativeSlugs, disabledNativeSlugs, exactComboCatalogSlugs, loadCatalogTemplate, NATIVE_OPENAI_MODELS, nativeOpenAiSlugs, nativeReasoningEfforts, nativeDefaultReasoningEffort, orderForSubagents, filterCatalogVisibleModels, shouldIncludeAccountBoundNativeOpenAi, shouldIncludeNativeOpenAi, uniqueCatalogModelsForRawPublicList, visibleCodexAccountSelectors, visibleNativeSlugs, desktopVisibleNativeSlugs } = await import("../codex/catalog");
         const includeNativeOpenAi = shouldIncludeNativeOpenAi(config);
         const includeAccountBoundNativeOpenAi = shouldIncludeAccountBoundNativeOpenAi(config);
         const nativeSlugs = includeNativeOpenAi ? nativeOpenAiSlugs() : [];
         const disabledNatives = disabledNativeSlugs(config);
         const disabledModels = new Set(config.disabledModels ?? []);
+        const shadowedNativeSlugs = configuredNativeAliasSlugs(config);
+        const suppressedBareNativeSlugs = desktopAllowlistSuppressedNativeSlugs(config);
         const accountSelectors = includeAccountBoundNativeOpenAi
           ? visibleCodexAccountSelectors(config)
           : [];
@@ -852,7 +911,7 @@ export function startServer(port?: number, deps: StartServerDeps = {}): Server<W
           const catalogNativeSlugs = accountSelectors.length > 0
             ? NATIVE_OPENAI_MODELS
             : nativeSlugs;
-          const entries = buildCatalogEntries(loadCatalogTemplate(), catalogNativeSlugs, goOrdered, config.subagentModels, websocketsEnabled(config), maMode as "v1" | "default" | "v2", exactComboCatalogSlugs(config), accountSelectors);
+          const entries = buildCatalogEntries(loadCatalogTemplate(), catalogNativeSlugs, goOrdered, config.subagentModels, websocketsEnabled(config), maMode as "v1" | "default" | "v2", exactComboCatalogSlugs(config), accountSelectors, suppressedBareNativeSlugs);
           return jsonResponse({
             models: applyNativeVisibility(
               entries,
@@ -904,7 +963,9 @@ export function startServer(port?: number, deps: StartServerDeps = {}): Server<W
           ? NATIVE_OPENAI_MODELS.filter(slug => !disabledNatives.has(slug))
           : [];
         const visibleNatives = includeNativeOpenAi
-          ? accountSelectors.length > 0 ? selectorNativeSlugs : visibleNativeSlugs(config)
+          ? accountSelectors.length > 0
+            ? selectorNativeSlugs.filter(slug => !shadowedNativeSlugs.has(slug))
+            : visibleNativeSlugs(config)
           : [];
         const visibleAccountNatives = accountSelectors.flatMap(selector =>
           selectorNativeSlugs.flatMap(metadataId => {
@@ -1239,6 +1300,7 @@ export function startServer(port?: number, deps: StartServerDeps = {}): Server<W
             liveUpstreamUrl: resolved.upstreamWsUrl,
             liveUpstreamHeaders: resolved.headers,
             livePending: [],
+            livePendingBytes: 0,
             liveOpened: false,
             liveTurnAdmissionLease: turnAdmissionLease,
           } satisfies WsData,
@@ -1272,6 +1334,7 @@ export function startServer(port?: number, deps: StartServerDeps = {}): Server<W
       return withCors(formatErrorResponse(404, "not_found", `Unknown endpoint: ${req.method} ${url.pathname}`), req, config);
     },
     websocket: {
+      maxPayloadLength: MAX_WS_FRAME_BYTES,
       idleTimeout: WEBSOCKET_IDLE_TIMEOUT_SECONDS,
       // Responses WebSocket data plane (phase 120.2). Re-frames the same SSE pipeline onto the
       // socket: parse response.create → run handleResponses unchanged → pump its SSE body as WS
@@ -1296,15 +1359,23 @@ export function startServer(port?: number, deps: StartServerDeps = {}): Server<W
       message(ws: ServerWebSocket<WsData>, raw: string | Buffer) {
         if (ws.data.kind === "live-sideband") {
           if (ws.data.liveClosing) return;
+          const rawBytes = webSocketFrameBytes(raw);
+          if (exceedsLiveSidebandFrameByteLimit(rawBytes)) {
+            closeLiveSideband(ws, 1009, "message too large");
+            return;
+          }
           logLiveSidebandFrame("c2u", raw);
           const upstream = ws.data.liveUpstream;
           if (!upstream || upstream.readyState === WebSocket.CONNECTING || !ws.data.liveOpened) {
-            const pending = ws.data.livePending ?? (ws.data.livePending = []);
-            if (pending.length >= LIVE_SIDEBAND_PENDING_MAX) {
+            const enqueueResult = enqueueLiveSidebandPendingFrame(ws.data, raw, rawBytes);
+            if (enqueueResult === "too-many-frames") {
               closeLiveSideband(ws, 1009, "too many pending frames");
               return;
             }
-            pending.push(raw);
+            if (enqueueResult === "too-many-bytes") {
+              closeLiveSideband(ws, 1009, "too many pending bytes");
+              return;
+            }
             return;
           }
           if (upstream.readyState !== WebSocket.OPEN) {
@@ -1312,7 +1383,7 @@ export function startServer(port?: number, deps: StartServerDeps = {}): Server<W
             return;
           }
           try {
-            upstream.send(raw);
+            sendUpstreamFrame(upstream, raw);
           } catch {
             closeLiveSideband(ws, 1011, "upstream send failed");
           }
@@ -1502,6 +1573,8 @@ export function startServer(port?: number, deps: StartServerDeps = {}): Server<W
       }
     }
   } catch (error) {
+    userCostOverlayReconciler?.stop();
+    backgroundLifecycle?.releaseAfterFailedStart();
     void nativeMainLifecycle.release();
     throw error;
   }
@@ -1520,8 +1593,14 @@ export function startServer(port?: number, deps: StartServerDeps = {}): Server<W
           ...(loopbackListenerRef
             ? [() => loopbackListenerRef.stop(closeActiveConnections)]
             : []),
+          async () => {
+            userCostOverlayReconciler?.stop();
+          },
         ],
-        () => releaseNativeMainStartupLifecycle(server),
+        async () => {
+          await backgroundLifecycle.release();
+          await releaseNativeMainStartupLifecycle(server);
+        },
       );
     },
   });
@@ -1565,7 +1644,7 @@ export function startServer(port?: number, deps: StartServerDeps = {}): Server<W
   }
 
   // Opt-in storage policy (default OFF). Never blocks listen; cancellable on shutdown.
-  scheduleStorageCleanupStartupRun();
+  backgroundLifecycle.scheduleStartupRun();
 
   return server;
 }

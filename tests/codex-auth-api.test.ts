@@ -24,6 +24,7 @@ import {
   readCodexAccountRecord,
   saveCodexAccountCredential,
 } from "../src/codex/account-store";
+import * as accountStoreModule from "../src/codex/account-store";
 import {
   clearCodexUpstreamHealth,
   clearThreadAccountMap,
@@ -49,11 +50,15 @@ import {
   resetMainCodexAccountIdentityTrackingForTests,
 } from "../src/codex/account-lifecycle";
 import {
+  ConfigMutationLockError,
   getConfigPath,
   loadConfig,
+  readConfigGeneration,
   saveConfig,
   setPersistedConfigMutationBeforeCommitForTests,
 } from "../src/config";
+import * as configModule from "../src/config";
+import type { CatalogDisposition } from "../src/codex/convergence-types";
 import { captureConfigGeneration, registerStateStore } from "../src/lib/state-store-sweeper";
 import {
   reconcileLiveStateStores,
@@ -64,6 +69,7 @@ import {
   listOpenAiForwardSidecarCandidates,
   resolveFirstUsableOpenAiSidecar,
 } from "../src/providers/openai-sidecar";
+import { BOUNDED_BODY_MAX_BYTES } from "../src/lib/bounded-body";
 
 const TEST_DIR = join(import.meta.dir, ".tmp-codex-auth-api-test");
 const TEST_CODEX_HOME = join(TEST_DIR, "codex");
@@ -124,7 +130,18 @@ async function completeMockCodexOAuth(options: {
   email: string;
   onWarmup: () => void;
   usageResponse?: () => Response;
-}): Promise<{ startStatus: number; state: { status: string; error?: string } }> {
+  convergeCodexCatalog?: () => Promise<CatalogDisposition>;
+}): Promise<{
+  startStatus: number;
+  state: {
+    status: string;
+    error?: string;
+    code?: string;
+    accountId?: string;
+    needsReauth?: boolean;
+    catalogRefreshPending?: boolean;
+  };
+}> {
   const oauth = await import("../src/oauth");
   const oauthStore = await import("../src/oauth/store");
   const openUrlMod = await import("../src/lib/open-url");
@@ -173,7 +190,12 @@ async function completeMockCodexOAuth(options: {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(options.requestBody),
     });
-    const resp = await handleCodexAuthAPI(req, new URL(req.url), options.config);
+    const resp = await handleCodexAuthAPI(
+      req,
+      new URL(req.url),
+      options.config,
+      options.convergeCodexCatalog,
+    );
     const started = await resp!.json() as { flowId: string };
     for (let attempt = 0; attempt < 500; attempt += 1) {
       const statusReq = new Request(
@@ -181,7 +203,14 @@ async function completeMockCodexOAuth(options: {
         { method: "GET" },
       );
       const statusResp = await handleCodexAuthAPI(statusReq, new URL(statusReq.url), options.config);
-      const state = await statusResp!.json() as { status: string; error?: string };
+      const state = await statusResp!.json() as {
+        status: string;
+        error?: string;
+        code?: string;
+        accountId?: string;
+        needsReauth?: boolean;
+        catalogRefreshPending?: boolean;
+      };
       if (state.status !== "pending") return { startStatus: resp!.status, state };
       await new Promise<void>(resolve => queueMicrotask(resolve));
     }
@@ -828,6 +857,32 @@ describe("codex-auth API", () => {
     const data = await resp!.json() as { accounts: { id: string; email: string }[] };
 
     expect(data.accounts.find(a => a.id === "pool-mask")?.email).toBe("p***n@example.test");
+  });
+
+  test("GET /api/codex-auth/accounts omits a malformed persisted plan", async () => {
+    const config = makeConfig({
+      codexAccounts: [
+        { id: "pool-invalid-plan", email: "invalid@example.test", plan: { tier: "go" }, isMain: false },
+      ] as unknown as OcxConfig["codexAccounts"],
+    });
+    saveCodexAccountCredential("pool-invalid-plan", {
+      accessToken: "access-invalid-plan",
+      refreshToken: "refresh-invalid-plan",
+      expiresAt: Date.now() + 5 * 60_000,
+      chatgptAccountId: "acct-invalid-plan",
+    });
+    updateAccountQuota("pool-invalid-plan", 91, 111, 33, 333);
+
+    const req = new Request("http://localhost/api/codex-auth/accounts", { method: "GET" });
+    const resp = await handleCodexAuthAPI(req, new URL(req.url), config);
+    const data = await resp!.json() as {
+      accounts: Array<{ id: string; plan?: unknown; quota?: Record<string, unknown> }>;
+    };
+    const account = data.accounts.find(row => row.id === "pool-invalid-plan");
+
+    expect(resp?.status).toBe(200);
+    expect(account).not.toHaveProperty("plan");
+    expect(account?.quota).toMatchObject({ weeklyPercent: 91, monthlyPercent: 33 });
   });
 
   test("GET /api/codex-auth/accounts exposes only 30d quota for go and free plans", async () => {
@@ -1904,6 +1959,176 @@ describe("codex-auth API", () => {
     }
   });
 
+  test("reset-credit lookup rejects a declared oversized response before reading it", async () => {
+    const config = makeConfig();
+    seedPoolAccount(config, { id: "credit-declared-cap", email: "declared@example.test" });
+    let pulls = 0;
+    let markCancelled!: () => void;
+    const cancelled = new Promise<void>(resolve => { markCancelled = resolve; });
+    globalThis.fetch = (async () => new Response(new ReadableStream<Uint8Array>({
+      pull() { pulls += 1; },
+      cancel() { markCancelled(); },
+    }, { highWaterMark: 0 }), {
+      headers: { "content-length": String(BOUNDED_BODY_MAX_BYTES + 1) },
+    })) as typeof fetch;
+
+    const req = new Request("http://localhost/api/codex-auth/reset-credits?accountId=credit-declared-cap");
+    const resp = await handleCodexAuthAPI(req, new URL(req.url), config);
+
+    expect(resp?.status).toBe(502);
+    expect(await resp?.json()).toEqual({ error: "Invalid upstream reset-credit response" });
+    await cancelled;
+    expect(pulls).toBe(0);
+  });
+
+  test("reset-credit lookup cancels an undeclared response that crosses the byte cap", async () => {
+    const config = makeConfig();
+    seedPoolAccount(config, { id: "credit-stream-cap", email: "stream@example.test" });
+    let sent = false;
+    let markCancelled!: () => void;
+    const cancelled = new Promise<void>(resolve => { markCancelled = resolve; });
+    globalThis.fetch = (async () => new Response(new ReadableStream<Uint8Array>({
+      pull(controller) {
+        if (!sent) {
+          sent = true;
+          controller.enqueue(new Uint8Array(BOUNDED_BODY_MAX_BYTES));
+          return;
+        }
+        controller.enqueue(new Uint8Array([0x61]));
+      },
+      cancel() { markCancelled(); },
+    }))) as typeof fetch;
+
+    const req = new Request("http://localhost/api/codex-auth/reset-credits?accountId=credit-stream-cap");
+    const resp = await handleCodexAuthAPI(req, new URL(req.url), config);
+
+    expect(resp?.status).toBe(502);
+    expect(await resp?.json()).toEqual({ error: "Invalid upstream reset-credit response" });
+    await cancelled;
+  });
+
+  test("reset-credit lookup binds client cancellation to the upstream body", async () => {
+    const config = makeConfig();
+    seedPoolAccount(config, { id: "credit-cancel", email: "cancel@example.test" });
+    let started!: () => void;
+    const bodyStarted = new Promise<void>(resolve => { started = resolve; });
+    let markCancelled!: () => void;
+    const cancelled = new Promise<void>(resolve => { markCancelled = resolve; });
+    globalThis.fetch = (async () => new Response(new ReadableStream<Uint8Array>({
+      pull() { started(); },
+      cancel() { markCancelled(); },
+    }))) as typeof fetch;
+    const controller = new AbortController();
+    const req = new Request("http://localhost/api/codex-auth/reset-credits?accountId=credit-cancel", {
+      signal: controller.signal,
+    });
+
+    const pending = handleCodexAuthAPI(req, new URL(req.url), config);
+    await bodyStarted;
+    controller.abort(new DOMException("client disconnected", "AbortError"));
+    const resp = await pending;
+
+    expect(resp?.status).toBe(502);
+    expect(await resp?.json()).toEqual({ error: "Invalid upstream reset-credit response" });
+    await cancelled;
+  });
+
+  test("reset-credit lookup cancels a response when the client aborts before the reader attaches", async () => {
+    const config = makeConfig();
+    seedPoolAccount(config, { id: "credit-pre-reader-cancel", email: "pre-reader@example.test" });
+    const controller = new AbortController();
+    let pulls = 0;
+    let markCancelled!: () => void;
+    const cancelled = new Promise<void>(resolve => { markCancelled = resolve; });
+    globalThis.fetch = (async () => {
+      controller.abort(new DOMException("client disconnected", "AbortError"));
+      return new Response(new ReadableStream<Uint8Array>({
+        pull() { pulls += 1; },
+        cancel() { markCancelled(); },
+      }, { highWaterMark: 0 }));
+    }) as typeof fetch;
+    const req = new Request("http://localhost/api/codex-auth/reset-credits?accountId=credit-pre-reader-cancel", {
+      signal: controller.signal,
+    });
+
+    const resp = await handleCodexAuthAPI(req, new URL(req.url), config);
+
+    expect(resp?.status).toBe(502);
+    expect(await resp?.json()).toEqual({ error: "Invalid upstream reset-credit response" });
+    await cancelled;
+    expect(pulls).toBe(0);
+  });
+
+  test("reset-credit lookup sanitizes cancellation before upstream response headers", async () => {
+    const config = makeConfig();
+    seedPoolAccount(config, { id: "credit-fetch-cancel", email: "fetch-cancel@example.test" });
+    const controller = new AbortController();
+    let markFetchStarted!: () => void;
+    const fetchStarted = new Promise<void>(resolve => { markFetchStarted = resolve; });
+    let upstreamSignal: AbortSignal | null = null;
+    globalThis.fetch = (async (_input, init) => {
+      upstreamSignal = init?.signal ?? null;
+      markFetchStarted();
+      return await new Promise<Response>((_resolve, reject) => {
+        const rejectForAbort = () => reject(upstreamSignal?.reason);
+        if (upstreamSignal?.aborted) {
+          rejectForAbort();
+          return;
+        }
+        upstreamSignal?.addEventListener("abort", rejectForAbort, { once: true });
+      });
+    }) as typeof fetch;
+    const req = new Request("http://localhost/api/codex-auth/reset-credits?accountId=credit-fetch-cancel", {
+      signal: controller.signal,
+    });
+
+    const pending = handleCodexAuthAPI(req, new URL(req.url), config);
+    await fetchStarted;
+    controller.abort(new Error("private reset-credit abort detail"));
+    const resp = await pending;
+
+    expect(upstreamSignal?.aborted).toBe(true);
+    expect(resp?.status).toBe(502);
+    expect(await resp?.json()).toEqual({ error: "Invalid upstream reset-credit response" });
+  });
+
+  test.each([
+    { label: "invalid UTF-8", body: new Uint8Array([0xff]) },
+    { label: "malformed JSON", body: "{" },
+  ])("reset-credit lookup rejects $label without reflecting it", async ({ body }) => {
+    const config = makeConfig();
+    seedPoolAccount(config, { id: "credit-invalid", email: "invalid@example.test" });
+    globalThis.fetch = (async () => new Response(body)) as typeof fetch;
+
+    const req = new Request("http://localhost/api/codex-auth/reset-credits?accountId=credit-invalid");
+    const resp = await handleCodexAuthAPI(req, new URL(req.url), config);
+
+    expect(resp?.status).toBe(502);
+    expect(await resp?.json()).toEqual({ error: "Invalid upstream reset-credit response" });
+  });
+
+  test("reset-credit lookup returns only validated fields from a bounded response", async () => {
+    const config = makeConfig();
+    seedPoolAccount(config, { id: "credit-fields", email: "fields@example.test" });
+    globalThis.fetch = (async () => Response.json({
+      credits: [
+        { granted_at: "2026-01-01T00:00:00Z", expires_at: "2026-02-01T00:00:00Z", secret: "drop-me" },
+        { granted_at: 123, expires_at: "invalid" },
+      ],
+      rate_limit_reset_credits: { available_count: 1 },
+      unexpected: "drop-me",
+    })) as typeof fetch;
+
+    const req = new Request("http://localhost/api/codex-auth/reset-credits?accountId=credit-fields");
+    const resp = await handleCodexAuthAPI(req, new URL(req.url), config);
+
+    expect(resp?.status).toBe(200);
+    expect(await resp?.json()).toEqual({
+      credits: [{ granted_at: "2026-01-01T00:00:00Z", expires_at: "2026-02-01T00:00:00Z" }],
+      available_count: 1,
+    });
+  });
+
   test("reset-credit consume rejects invalid account ids before credential lookup", async () => {
     const req = new Request("http://localhost/api/codex-auth/reset-credits/consume", {
       method: "POST",
@@ -2231,12 +2456,13 @@ describe("codex-auth API", () => {
     const req = new Request("http://localhost/api/codex-auth/accounts", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(manualImportBody({ id: "manual-enabled" })),
+      body: JSON.stringify(manualImportBody({ id: "manual-enabled", plan: { tier: "go" } })),
     });
     const resp = await handleCodexAuthAPI(req, new URL(req.url), config);
 
     expect(resp!.status).toBe(200);
     expect(config.codexAccounts?.map(a => a.id)).toEqual(["manual-enabled"]);
+    expect(config.codexAccounts?.[0]).not.toHaveProperty("plan");
     expect(config.codexAccounts?.[0]?.logLabel).toMatch(CODEX_ACCOUNT_LOG_LABEL_RE);
     expect(getCodexAccountCredential("manual-enabled")).toMatchObject({
       accessToken: "access-manual-test",
@@ -2246,6 +2472,345 @@ describe("codex-auth API", () => {
     expect(readCodexAccountRecord("manual-enabled")?.lastCodexValidationStatus).toBe("ok");
     expect(readCodexAccountRecord("manual-enabled")?.lastCodexValidatedAt).toBeNumber();
     expect(warmup.calls()).toBe(1);
+  });
+
+  test("manual add publishes neither account state nor a selector before config commit", async () => {
+    enableManualImport();
+    mockCodexWarmupSuccess();
+    const accountId = "manual-picker-lock-busy";
+    const config = makeConfig({
+      codexAccountNamespaces: { desktop: "@main" },
+      codexAccountPickerEnabled: true,
+    });
+    saveConfig(structuredClone(config));
+    markAccountNeedsReauth(accountId);
+    let convergenceCalls = 0;
+    const saveSpy = spyOn(configModule, "saveConfigPreservingClaudeCode")
+      .mockImplementation(candidate => {
+        expect(candidate).toBe(config);
+        expect(getCodexAccountCredential(accountId)).toBeNull();
+        expect(readCodexAccountRecord(accountId)).toBeNull();
+        expect(isAccountNeedsReauth(accountId)).toBe(true);
+        throw new ConfigMutationLockError("test config commit failed");
+      });
+
+    try {
+      const req = new Request("http://localhost/api/codex-auth/accounts", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(manualImportBody({ id: accountId })),
+      });
+      await expect(handleCodexAuthAPI(req, new URL(req.url), config, async () => {
+        convergenceCalls += 1;
+        return { status: "committed", changed: false, degraded: false, notices: [] };
+      })).rejects.toBeInstanceOf(ConfigMutationLockError);
+
+      expect(config.codexAccounts).toEqual([]);
+      expect(config.codexAccountNamespaces).toEqual({ desktop: "@main" });
+      expect(Object.values(config.codexAccountNamespaces ?? {})).not.toContain(accountId);
+      expect(loadConfig()).toMatchObject({
+        codexAccounts: [],
+        codexAccountNamespaces: { desktop: "@main" },
+      });
+      expect(getCodexAccountCredential(accountId)).toBeNull();
+      expect(readCodexAccountRecord(accountId)).toBeNull();
+      expect(isAccountNeedsReauth(accountId)).toBe(true);
+      expect(convergenceCalls).toBe(0);
+    } finally {
+      saveSpy.mockRestore();
+    }
+  });
+
+  test("manual add exposes its durable account for recovery when credential publication fails", async () => {
+    enableManualImport();
+    mockCodexWarmupSuccess();
+    const accountId = "manual-picker-credential-fail";
+    const config = makeConfig({
+      codexAccountNamespaces: { desktop: "@main" },
+      codexAccountPickerEnabled: true,
+    });
+    setLiveStateStoreConfig(config);
+    saveConfig(structuredClone(config));
+    const beforeGeneration = readConfigGeneration();
+    if (beforeGeneration.kind !== "ready") throw new Error("config generation unavailable before test");
+    let convergenceCalls = 0;
+    const credentialSpy = spyOn(accountStoreModule, "saveCodexAccountCredential")
+      .mockImplementation(() => {
+        expect(config.codexAccounts?.map(account => account.id)).toEqual([accountId]);
+        expect(Object.values(config.codexAccountNamespaces ?? {})).toContain(accountId);
+        throw new Error("private credential detail Bearer private-token /private/codex-accounts.json");
+      });
+
+    try {
+      const req = new Request("http://localhost/api/codex-auth/accounts", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(manualImportBody({ id: accountId })),
+      });
+      const response = await handleCodexAuthAPI(req, new URL(req.url), config, async () => {
+        convergenceCalls += 1;
+        expect(config.codexAccounts?.map(account => account.id)).toEqual([accountId]);
+        expect(getCodexAccountCredential(accountId)).toBeNull();
+        return { status: "skipped", reason: "busy", retryable: true };
+      });
+      expect(response!.status).toBe(500);
+      const responseBody = await response!.json();
+      expect(responseBody).toEqual({
+        ok: false,
+        error: "Account was saved, but credential setup did not complete. Reauthenticate or remove the account.",
+        code: "codex_credential_persistence_failed",
+        accountId,
+        needsReauth: true,
+        catalogRefreshPending: true,
+      });
+      expect(JSON.stringify(responseBody)).not.toContain("private-token");
+      expect(JSON.stringify(responseBody)).not.toContain("codex-accounts.json");
+
+      expect(config.codexAccounts?.map(account => account.id)).toEqual([accountId]);
+      expect(Object.values(config.codexAccountNamespaces ?? {})).toContain(accountId);
+      expect(loadConfig().codexAccounts?.map(account => account.id)).toEqual([accountId]);
+      expect(Object.values(loadConfig().codexAccountNamespaces ?? {})).toContain(accountId);
+      expect(getCodexAccountCredential(accountId)).toBeNull();
+      expect(readCodexAccountRecord(accountId)).toBeNull();
+      expect(isAccountNeedsReauth(accountId)).toBe(true);
+      expect((await listCodexAuthAccounts(config)).find(account => account.id === accountId))
+        .toMatchObject({ needsReauth: true });
+      expect(convergenceCalls).toBe(1);
+      expect(readConfigGeneration()).toEqual({
+        kind: "ready",
+        generation: { value: beforeGeneration.generation.value + 1 },
+      });
+    } finally {
+      credentialSpy.mockRestore();
+    }
+  });
+
+  test("manual add marks a partially published credential for reauthentication", async () => {
+    enableManualImport();
+    mockCodexWarmupSuccess();
+    const accountId = "manual-picker-validation-fail";
+    const config = makeConfig({
+      codexAccountNamespaces: { desktop: "@main" },
+      codexAccountPickerEnabled: true,
+    });
+    setLiveStateStoreConfig(config);
+    saveConfig(structuredClone(config));
+    let convergenceCalls = 0;
+    const validationSpy = spyOn(accountStoreModule, "markCodexAccountValidated")
+      .mockImplementation(() => {
+        throw new Error("private validation detail /private/codex-accounts.json");
+      });
+
+    try {
+      const req = new Request("http://localhost/api/codex-auth/accounts", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(manualImportBody({ id: accountId })),
+      });
+      const response = await handleCodexAuthAPI(req, new URL(req.url), config, async () => {
+        convergenceCalls += 1;
+        return { status: "committed", changed: true, degraded: false, notices: [] };
+      });
+      expect(response!.status).toBe(500);
+      const responseBody = await response!.json();
+      expect(responseBody).toEqual({
+        ok: false,
+        error: "Account was saved, but credential setup did not complete. Reauthenticate or remove the account.",
+        code: "codex_credential_persistence_failed",
+        accountId,
+        needsReauth: true,
+      });
+      expect(JSON.stringify(responseBody)).not.toContain("codex-accounts.json");
+      expect(config.codexAccounts?.map(account => account.id)).toEqual([accountId]);
+      expect(getCodexAccountCredential(accountId)).not.toBeNull();
+      expect(readCodexAccountRecord(accountId)?.lastCodexValidationStatus).toBeUndefined();
+      expect(getAccountQuota(accountId)).toBeNull();
+      expect(isAccountNeedsReauth(accountId)).toBe(true);
+      expect((await listCodexAuthAccounts(config)).find(account => account.id === accountId))
+        .toMatchObject({ needsReauth: true });
+      expect(convergenceCalls).toBe(1);
+    } finally {
+      validationSpy.mockRestore();
+    }
+  });
+
+  test.each([
+    [
+      "committed",
+      { status: "committed", changed: true, degraded: false, notices: [] } satisfies CatalogDisposition,
+      false,
+    ],
+    [
+      "deferred",
+      { status: "skipped", reason: "busy", retryable: true } satisfies CatalogDisposition,
+      true,
+    ],
+  ] as const)("UI-managed manual add is durable before %s convergence", async (_label, disposition, pending) => {
+    enableManualImport();
+    mockCodexWarmupSuccess();
+    const accountId = pending ? "manual-picker-pending" : "manual-picker-ready";
+    const config = makeConfig({
+      codexAccountNamespaces: { desktop: "@main" },
+      codexAccountPickerEnabled: true,
+    });
+    let convergenceCalls = 0;
+    const req = new Request("http://localhost/api/codex-auth/accounts", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(manualImportBody({ id: accountId })),
+    });
+    const response = await handleCodexAuthAPI(req, new URL(req.url), config, async () => {
+      convergenceCalls += 1;
+      const persisted = JSON.parse(readFileSync(getConfigPath(), "utf8")) as OcxConfig;
+      expect(persisted.codexAccounts?.some(account => account.id === accountId)).toBe(true);
+      expect(getCodexAccountCredential(accountId)).not.toBeNull();
+      return disposition;
+    });
+
+    const binding = Object.entries(config.codexAccountNamespaces ?? {})
+      .find(([, target]) => target === accountId);
+    expect(response!.status).toBe(200);
+    expect(await response!.json()).toEqual({ ok: true, catalogRefreshPending: pending });
+    expect(binding?.[0]).toMatch(CODEX_ACCOUNT_LOG_LABEL_RE);
+    expect(binding?.[0]).not.toContain(accountId);
+    expect(convergenceCalls).toBe(1);
+  });
+
+  test("manual add projects a convergence result to only the pending boolean", async () => {
+    enableManualImport();
+    mockCodexWarmupSuccess();
+    const privateDetail = "Bearer private-token acct-private /private/catalog/path";
+    const config = makeConfig({
+      codexAccountNamespaces: { desktop: "@main" },
+      codexAccountPickerEnabled: true,
+    });
+    const req = new Request("http://localhost/api/codex-auth/accounts", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(manualImportBody({ id: "manual-picker-sanitized" })),
+    });
+    const response = await handleCodexAuthAPI(req, new URL(req.url), config, async () => ({
+      status: "failed",
+      reason: "disk",
+      phase: "commit",
+      retryable: false,
+      partialWrite: true,
+      privateDetail,
+      toJSON: () => ({ privateDetail }),
+    } as unknown as CatalogDisposition));
+    const body = await response!.json();
+
+    expect(body).toEqual({ ok: true, catalogRefreshPending: true });
+    expect(JSON.stringify(body)).not.toContain(privateDetail);
+  });
+
+  test("manual maps stay manual while a disabled UI-managed map tracks new accounts", async () => {
+    enableManualImport();
+    mockCodexWarmupSuccess();
+    let convergenceCalls = 0;
+    for (const [accountId, enabled, expectedBinding] of [
+      ["manual-map-add", undefined, false],
+      ["hidden-picker-add", false, true],
+    ] as const) {
+      const config = makeConfig({
+        codexAccountNamespaces: { desktop: "@main" },
+        ...(enabled === undefined ? {} : { codexAccountPickerEnabled: enabled }),
+      });
+      const req = new Request("http://localhost/api/codex-auth/accounts", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(manualImportBody({
+          id: accountId,
+          email: `${accountId}@example.test`,
+          chatgptAccountId: `acct-${accountId}`,
+        })),
+      });
+      const response = await handleCodexAuthAPI(req, new URL(req.url), config, async () => {
+        convergenceCalls += 1;
+        return { status: "committed", changed: false, degraded: false, notices: [] };
+      });
+      expect(await response!.json()).toEqual({ ok: true, catalogRefreshPending: false });
+      expect(Object.values(config.codexAccountNamespaces ?? {}).includes(accountId)).toBe(expectedBinding);
+    }
+    expect(convergenceCalls).toBe(0);
+  });
+
+  test.each([
+    ["enabled matching binding", true, "lifecycle-delete", true],
+    ["disabled matching binding", false, "lifecycle-delete", false],
+    ["enabled orphaned binding", true, "missing-account", false],
+  ] as const)("delete lifecycle reports picker visibility for %s", (_case, enabled, target, expected) => {
+    const accountId = "lifecycle-delete";
+    const config = makeConfig({
+      codexAccounts: [{ id: accountId, email: "delete@example.test", isMain: false }],
+      codexAccountNamespaces: { team: target },
+      codexAccountPickerEnabled: enabled,
+    });
+
+    expect(deleteCodexAccount(config, accountId)).toBe(expected);
+    expect(config.codexAccounts).toEqual([]);
+    expect(config.codexAccountNamespaces).toEqual({ team: target });
+  });
+
+  test("enabled picker deletion retains its selector and converges after delete and re-add", async () => {
+    enableManualImport();
+    mockCodexWarmupSuccess();
+    const accountId = "picker-delete";
+    const config = makeConfig({
+      codexAccounts: [{ id: accountId, email: "delete@example.test", isMain: false }],
+      codexAccountNamespaces: { team: accountId },
+      codexAccountPickerEnabled: true,
+    });
+    saveCodexAccountCredential(accountId, {
+      accessToken: "delete-access",
+      refreshToken: "delete-refresh",
+      expiresAt: Date.now() + 60_000,
+      chatgptAccountId: "delete-chatgpt-id",
+    });
+    let convergences = 0;
+    const convergeCodexCatalog = async (): Promise<CatalogDisposition> => {
+      convergences += 1;
+      const persisted = JSON.parse(readFileSync(getConfigPath(), "utf8")) as OcxConfig;
+      expect(persisted.codexAccountNamespaces).toEqual({ team: accountId });
+      if (convergences === 1) {
+        expect(persisted.codexAccounts).toEqual([]);
+        expect(getCodexAccountCredential(accountId)).toBeNull();
+      } else {
+        expect(persisted.codexAccounts?.map(account => account.id)).toEqual([accountId]);
+        expect(getCodexAccountCredential(accountId)).not.toBeNull();
+      }
+      return { status: "committed", changed: true, degraded: false, notices: [] };
+    };
+
+    const deleteReq = new Request(
+      `http://localhost/api/codex-auth/accounts?id=${accountId}`,
+      { method: "DELETE" },
+    );
+    const deleted = await handleCodexAuthAPI(
+      deleteReq,
+      new URL(deleteReq.url),
+      config,
+      convergeCodexCatalog,
+    );
+    expect(await deleted!.json()).toEqual({ ok: true, catalogRefreshPending: false });
+    expect(config.codexAccountNamespaces).toEqual({ team: accountId });
+    expect(config.codexAccounts).toEqual([]);
+
+    const addReq = new Request("http://localhost/api/codex-auth/accounts", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(manualImportBody({ id: accountId })),
+    });
+    const added = await handleCodexAuthAPI(
+      addReq,
+      new URL(addReq.url),
+      config,
+      convergeCodexCatalog,
+    );
+    expect(await added!.json()).toEqual({ ok: true, catalogRefreshPending: false });
+    expect(config.codexAccountNamespaces).toEqual({ team: accountId });
+    expect(config.codexAccounts?.map(account => account.id)).toEqual([accountId]);
+    expect(convergences).toBe(2);
   });
 
   test("POST /api/codex-auth/accounts allows a pool account matching the main login", async () => {
@@ -3442,6 +4007,25 @@ describe("codex-auth API", () => {
     expect(data).toEqual({ status: "done", accountId: "pool-login-recovery" });
   });
 
+  test("GET /api/codex-auth/login-status does not recover a partially published account as done", async () => {
+    const accountId = "pool-login-partial";
+    saveCodexAccountCredential(accountId, {
+      accessToken: "tok",
+      refreshToken: "ref",
+      expiresAt: Date.now() + 5 * 60_000,
+      chatgptAccountId: "acc-pool-login-partial",
+    });
+    markAccountNeedsReauth(accountId);
+
+    const req = new Request(
+      `http://localhost/api/codex-auth/login-status?flowId=missing&accountId=${accountId}`,
+      { method: "GET" },
+    );
+    const resp = await handleCodexAuthAPI(req, new URL(req.url), {} as any);
+    const data = await resp!.json() as { status: string; accountId?: string };
+    expect(data).toEqual({ status: "expired" });
+  });
+
   test("GET /api/codex-auth/login-status does not false-complete reauth from a stale credential", async () => {
     saveCodexAccountCredential("pool-reauth-stale", {
       accessToken: "tok",
@@ -3665,6 +4249,168 @@ describe("codex-auth API", () => {
     expect(getCodexAccountCredential("oauth-race")).toBeNull();
   });
 
+  test("OAuth creation reports a durable add when catalog convergence is pending", async () => {
+    const accountId = "oauth-picker-pending";
+    const config = makeConfig({
+      codexAccountNamespaces: { desktop: "@main" },
+      codexAccountPickerEnabled: true,
+    });
+    setLiveStateStoreConfig(config);
+    markAccountNeedsReauth(accountId);
+    let convergenceCalls = 0;
+    const result = await completeMockCodexOAuth({
+      config,
+      requestBody: { id: accountId },
+      oauthAccountId: "oauth-picker-chatgpt-id",
+      email: "oauth-picker@example.test",
+      onWarmup: () => {},
+      usageResponse: () => new Response(JSON.stringify({
+        email: "oauth-picker@example.test",
+        plan_type: "pro",
+        rate_limit: { primary_window: { used_percent: 73, reset_at: 1782628379 } },
+      }), { status: 200 }),
+      convergeCodexCatalog: async () => {
+        convergenceCalls += 1;
+        expect(config.codexAccounts?.some(account => account.id === accountId)).toBe(true);
+        expect(getCodexAccountCredential(accountId)).not.toBeNull();
+        expect(readCodexAccountRecord(accountId)?.lastCodexValidationStatus).toBe("ok");
+        expect(isAccountNeedsReauth(accountId)).toBe(false);
+        expect(getAccountQuota(accountId)?.weeklyPercent).toBe(73);
+        throw new Error("private oauth refresh details Bearer private-token /private/path");
+      },
+    });
+
+    expect(result.startStatus).toBe(200);
+    expect(result.state).toMatchObject({ status: "done", catalogRefreshPending: true });
+    expect(JSON.stringify(result.state)).not.toContain("private oauth refresh details");
+    expect(config.codexAccounts?.some(account => account.id === accountId)).toBe(true);
+    expect(Object.values(config.codexAccountNamespaces ?? {})).toContain(accountId);
+    expect(getCodexAccountCredential(accountId)).not.toBeNull();
+    expect(readCodexAccountRecord(accountId)?.lastCodexValidationStatus).toBe("ok");
+    expect(isAccountNeedsReauth(accountId)).toBe(false);
+    expect(getAccountQuota(accountId)?.weeklyPercent).toBe(73);
+    expect(convergenceCalls).toBe(1);
+  });
+
+  test("OAuth creation exposes its durable account for recovery when credential publication fails", async () => {
+    const accountId = "oauth-picker-credential-fail";
+    const config = makeConfig({
+      codexAccountNamespaces: { desktop: "@main" },
+      codexAccountPickerEnabled: true,
+    });
+    setLiveStateStoreConfig(config);
+    let convergenceCalls = 0;
+    const credentialSpy = spyOn(accountStoreModule, "saveCodexAccountCredential")
+      .mockImplementation(() => {
+        throw new Error("private OAuth detail Bearer private-token /private/codex-accounts.json");
+      });
+
+    try {
+      const result = await completeMockCodexOAuth({
+        config,
+        requestBody: { id: accountId },
+        oauthAccountId: "oauth-picker-credential-fail-chatgpt-id",
+        email: "oauth-picker-credential-fail@example.test",
+        onWarmup: () => {},
+        usageResponse: () => new Response(JSON.stringify({
+          email: "oauth-picker-credential-fail@example.test",
+          plan_type: "pro",
+          rate_limit: { primary_window: { used_percent: 73, reset_at: 1782628379 } },
+        }), { status: 200 }),
+        convergeCodexCatalog: async () => {
+          convergenceCalls += 1;
+          expect(config.codexAccounts?.map(account => account.id)).toEqual([accountId]);
+          expect(getCodexAccountCredential(accountId)).toBeNull();
+          expect(getAccountQuota(accountId)).toBeNull();
+          return { status: "skipped", reason: "busy", retryable: true };
+        },
+      });
+
+      expect(result.startStatus).toBe(200);
+      expect(result.state).toMatchObject({
+        status: "error",
+        error: "Account was saved, but credential setup did not complete. Reauthenticate or remove the account.",
+        code: "codex_credential_persistence_failed",
+        accountId,
+        needsReauth: true,
+        catalogRefreshPending: true,
+      });
+      expect(JSON.stringify(result.state)).not.toContain("private-token");
+      expect(JSON.stringify(result.state)).not.toContain("codex-accounts.json");
+      expect(config.codexAccounts?.map(account => account.id)).toEqual([accountId]);
+      expect(Object.values(config.codexAccountNamespaces ?? {})).toContain(accountId);
+      expect(loadConfig().codexAccounts?.map(account => account.id)).toEqual([accountId]);
+      expect(getCodexAccountCredential(accountId)).toBeNull();
+      expect(getAccountQuota(accountId)).toBeNull();
+      expect(isAccountNeedsReauth(accountId)).toBe(true);
+      expect((await listCodexAuthAccounts(config)).find(account => account.id === accountId))
+        .toMatchObject({ needsReauth: true });
+      expect(convergenceCalls).toBe(1);
+    } finally {
+      credentialSpy.mockRestore();
+    }
+  });
+
+  test("OAuth add publishes neither account state nor a selector before config commit", async () => {
+    const accountId = "oauth-picker-lock-busy";
+    const config = makeConfig({
+      codexAccountNamespaces: { desktop: "@main" },
+      codexAccountPickerEnabled: true,
+    });
+    saveConfig(structuredClone(config));
+    markAccountNeedsReauth(accountId);
+    updateAccountQuota(accountId, 11);
+    let convergenceCalls = 0;
+    const saveSpy = spyOn(configModule, "saveConfigPreservingClaudeCode")
+      .mockImplementation(candidate => {
+        expect(candidate).toBe(config);
+        expect(getCodexAccountCredential(accountId)).toBeNull();
+        expect(readCodexAccountRecord(accountId)).toBeNull();
+        expect(isAccountNeedsReauth(accountId)).toBe(true);
+        expect(getAccountQuota(accountId)?.weeklyPercent).toBe(11);
+        throw new ConfigMutationLockError("test config commit failed");
+      });
+
+    try {
+      const result = await completeMockCodexOAuth({
+        config,
+        requestBody: { id: accountId },
+        oauthAccountId: "oauth-picker-lock-chatgpt-id",
+        email: "oauth-picker-lock@example.test",
+        onWarmup: () => {},
+        usageResponse: () => new Response(JSON.stringify({
+          email: "oauth-picker-lock@example.test",
+          plan_type: "pro",
+          rate_limit: { primary_window: { used_percent: 73, reset_at: 1782628379 } },
+        }), { status: 200 }),
+        convergeCodexCatalog: async () => {
+          convergenceCalls += 1;
+          return { status: "committed", changed: false, degraded: false, notices: [] };
+        },
+      });
+
+      expect(result.startStatus).toBe(200);
+      expect(result.state).toMatchObject({
+        status: "error",
+        error: "Configuration is busy; retry login shortly.",
+      });
+      expect(config.codexAccounts).toEqual([]);
+      expect(config.codexAccountNamespaces).toEqual({ desktop: "@main" });
+      expect(Object.values(config.codexAccountNamespaces ?? {})).not.toContain(accountId);
+      expect(loadConfig()).toMatchObject({
+        codexAccounts: [],
+        codexAccountNamespaces: { desktop: "@main" },
+      });
+      expect(getCodexAccountCredential(accountId)).toBeNull();
+      expect(readCodexAccountRecord(accountId)).toBeNull();
+      expect(isAccountNeedsReauth(accountId)).toBe(true);
+      expect(getAccountQuota(accountId)?.weeklyPercent).toBe(11);
+      expect(convergenceCalls).toBe(0);
+    } finally {
+      saveSpy.mockRestore();
+    }
+  });
+
   test("OAuth reauth cannot recreate an account deleted during warmup", async () => {
     const config = makeConfig({
       codexAccounts: [{ id: "reauth-race", email: "reauth-race@example.test", isMain: false }],
@@ -3754,12 +4500,6 @@ describe("codex-auth API", () => {
     expect(source).toContain("expectedEmail");
     expect(source).toContain("Signed-in ChatGPT account does not match this pool account");
     expect(source).toContain("Cannot verify account identity for reauth. Remove this account and add it again.");
-  });
-
-  test("login-status reauth polling refuses credential-exists shortcut", async () => {
-    const source = await Bun.file("src/codex/auth-api.ts").text();
-    expect(source).toContain('url.searchParams.get("reauth") === "1"');
-    expect(source).toContain("!st && accountId && !reauthStatus && getCodexAccountCredential(accountId)");
   });
 
   test("OAuth pool login waits for the current flow to finish, not stale credentials", async () => {

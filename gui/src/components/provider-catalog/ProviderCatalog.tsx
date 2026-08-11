@@ -46,6 +46,7 @@ export default function ProviderCatalog({
   onLogin,
   onCancelLogin,
   onLogout,
+  onManage,
 }: {
   presets: CatalogPreset[];
   usageRank?: Record<string, number>;
@@ -64,9 +65,11 @@ export default function ProviderCatalog({
   loginHint?: AccountLoginHint | null;
   /** Needed by the manual redirect-URL paste fallback (POST /api/oauth/login/code). */
   apiBase?: string;
-  onLogin?: (provider: string) => void;
+  onLogin?: (provider: string, addAccount?: boolean) => void;
   onCancelLogin?: (provider: string) => void;
   onLogout?: (provider: string) => void;
+  /** Jump to the provider's Accounts surface in the workspace. */
+  onManage?: (provider: string) => void;
 }) {
   const t = useT();
   const [tier, setTier] = useState<CatalogTier>(initialTier);
@@ -204,15 +207,36 @@ export default function ProviderCatalog({
                       </button>
                     )}
                   </>
-                ) : busy ? (
-                  onCancelLogin && <button type="button" className="btn btn-ghost" onClick={() => onCancelLogin(row.id)}>{t("common.cancel")}</button>
                 ) : loggedIn ? (
                   <>
-                    {onLogin && (
-                      <button type="button" className="btn btn-ghost" onClick={() => onLogin(row.id)}>{t("modal.accountAdd")}</button>
+                    {onManage && (
+                      <button type="button" className="btn btn-ghost" onClick={() => onManage(row.id)}>
+                        {t("modal.accountManage")}
+                      </button>
                     )}
-                    {onLogout && <button type="button" className="btn btn-ghost" onClick={() => onLogout(row.id)}>{t("modal.accountLogout")}</button>}
+                    {onLogin && (
+                      <button
+                        type="button"
+                        className="btn btn-ghost"
+                        disabled={busy}
+                        onClick={() => { if (!busy) onLogin(row.id, true); }}
+                      >
+                        {busy ? t("prov.waitingBrowser") : t("modal.accountAdd")}
+                      </button>
+                    )}
+                    {busy && onCancelLogin && (
+                      <button type="button" className="btn btn-ghost" onClick={() => onCancelLogin(row.id)}>
+                        {t("common.cancel")}
+                      </button>
+                    )}
+                    {onLogout && !busy && (
+                      <button type="button" className="btn btn-ghost" onClick={() => onLogout(row.id)}>
+                        {t("modal.accountLogout")}
+                      </button>
+                    )}
                   </>
+                ) : busy ? (
+                  onCancelLogin && <button type="button" className="btn btn-ghost" onClick={() => onCancelLogin(row.id)}>{t("common.cancel")}</button>
                 ) : (
                   onLogin && <button type="button" className="btn btn-primary" onClick={() => onLogin(row.id)}>{t("modal.accountLogin")}</button>
                 )}
