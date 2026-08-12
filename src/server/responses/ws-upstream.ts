@@ -2,7 +2,7 @@
 //
 // Why this exists: the Codex backend serves the responses_websockets path from
 // a measurably faster queue than the plain SSE POST path. Measured 2026-08-12
-// (same account, same payload, strictly sequential): gpt-5.6-luna TTFT p50
+// KST (same account, same payload, strictly sequential): gpt-5.6-luna TTFT p50
 // ~1.0s over WS vs ~3.9s over SSE. Codex CLI itself defaults to the WS
 // transport; opencodex previously always POSTed SSE, which is where its extra
 // 2-3s of TTFT came from.
@@ -24,10 +24,17 @@ export function shouldUseCodexWsUpstream(url: string, init?: RequestInit): boole
   if ((init?.method ?? "GET").toUpperCase() !== "POST") return false;
   const body = init?.body;
   if (typeof body !== "string") return false;
-  // Turn requests always stream. JSON-mode calls (no stream flag) keep the
-  // HTTP path because the WS path only speaks the event protocol. The body is
-  // adapter-built JSON.stringify output, so the compact form is exact.
-  return body.includes("\"stream\":true");
+  // Only root-level stream:true selects WS: JSON-mode calls keep the HTTP path
+  // because the WS path only speaks the event protocol, and a nested
+  // {"metadata":{"stream":true}} must not flip the transport. Parsing (not
+  // substring matching) also keeps whitespace-formatted bodies routable.
+  try {
+    const parsed = JSON.parse(body) as unknown;
+    return typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)
+      && (parsed as Record<string, unknown>).stream === true;
+  } catch {
+    return false;
+  }
 }
 
 export function codexWsUpstreamFetch(
@@ -62,10 +69,11 @@ export function codexWsUpstreamFetch(
       ? headers["openai-beta"]
       : `${headers["openai-beta"]}, ${WS_BETA}`
     : WS_BETA;
-  // The backend keys its fast lane on the originator tag, not just the WS
-  // transport: measured 60KB turns run ~1.5s with `codex_cli_rs` vs ~4.6s
-  // without. Codex CLI always sends it; default it for SDK-style callers.
-  if (!headers.originator) headers.originator = "codex_cli_rs";
+  // A genuine caller `originator` is already in these headers via the forward
+  // set. Never fabricate one here: pool/forward traffic must not impersonate
+  // Codex CLI, per the metadata-integrity contract. (The backend's fast lane
+  // keys on WS + originator, so callers without the tag simply keep their own
+  // provenance and scheduling.)
 
   return new Promise<Response>((resolve, reject) => {
     let ws: WebSocket;
@@ -113,23 +121,24 @@ export function codexWsUpstreamFetch(
 
     ws.addEventListener("open", () => {
       if (settledPreOpen) return;
-      opened = true;
       clearTimeout(upgradeTimer);
+      try {
+        ws.send(frameText);
+      } catch {
+        // send() throwing means the frame never left, so no upstream turn
+        // started and the SSE resend cannot double-generate. Falling back
+        // (instead of erroring a synthetic 200 body) keeps the pre-stream
+        // HTTP error/refresh/failover machinery in charge.
+        settledPreOpen = true;
+        try { ws.close(); } catch { /* already closing */ }
+        resolve(sseFallback(url, init));
+        return;
+      }
+      opened = true;
       const stream = new ReadableStream<Uint8Array>({
         start(c) { controller = c; },
         cancel() { try { ws.close(); } catch { /* already closing */ } },
       });
-      try {
-        ws.send(frameText);
-      } catch {
-        // send() throwing means the frame never left, so no turn started; the
-        // stream error routes the caller into its normal transport-retry path.
-        if (controller && !terminal) {
-          terminal = true;
-          try { controller.error(new Error("codex websocket send failed")); } catch { /* noop */ }
-        }
-        try { ws.close(); } catch { /* noop */ }
-      }
       resolve(new Response(stream, {
         status: 200,
         // The 101 response headers (x-codex-*-reset-at quota hints) are not
@@ -175,9 +184,11 @@ export function codexWsUpstreamFetch(
       }
       if (controller && !terminal) {
         terminal = true;
-        // Connection dropped mid-stream: close like an SSE socket drop and let
-        // the caller's incomplete/stall handling take over.
-        try { controller.close(); } catch { /* already closed */ }
+        // Connection dropped before a Responses terminal event. A clean EOF
+        // here would reach clients with no response.completed/failed at all —
+        // relaySseWithFailedTail() only synthesizes a failed terminal when the
+        // body read THROWS. Error the stream like a reset TCP socket.
+        try { controller.error(new Error("codex websocket closed before a Responses terminal event")); } catch { /* stream already done */ }
       }
     });
 
