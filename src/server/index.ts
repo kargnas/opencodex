@@ -134,6 +134,7 @@ import {
   isLoopbackHostname,
   jsonResponse,
   admissionFields,
+  conflictingApiAuthCredentials,
   resolveApiAuth,
   resolveResponsesApiAuth,
   requestPolicyView,
@@ -143,6 +144,7 @@ import {
   withCors,
   withManagementCors,
 } from "./auth-cors";
+import { modelDiscoveryFlavor } from "./model-discovery";
 export {
   assertServerAuthConfig,
   corsHeaders,
@@ -834,6 +836,9 @@ export function startServer(port?: number, deps: StartServerDeps = {}): Server<W
         // Model discovery never forwards Authorization upstream, so the broader admission
         // set (Authorization / x-api-key / x-opencodex-api-key) is safe here and required by
         // remote OpenAI-style bearer clients and Claude gateway discovery (anthropic-version).
+        if (conflictingApiAuthCredentials(req)) {
+          return withCors(formatErrorResponse(400, "invalid_request_error", "conflicting API keys"), req, policy);
+        }
         const admission = resolveApiAuth(req, policy);
         if (!admission) return withCors(formatErrorResponse(401, "authentication_error", "opencodex API key required"), req, policy);
         if (!isAllowedRequestOrigin(req, policy)) {
@@ -872,9 +877,8 @@ export function startServer(port?: number, deps: StartServerDeps = {}): Server<W
         // aliases; legacy claude-ocx-* ids keep decoding via resolveAlias. Detection:
         // anthropic-version header (Claude Code sends it) or explicit ?flavor=anthropic.
         // Codex catalog (client_version) and the OpenAI list shape below stay byte-identical.
-        const wantsAnthropicList = req.headers.get("anthropic-version") !== null
-          || url.searchParams.get("flavor") === "anthropic";
-        if (wantsAnthropicList && !url.searchParams.has("client_version")) {
+        const flavor = modelDiscoveryFlavor(url, req.headers);
+        if (flavor === "anthropic") {
           if (config.claudeCode?.enabled === false) return jsonResponse({ data: [] }, 200, req, policy);
           // Build Desktop 3P registry so inbound alias resolution works for subsequent requests.
           buildDesktop3pRegistry(
@@ -898,7 +902,7 @@ export function startServer(port?: number, deps: StartServerDeps = {}): Server<W
           const data = buildAnthropicModelInfos([...desktopVisibleNativeSlugs(config)], goOrdered, resolveAutoContext(config.claudeCode), idStyle, activeDesktop3pAlias);
           return jsonResponse({ data }, 200, req, policy);
         }
-        if (url.searchParams.has("client_version")) {
+        if (flavor === "codex") {
           // Codex client → Codex catalog shape: native gpt + namespaced routed models,
           // cloned from a native template so required fields (base_instructions, etc.) are present.
           // Pass the subagent picks so featured models lead by priority (matches the on-disk file).

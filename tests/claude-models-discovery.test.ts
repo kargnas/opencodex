@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { saveConfig } from "../src/config";
 import { startServer } from "../src/server";
+import { modelDiscoveryFlavor } from "../src/server/model-discovery";
 import type { OcxConfig } from "../src/types";
 import { installIsolatedCodexHome, type IsolatedCodexHome } from "./helpers/isolated-codex-home";
 
@@ -151,6 +152,48 @@ test("OpenAI list shape and Codex catalog shape stay unchanged", async () => {
     const codexJson = await codex.json() as { models?: unknown[]; data?: unknown };
     expect(Array.isArray(codexJson.models)).toBe(true);
     expect(codexJson.data).toBeUndefined();
+    const codexIds = (codexJson.models as Array<{ slug: string }>).map(model => model.slug);
+    expect(codexIds.some(id => id.startsWith("openai/"))).toBe(false);
+    expect(codexIds).toContain("mock/test-model");
+
+    const anthropic = await fetch(new URL("/v1/models?limit=1000", server.url), {
+      headers: { "anthropic-version": "2023-06-01", "user-agent": "claude-code/2.1.220" },
+    }).then(response => response.json()) as { data: Array<{ id: string }> };
+    expect(anthropic.data.some(model => model.id.startsWith("anthropic/"))).toBe(false);
+    expect(anthropic.data.some(model => model.id === "claude-ocx-mock--test-model")).toBe(true);
+  } finally {
+    await server.stop(true);
+  }
+});
+
+test("model discovery flavor는 Codex, Anthropic, OpenAI 순으로 판정한다", () => {
+  expect(modelDiscoveryFlavor(
+    new URL("https://proxy.test/v1/models?client_version=1.0.0"),
+    new Headers({ "anthropic-version": "2023-06-01" }),
+  )).toBe("codex");
+  expect(modelDiscoveryFlavor(
+    new URL("https://proxy.test/v1/models?limit=1000"),
+    new Headers({ "anthropic-version": "2023-06-01" }),
+  )).toBe("anthropic");
+  expect(modelDiscoveryFlavor(
+    new URL("https://proxy.test/v1/models"),
+    new Headers(),
+  )).toBe("openai");
+});
+
+test("model discovery는 서로 다른 Bearer와 X-Api-Key를 catalog 생성 전에 거부한다", async () => {
+  saveConfig(configWithStaticModels());
+  const server = startServer(0);
+  try {
+    const response = await fetch(new URL("/v1/models", server.url), {
+      headers: {
+        authorization: "Bearer left-key",
+        "x-api-key": "right-key",
+      },
+    });
+    expect(response.status).toBe(400);
+    const body = await response.json() as { error?: { message?: string } };
+    expect(body.error?.message).toBe("conflicting API keys");
   } finally {
     await server.stop(true);
   }
