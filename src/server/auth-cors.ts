@@ -370,6 +370,12 @@ export function validateForwardAdmissionCredential(headers: Headers, config: Ocx
   if (bearer && isProxyAdmissionSecret(bearer, config)) throw new ForwardAdmissionCredentialError();
 }
 
+export function conflictingApiAuthCredentials(req: Request): boolean {
+  const bearer = req.headers.get("authorization")?.replace(/^Bearer\s+/i, "").trim() ?? "";
+  const xApiKey = req.headers.get("x-api-key")?.trim() ?? "";
+  return !!bearer && !!xApiKey && bearer !== xApiKey;
+}
+
 /**
  * Resolving form of `hasValidApiAuth`: identical header precedence, identical
  * decision, but it names the admission instead of collapsing it to a boolean.

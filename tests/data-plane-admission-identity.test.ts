@@ -7,6 +7,7 @@ import {
   resolveApiAuth,
   resolveDataPlaneAdmissionSecret,
   resolveResponsesApiAuth,
+  conflictingApiAuthCredentials,
 } from "../src/server/auth-cors";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -114,6 +115,17 @@ describe("no admission decision changed", () => {
 });
 
 describe("the two wrappers still differ", () => {
+  test("different bearer and x-api-key credentials conflict before precedence", () => {
+    expect(conflictingApiAuthCredentials(request({
+      authorization: "Bearer ocx_data_firstsecret",
+      "x-api-key": "ocx_data_secondsecret",
+    }))).toBe(true);
+    expect(conflictingApiAuthCredentials(request({
+      authorization: "Bearer ocx_data_firstsecret",
+      "x-api-key": "ocx_data_firstsecret",
+    }))).toBe(false);
+  });
+
   test("bearer is accepted by the broad path and rejected by the Responses path", () => {
     const config = remoteConfig();
     const bearer = request({ authorization: "Bearer ocx_data_firstsecret" });
