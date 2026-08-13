@@ -225,12 +225,12 @@ test("exact account disables affect only the matching OpenAI and Codex discovery
       data: Array<{ id: string; reasoning_efforts?: unknown[] }>;
     };
     const plainIds = plain.data.map(model => model.id);
-    expect(plainIds).toContain("gpt-5.5");
+    expect(plainIds).toContain("openai/gpt-5.5");
     expect(plainIds).toContain("desktop/gpt-5.5");
     expect(plainIds).not.toContain("team/gpt-5.5");
     expect(plainIds.some(id => id.startsWith("removed/"))).toBe(false);
     expect(plain.data.find(model => model.id === "desktop/gpt-5.5")?.reasoning_efforts)
-      .toEqual(plain.data.find(model => model.id === "gpt-5.5")?.reasoning_efforts);
+      .toEqual(plain.data.find(model => model.id === "openai/gpt-5.5")?.reasoning_efforts);
 
     const catalog = await fetch(new URL("/v1/models?client_version=1.0.0", server.url))
       .then(response => response.json()) as {
@@ -290,6 +290,8 @@ test("Codex discovery restores account rows for supported natives hidden on disk
     const plain = await fetch(new URL("/v1/models", server.url))
       .then(response => response.json()) as { data: Array<{ id: string }> };
     expect(plain.data.some(model => model.id === "gpt-5.4-mini")).toBe(false);
+    expect(plain.data.some(model => /^gpt-/.test(model.id))).toBe(false);
+    expect(plain.data.some(model => model.id === "openai/gpt-5.5")).toBe(true);
 
     const catalog = await fetch(new URL("/v1/models?client_version=1.0.0", server.url))
       .then(response => response.json()) as {
@@ -312,17 +314,17 @@ test("Codex discovery restores account rows for supported natives hidden on disk
       .then(response => response.json()) as {
         data: Array<{ id: string; reasoning_efforts?: unknown[] }>;
       };
-    expect(plain.data.find(model => model.id === "gpt-5.5")?.reasoning_efforts).toBeArray();
+    expect(plain.data.find(model => model.id === "openai/gpt-5.5")?.reasoning_efforts).toBeArray();
     expect(plain.data.find(model => model.id === "team/gpt-5.5")?.reasoning_efforts)
-      .toEqual(plain.data.find(model => model.id === "gpt-5.5")?.reasoning_efforts);
-    expect(plain.data.some(model => model.id === "gpt-5.4")).toBe(false);
+      .toEqual(plain.data.find(model => model.id === "openai/gpt-5.5")?.reasoning_efforts);
+    expect(plain.data.some(model => model.id === "openai/gpt-5.4")).toBe(false);
     expect(plain.data.some(model => model.id === "team/gpt-5.4")).toBe(false);
     // Activating account selectors makes both bare and qualified discovery mirror the complete
     // enabled supported set, even when a partial custom catalog omitted this native.
-    expect(plain.data.find(model => model.id === "gpt-5.4-mini")?.reasoning_efforts)
+    expect(plain.data.find(model => model.id === "openai/gpt-5.4-mini")?.reasoning_efforts)
       .toBeArray();
     expect(plain.data.find(model => model.id === "team/gpt-5.4-mini")?.reasoning_efforts)
-      .toEqual(plain.data.find(model => model.id === "gpt-5.4-mini")?.reasoning_efforts);
+      .toEqual(plain.data.find(model => model.id === "openai/gpt-5.4-mini")?.reasoning_efforts);
 
     const catalog = await fetch(new URL("/v1/models?client_version=1.0.0", server.url))
       .then(response => response.json()) as {
@@ -389,7 +391,7 @@ test("disabled canonical OpenAI preserves bare bootstrap rows without advertisin
     const plain = await fetch(new URL("/v1/models", server.url)).then(response => response.json()) as {
       data: Array<{ id: string }>;
     };
-    expect(plain.data.some(model => model.id.startsWith("gpt-"))).toBe(true);
+    expect(plain.data.some(model => model.id.startsWith("openai/gpt-"))).toBe(true);
     expect(plain.data.some(model => model.id.startsWith("team/"))).toBe(false);
 
     const catalog = await fetch(new URL("/v1/models?client_version=1.0.0", server.url))

@@ -978,7 +978,7 @@ export function startServer(port?: number, deps: StartServerDeps = {}): Server<W
           })
         );
         const data = [
-          ...visibleNatives.map(id => nativeModelRow(id)),
+          ...visibleNatives.map(id => nativeModelRow(`openai/${id}`, id)),
           ...visibleAccountNatives.map(({ id, metadataId }) => nativeModelRow(id, metadataId)),
           ...uniqueCatalogModelsForRawPublicList(goOrdered).map(m => ({
             id: m.alias ?? `${m.provider}/${m.id}`,
