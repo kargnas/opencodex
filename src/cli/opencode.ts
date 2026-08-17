@@ -19,7 +19,7 @@ import { spawn } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
-import { loadConfig } from "../config";
+import { getRuntimeDir, loadConfig } from "../config";
 import {
   OPENCODE_API_KEY_ENV,
   OPENCODE_CONFIG_SCHEMA,
@@ -495,7 +495,10 @@ async function ensureProxyForOpencode(config: OcxConfig): Promise<LiveProxy | nu
   if (live) return live;
   const cfgPort = config.port;
   const pinPort = typeof cfgPort === "number" && cfgPort > 0 ? cfgPort : 10100;
-  const child = spawn(process.execPath, selfLaunchArgv(["start", "--port", String(pinPort)]), {
+  const startArgs = ["start", "--port", String(pinPort)];
+  const runtimeDir = getRuntimeDir();
+  if (runtimeDir) startArgs.push("--runtime-dir", runtimeDir);
+  const child = spawn(process.execPath, selfLaunchArgv(startArgs), {
     detached: true,
     stdio: "ignore",
     windowsHide: true,

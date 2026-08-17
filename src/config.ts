@@ -640,6 +640,7 @@ export function expandUserPath(raw: string): string {
 }
 
 let resolvedConfigDirCache: { raw: string | undefined; path: string } | null = null;
+let runtimeDirOverride: string | undefined;
 
 function resolveConfigDir(): string {
   const raw = process.env["OPENCODEX_HOME"]?.trim() || undefined;
@@ -654,11 +655,20 @@ function resolveConfigPath(): string {
 }
 
 function resolvePidPath(): string {
-  return join(resolveConfigDir(), "ocx.pid");
+  return join(runtimeDirOverride ?? resolveConfigDir(), "ocx.pid");
 }
 
 function resolveRuntimePortPath(): string {
-  return join(resolveConfigDir(), "runtime-port.json");
+  return join(runtimeDirOverride ?? resolveConfigDir(), "runtime-port.json");
+}
+
+/** Lifecycle records are slot-private; durable state stays under OPENCODEX_HOME. */
+export function setRuntimeDir(path: string | undefined): void {
+  runtimeDirOverride = path?.trim() ? resolve(expandUserPath(path.trim())) : undefined;
+}
+
+export function getRuntimeDir(): string | undefined {
+  return runtimeDirOverride;
 }
 
 const warnedConfigFallbacks = new Set<string>();
@@ -3377,7 +3387,8 @@ export function getDefaultConfig(): OcxConfig {
     defaultProvider: "openai",
     subagentModels: [...DEFAULT_SUBAGENT_MODELS],
     multiAgentGuidanceEnabled: true,
-    websockets: false,
+    // Gateway deployments use one listener for HTTP/SSE and WebSocket responses.
+    websockets: true,
     codexAutoStart: true,
     codexShimAutoRestore: true,
   };
@@ -3416,12 +3427,12 @@ export function applyProxyEnv(config: OcxConfig): void {
 }
 
 export function writePid(pid: number): void {
-  const dir = getConfigDir();
+  const dir = dirname(getPidPath());
   // Guard before ANY directory mutation (mkdir or chmod), not just the write.
   assertNotRealHomeUnderTest(dir);
   if (!existsSync(dir)) {
     mkdirSync(dir, { recursive: true, mode: 0o700 });
-  } else {
+  } else if (dir === getConfigDir()) {
     hardenConfigDir();
   }
   atomicWriteFile(getPidPath(), String(pid));
@@ -3450,12 +3461,12 @@ function isValidRuntimePortState(value: unknown): value is RuntimePortState {
 }
 
 export function writeRuntimePort(state: RuntimePortState): void {
-  const dir = getConfigDir();
+  const dir = dirname(getRuntimePortPath());
   // Guard before ANY directory mutation (mkdir or chmod), not just the write.
   assertNotRealHomeUnderTest(dir);
   if (!existsSync(dir)) {
     mkdirSync(dir, { recursive: true, mode: 0o700 });
-  } else {
+  } else if (dir === getConfigDir()) {
     hardenConfigDir();
   }
   atomicWriteFile(getRuntimePortPath(), JSON.stringify(state, null, 2) + "\n");

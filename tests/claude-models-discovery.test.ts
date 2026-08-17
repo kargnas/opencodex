@@ -423,9 +423,10 @@ test("Codex discovery exposes the observed native as a selector row plus one glo
     const plain = await fetch(new URL("/v1/models", server.url))
       .then(response => response.json()) as { data: Array<{ id: string }> };
     expect(plain.data).toContainEqual(expect.objectContaining({ id: "team/gpt-daybreak-blue-latest" }));
-    // Daybreak is globally allowlisted (owner decision, devlog 260816_.../011), so the bare
-    // id is now discoverable too, exactly once.
-    expect(plain.data.filter(model => model.id === "gpt-daybreak-blue-latest")).toHaveLength(1);
+    // zzgg: OpenAI-compatible list keeps the openai/ namespace on native rows.
+    // Daybreak is globally allowlisted, so it appears once under that namespace.
+    expect(plain.data.filter(model => model.id === "openai/gpt-daybreak-blue-latest")).toHaveLength(1);
+    expect(plain.data.some(model => model.id === "gpt-daybreak-blue-latest")).toBe(false);
 
     const managementUrl = new URL("http://localhost/api/models");
     const managementResponse = await handleManagementAPI(

@@ -11,6 +11,7 @@ import { reconcileJournal } from "../codex/journal";
 import {
   codexAutoStartEnabled,
   getConfigDir,
+  getRuntimeDir,
   loadConfig,
   readPid,
   readPidFileValue,
@@ -20,6 +21,7 @@ import {
   removeRuntimePort,
   removeRuntimePortIfPidIs,
   saveConfig,
+  setRuntimeDir,
   writePid,
   writeRuntimePort,
 } from "../config";
@@ -76,21 +78,39 @@ const head = await runCli(process.argv.slice(2));
 const args = head.args;
 const command = head.command;
 
+function parseStartOptions(): { port?: number; runtimeDir?: string } {
+  if (command !== "start") return {};
+  let port: number | undefined;
+  let runtimeDir: string | undefined;
+  for (let index = 1; index < args.length; index++) {
+    const flag = args[index];
+    const value = args[++index];
+    if (flag === "--port") {
+      const parsed = value && /^\d+$/.test(value) ? Number(value) : NaN;
+      if (!Number.isInteger(parsed) || parsed <= 0 || parsed > 65535) {
+        console.error("Invalid port number");
+        process.exit(1);
+      }
+      port = parsed;
+    } else if (flag === "--runtime-dir") {
+      if (!value || value.startsWith("--")) {
+        console.error("Invalid runtime directory");
+        process.exit(1);
+      }
+      runtimeDir = value;
+    } else {
+      console.error("Usage: ocx start [--port <port>] [--runtime-dir <path>]");
+      process.exit(1);
+    }
+  }
+  return { port, runtimeDir };
+}
+
 function parsePortOption(): number | undefined {
-  if (args.length === 1) return undefined;
-  if (args.length !== 3 || args[1] !== "--port") {
-    console.error("Usage: ocx start [--port <port>]");
-    process.exit(1);
-  }
-  const portIdx = args.indexOf("--port");
-  if (portIdx === -1) return undefined;
-  const value = args[portIdx + 1];
-  const port = value && /^\d+$/.test(value) ? Number(value) : NaN;
-  if (!Number.isInteger(port) || port <= 0 || port > 65535) {
-    console.error("Invalid port number");
-    process.exit(1);
-  }
-  return port;
+  if (command !== "start") return undefined;
+  const parsed = parseStartOptions();
+  setRuntimeDir(parsed.runtimeDir);
+  return parsed.port;
 }
 
 async function waitForProxy(timeoutMs = 8_000): Promise<LiveProxy | null> {
@@ -120,12 +140,16 @@ function grokSyncFailureMessage(err: unknown): string {
     + "run 'ocx ensure' (or apply from the dashboard's Grok page) to repoint it.";
 }
 
-/** Argv for detached `start`, optionally hard-pinning the listen port. */
-function startArgv(port?: number): string[] {
+/**
+ * Argv for detached `start`, optionally hard-pinning the listen port.
+ * Keep children on the same lifecycle slot via --runtime-dir (never env).
+ */
+function startArgv(port?: number, runtimeDir = getRuntimeDir()): string[] {
   const args = ["start"];
   if (typeof port === "number" && Number.isFinite(port) && port > 0 && port <= 65535) {
     args.push("--port", String(Math.trunc(port)));
   }
+  if (runtimeDir) args.push("--runtime-dir", runtimeDir);
   return selfLaunchArgv(args);
 }
 

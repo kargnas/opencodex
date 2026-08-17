@@ -33,7 +33,7 @@ import {
   stopServerListener,
 } from "../lifecycle";
 import { isServiceViable } from "../../service";
-import { readRuntimePort } from "../../config";
+import { getRuntimeDir, readRuntimePort } from "../../config";
 import { withProcessRuntimeProvenance } from "../../lib/bun-runtime";
 import { selfLaunchArgv } from "../../lib/self-launch-argv";
 import {
@@ -221,6 +221,8 @@ function spawnDetachedStart(
   if (expectedPort !== undefined) {
     args.push("--port", String(expectedPort));
   }
+  const runtimeDir = getRuntimeDir();
+  if (runtimeDir) args.push("--runtime-dir", runtimeDir);
   const launchArgs = selfLaunchArgv(args);
   return new Promise<void>((resolve, reject) => {
     let child: ReturnType<typeof spawn>;

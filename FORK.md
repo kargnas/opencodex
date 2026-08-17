@@ -24,6 +24,9 @@ upstream을 주기적으로 merge해서 버전을 따라간다. upstream이 고�
   anthropic/codex/openai flavor 경계를 명시하고, Bearer와 x-api-key 값이 다르면
   우선순위 적용 전에 400으로 거부한다. OpenAI-compatible 목록의 native 행은
   `openai/<id>` namespace를 유지한다 (bare slug는 Codex client_version 경로만).
+- `feat(runtime): slot-private lifecycle dir` — `--runtime-dir`로 pid/runtime-port만
+  슬롯 전용 경로에 두고 OPENCODEX_HOME의 durable state는 공유한다. blue/green
+  배포 슬롯용. 예전엔 damn-gfw Docker patch였는데 v2.24.1부터 zzgg에 내장했다.
 
 ## 삭제된 패치 (upstream 반영)
 

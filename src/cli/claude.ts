@@ -7,7 +7,7 @@
  * loopback opencodex base URL points at a different proxy port.
  */
 import { spawn } from "node:child_process";
-import { loadConfig } from "../config";
+import { getRuntimeDir, loadConfig } from "../config";
 import { injectClaudeAgentDefs } from "../claude/agents-inject";
 import { effectiveModelEnv, resolveAutoContext } from "../claude/context-windows";
 import { refreshGatewayModelCacheFromProxy } from "../claude/gateway-cache";
@@ -270,7 +270,10 @@ async function ensureProxyForClaude(): Promise<number | null> {
   if (live) return live.port;
   const cfgPort = loadConfig().port;
   const pinPort = typeof cfgPort === "number" && cfgPort > 0 ? cfgPort : 10100;
-  const child = spawn(process.execPath, selfLaunchArgv(["start", "--port", String(pinPort)]), {
+  const startArgs = ["start", "--port", String(pinPort)];
+  const runtimeDir = getRuntimeDir();
+  if (runtimeDir) startArgs.push("--runtime-dir", runtimeDir);
+  const child = spawn(process.execPath, selfLaunchArgv(startArgs), {
     detached: true,
     stdio: "ignore",
     windowsHide: true,

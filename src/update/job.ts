@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 import {
   atomicWriteFile,
   getConfigDir,
+  getRuntimeDir,
   loadConfig,
   readPid,
   readRuntimePort,
@@ -456,6 +457,8 @@ export function restartCommand(
   const startArgs = pinPort
     ? [launcher, "start", "--port", String(Math.trunc(port))]
     : [launcher, "start"];
+  const runtimeDir = getRuntimeDir();
+  if (runtimeDir && !serviceInstalled) startArgs.push("--runtime-dir", runtimeDir);
   // Default to the non-registering refresh: an update path reaching here has an already
   // installed service, and `install` would demand elevation on Windows scheduler backends.
   const svcArgs = serviceInstalled ? [launcher, ...(serviceArgs ?? ["service", "repair"])] : startArgs;

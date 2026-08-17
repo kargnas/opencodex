@@ -2,7 +2,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { readFileSync, readdirSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
-import { getConfigDir, loadConfig, readPid, readRuntimePort } from "../config";
+import { getConfigDir, getRuntimeDir, loadConfig, readPid, readRuntimePort } from "../config";
 import { npmInvocation } from "./npm-invocation.mjs";
 import {
   npmCachePreflightFailureMessage,
@@ -373,7 +373,10 @@ export async function runUpdate(): Promise<void> {
               : "   Run 'ocx service repair' to refresh the background service and see why it failed.");
             const env = { ...process.env };
             delete env.OCX_SERVICE;
-            const child = spawn(process.execPath, selfLaunchArgv(["start", "--port", String(capturedListen.port)]), {
+            const startArgs = ["start", "--port", String(capturedListen.port)];
+            const runtimeDir = getRuntimeDir();
+            if (runtimeDir) startArgs.push("--runtime-dir", runtimeDir);
+            const child = spawn(process.execPath, selfLaunchArgv(startArgs), {
               detached: true,
               stdio: "ignore",
               windowsHide: true,
