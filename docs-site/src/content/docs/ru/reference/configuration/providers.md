@@ -55,7 +55,7 @@ route fail closed, пока аккаунт отсутствует, а повто
 использует только текущий login вызывающей стороны / основной login. Уровень API использует только
 свой настроенный API-key или key-pool. Используйте bare-model либо `openai-apikey/<model>`;
 cross-route credential fallback не существует. Строки API GPT-5.6 несут метаданные контекста
-1,050,000 / max input 922,000, а виртуальные Pro-id переписываются в базовую wire-модель с
+922,000 / max input 922,000, а виртуальные Pro-id переписываются в базовую wire-модель с
 `reasoning.mode: "pro"`.
 
 `openaiProviderTierVersion: 2` отмечает текущую single-provider projection. Перед миграцией
@@ -69,6 +69,7 @@ cross-route credential fallback не существует. Строки API GPT-
 | --- | --- | --- |
 | `adapter` | `string` | Один из `openai-chat`, `openai-responses`, `anthropic`, `google`, `kiro`, `cursor`, `azure-openai` (или alias `azure`). |
 | `baseUrl` | `string` | Базовый URL API upstream'а. Большинство built-in fixed-endpoint'ов игнорируют несовпадение; collision-safe key-preset'ы сохраняют старый custom destination с тем же именем. |
+| `requestPacing?` | `{ enabled, requestsPerMinute?, minIntervalMs?, models? }` | Опциональное клиентское выравнивание начала исходящих запросов, отдельное от учёта использования, биллинга и индикаторов rate limit апстрима. Лимит провайдера действует на все модели, а `models` сопоставляется с точными ID моделей апстрима и может только увеличить задержку. Ожидание очереди не расходует таймаут заголовков ответа. Поддерживаются HTTP, Responses WebSocket и явные вызовы адаптеров `fetchResponse`/`runTurn`. |
 | `responsesPath?` | `string` | Relative resource path для key-auth запросов `openai-responses`. Должен начинаться с `/` и не может содержать scheme, query или fragment. |
 | `supportsServiceTier?` | `boolean` | Три состояния поддержки `service_tier`. `true`: fast mode может подставлять поле, значения вызывающего сохраняются. `false`: поле удаляется и никогда не подставляется (апстрим, для которого задокументировано отсутствие поддержки, не должен его получать). Не задано: провайдер не классифицирован — значения вызывающего сохраняются без изменений, fast mode не подставляет. Registry классифицирует canonical OpenAI (`true`), DeepSeek и Volcengine Ark (`false`); задавайте явно только для custom gateway'ев, реально поддерживающих tier'ы. |
 | `preserveResponsesReasoningContent?` | `boolean` | Сохранять plaintext reasoning content в replay'нутых Responses reasoning item'ах вместо очистки (очистка — правило ChatGPT backend'а). Включайте для upstream'ов, чей контракт принимает reasoning replay, например DeepSeek. Proxy-minted `ocxr1` envelope'ы удаляются всегда. |
@@ -106,6 +107,7 @@ cross-route credential fallback не существует. Строки API GPT-
 | `noTemperatureModels?` | `string[]` | Модели, отвергающие переданный вызывающей стороной `temperature`. |
 | `noTopPModels?` | `string[]` | Модели, отвергающие переданный вызывающей стороной `top_p`. |
 | `noPenaltyModels?` | `string[]` | Модели, отвергающие penalty presence/frequency. |
+| `noStructuredOutputModels?` | `string[]` | Точные идентификаторы моделей, чей endpoint `openai-chat` отклоняет `response_format`. Поле опускается только при точном совпадении запрошенной модели; для остальных моделей `openai-chat` преобразование structured output остаётся включённым. |
 | `parallelToolCalls?` | `boolean` | Переключатель parallel tool call'ов. Для OpenAI Chat по умолчанию включено; не-chat adapter'ы рекламируют это только при явном `true`. |
 | `responsesItemIdRepair?` | `{ message?: string[]; reasoning?: string[]; repairMissingTerminalIds?: boolean; repairInvalidIds?: boolean }` | По умолчанию выключенная downstream SSE-repair для exact placeholder-id, отсутствующих terminal-id и (с `repairInvalidIds`) message/reasoning id без канонического префикса `msg_`/`rs_`. Function-call id никогда не переписываются. Встроенный DeepSeek включает последние два по умолчанию. |
 | `responsesSnapshotRepair?` | `boolean` | По умолчанию выключенная клиентская repair для неполных lifecycle snapshot'ов Responses в SSE и JSON. Добавляет отсутствующие status, output и tool metadata, не меняя raw inspection и persistence. |
@@ -381,9 +383,9 @@ malformed-результаты откатываются к stale/configured fall
 дальнейших изменений allowlist'а.
 
 Preview fallback-записи GPT-5.6 используют тот же механизм. Preset OpenAI API-key заранее засевает
-base- и Pro-id с context `1050000` и max input `922000`; OpenRouter заранее засевает
-`openai/gpt-5.6-sol`, `openai/gpt-5.6-terra` и `openai/gpt-5.6-luna` с context `1050000`.
-Pool/Direct рекламирует `372000`; синхронизированный каталог показывает `max`, сохраняя при этом
+base- и Pro-id с context `922000` и max input `922000`; OpenRouter заранее засевает
+`openai/gpt-5.6-sol`, `openai/gpt-5.6-terra` и `openai/gpt-5.6-luna` с context `922000`.
+Pool/Direct рекламирует `922000`; синхронизированный каталог показывает `max`, сохраняя при этом
 отдельную ступень `xhigh`.
 
 ```json

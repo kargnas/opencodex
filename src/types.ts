@@ -1,5 +1,26 @@
 import type { KiroOAuthMetadata } from "./oauth/types";
 
+/** Exact provider/credential namespace for process-local reasoning replay. */
+export interface OcxReasoningReplayIdentity {
+  providerName: string;
+  /** Opaque process-local digest of the exact upstream destination. */
+  providerDestinationIdentity: string;
+  adapterName: string;
+  modelId: string;
+  /** Opaque process-local credential identity; never a raw token or API key. */
+  credentialIdentity: string;
+}
+
+/**
+ * Stable holder shared by parsed-request copies and already-created bridges.
+ * Credential/provider rotation replaces `current` atomically without replacing
+ * the holder, so late tool-call cache writes see the active physical identity.
+ */
+export interface OcxReasoningReplayScopeRef {
+  readonly clientThreadId: string;
+  current?: Readonly<OcxReasoningReplayIdentity>;
+}
+
 export interface OcxParsedRequest {
   modelId: string;
   /** Client-facing model selector retained for Anthropic routes after wire-model normalization. */
@@ -11,14 +32,26 @@ export interface OcxParsedRequest {
   stream: boolean;
   options: OcxRequestOptions;
   _rawBody?: unknown;
-  /** Number of leading raw input items restored from local previous_response_id state. */
+  /**
+   * Boundary between replayed history and this turn's newly appended input. Usually the
+   * items the proxy restored from local previous_response_id state; also set when the
+   * CLIENT already carried that history verbatim and the proxy skipped the prepend.
+   */
   _replayPrefixLen?: number;
-  /** True when the proxy expanded a previous_response_id request into a full input replay. */
+  /** Parsed-message index before the first conversational item in a continuation's current delta. */
+  _continuationConversationMessageIndex?: number;
+  /**
+   * True when the full history for a previous_response_id request is present in the input —
+   * whether the proxy expanded it or the client already sent it. Consumers read this as
+   * "this request is self-contained", never as "the proxy mutated it".
+   */
   _previousResponseInputExpanded?: boolean;
   /** Provider-private stable Cursor conversation id resolved from the Responses previous_response_id chain. */
   _cursorConversationId?: string;
   /** Stable upstream client thread identity, used only to derive provider-scoped continuation ids. */
   _clientThreadId?: string;
+  /** Provider/account/model-bound namespace for process-local raw-reasoning replay. */
+  _reasoningReplayScope?: OcxReasoningReplayScopeRef;
   /**
    * Optional authenticated tenant/operator namespace for Cursor thread→conversation derivation.
    * When absent (single-operator local proxy), derivation stays local-scoped.
@@ -147,8 +180,25 @@ export interface OcxToolCall {
   arguments: Record<string, unknown>;
   customWireName?: string;
   thoughtSignature?: string;
+  /**
+   * Provider-issued opaque metadata that must survive the whole round trip unchanged
+   * (issue #1735). A signed Gemini part is only valid when its signature comes back on the
+   * SAME part it was issued for, so this travels with the individual tool call rather than
+   * being matched by name/arguments after the fact.
+   */
+  providerMetadata?: OcxProviderOpaqueToolCallMetadata;
   /** MCP namespace (e.g. "mcp__context7") when this call targets a namespaced tool. */
   namespace?: string;
+}
+
+/**
+ * Opaque, provider-scoped tool-call metadata. Values are never parsed, merged, re-encoded, or
+ * synthesized — they are carried verbatim or not at all.
+ */
+export interface OcxProviderOpaqueToolCallMetadata {
+  google?: {
+    thoughtSignature?: string;
+  };
 }
 
 export type OcxAssistantContentPart = OcxTextContent | OcxThinkingContent | OcxToolCall;
@@ -295,7 +345,7 @@ export type AdapterEvent =
   // Never rendered — it only rides the reasoning item's envelope so the next request can replay it.
   | { type: "kiro_redacted_reasoning"; data: string }
   | { type: "reasoning_raw_delta"; text: string }
-  | { type: "tool_call_start"; id: string; name: string }
+  | { type: "tool_call_start"; id: string; name: string; providerMetadata?: OcxProviderOpaqueToolCallMetadata }
   | { type: "tool_call_delta"; arguments: string }
   | { type: "tool_call_end" }
   /** Internal boundary between a guarded first pass and its one-shot continuation. */
@@ -408,6 +458,17 @@ export interface OcxClaudeCodeConfig {
   /** Inbound model id remaps: exact id first, then date-stripped (`-\d{8}$`). */
   modelMap?: Record<string, string>;
   /**
+   * Explicit classifier model for Claude Code Auto Mode safety checks (e.g. "RelayA/claude-opus-5").
+   * When unset, bare classifier requests check modelMap, then same-provider affinity from
+   * `claudeCode.model`, then compatible Anthropic-adapter providers, and finally fallbacks.
+   */
+  classifierModel?: string;
+  /**
+   * Ordered fallback candidates for Claude Code Auto Mode classifier routing when the primary
+   * classifier route is not available.
+   */
+  classifierFallbacks?: string[];
+  /**
   * Inject ANTHROPIC_BASE_URL etc. into the macOS user domain via `launchctl setenv`
   * so plain `claude` commands route through the proxy without `ocx claude`. Reverted
    * on stop/shutdown. Default: false (opt-in). macOS only.
@@ -464,7 +525,7 @@ export interface OcxClaudeCodeConfig {
    * (the legacy DISABLE_COMPACT pair takes rule-1 precedence in the CLI).
    */
   autoContext?: boolean;
-  /** Compact-window tokens for auto-context. Default 350_000. */
+  /** Compact-window tokens for auto-context. Default 829_800 (AUTO_COMPACT_WINDOW_DEFAULT). */
   autoCompactWindow?: number;
   /**
    * Bundled-skill content elision for ROUTED (non-Anthropic) models (devlog 260712
@@ -546,7 +607,7 @@ export interface OcxCustomModel {
   id: string;
   /** 프로바이더 키 (기존 providers[name]) */
   provider: string;
-  /** 모델 슬러그 (프로바이더 접두사 없는 bare id) */
+  /** Native provider model id; slashes are allowed and encoded for Codex as provider/<hyphenated-id>. */
   modelId: string;
   /** 인간 가독 표시명 (선택, 슬래시 불가) */
   displayName?: string;
@@ -554,6 +615,13 @@ export interface OcxCustomModel {
   contextWindow?: number;
   /** 입력 모달리티 (선택, 기본 ["text"]) */
   inputModalities?: string[];
+  /**
+   * Reasoning ladder (Codex labels) this custom row explicitly advertises. An empty array
+   * hides the effort control; an omitted key leaves the provider-derived ladder in charge.
+   */
+  reasoningEfforts?: string[];
+  /** Default effort label when `reasoningEfforts` is non-empty. */
+  defaultReasoningEffort?: string;
   /** 추가 시각 (ISO 8601) */
   addedAt?: string;
 }
@@ -590,6 +658,8 @@ export interface OcxClientIntegrationsConfig {
 
 export interface OcxConfig {
   port: number;
+  /** Opt in to one identical-turn retry when a Responses completion has no text or tool call. */
+  emptyCompletionRetry?: boolean;
   /** Maximum usage-log bytes read for one management snapshot. */
   managementUsageMaxReadBytes?: number;
   providers: Record<string, OcxProviderConfig>;
@@ -612,6 +682,20 @@ export interface OcxConfig {
    * into a selector-qualified group; Codex still advertises only the first 5 visible rows.
    */
   subagentModels?: string[];
+  /**
+   * Optional full picker ordering for the Codex model catalog, independent of the
+   * 5-slot `subagentModels` spawn_agent cap. DISPLAY-ONLY: it controls the visual order of
+   * the Codex model picker for large routed catalogs (10-20+ models) that would otherwise sort
+   * arbitrarily and reshuffle on every rebuild. Values are routed `<provider>/<model>` catalog
+   * slugs (matched by exact slug or `provider/id`); native OpenAI passthrough rows and
+   * account-qualified native rows are not reordered (order native rows via `subagentModels`).
+   * Listed routed rows appear in array order; rows not listed keep their normal display order.
+   * `subagentModels`-featured rows keep their top position. When unset or empty, catalog
+   * priority is unchanged. This changes ONLY what the user sees in the picker: the spawn_agent
+   * candidate set is derived from each row's natural priority and is provably unaffected, even
+   * when every routed row is listed (see opencodex_spawn_priority / effectiveSubagentRoster).
+   */
+  modelPickerOrder?: string[];
   /**
    * Priority-ordered fallback models for spawned sub-agents. When the requested
    * model is quota-exhausted or recently failed, opencodex rewrites the child
@@ -731,11 +815,11 @@ export interface OcxConfig {
    */
   customModelCatalogMigration?: unknown;
   /**
-   * Shadow call intercept: redirect Codex's hard-coded helper calls (title generation,
-   * commit messages, skill orchestration) to a user-chosen model. Default intercepted
-   * source models: gpt-5.4-mini (older clients) and gpt-5.6-luna (Codex 0.145.0+).
-   * Opt-in; disabled by default. Matching maintenance/helper requests are forced to low.
-   * Normal Codex turns identified by request_kind=turn are never rewritten.
+  * Shadow call intercept: redirect Codex's hard-coded helper calls (title generation,
+  * commit messages, skill orchestration) to a user-chosen model. Default intercepted
+  * source models: gpt-5.4-mini (older clients) and gpt-5.6-luna (Codex 0.145.0+).
+  * Opt-in; disabled by default. Matching maintenance/helper requests are forced to low.
+   * All requests for configured shadow source models are intercepted unconditionally.
    */
   shadowCallIntercept?: {
     /** When true, requests for known shadow/helper source models are rewritten to the configured model. */
@@ -752,6 +836,21 @@ export interface OcxConfig {
    * - "v2": force ALL models to v2 surface (override upstream pins)
    */
   multiAgentMode?: "v1" | "default" | "v2";
+  /**
+   * When `multiAgentMode` is `"v2"`, keep ChatGPT-native catalog rows on v1.
+   * Routed parents get v2 tools; Sol/Terra can still spawn Grok/Claude (issue #92).
+   */
+  keepNativeChatGptOnV1?: boolean;
+  /** Experimental, default-off ChatGPT recovery for encrypted V2 routed tasks. */
+  agentTaskRecovery?: {
+    enabled?: boolean;
+    /** ChatGPT model used by the recovery request. Default: gpt-5.6-sol. */
+    model?: string;
+    /** Recovery request timeout in milliseconds. Default: 45000. */
+    timeoutMs?: number;
+    /** Maximum in-memory ciphertext-to-assignment entries. Default: 200. */
+    cacheEntries?: number;
+  };
   /** Provider-level Codex-visible context caps. Values only lower known model context windows. */
   providerContextCaps?: Record<string, number>;
   /** Global Codex-visible context cap value (tokens). Falls back to DEFAULT_PROVIDER_CONTEXT_CAP. */
@@ -924,6 +1023,12 @@ export interface OcxComboConfig {
   /** Used when the client omits reasoning.effort. null/omitted leaves the target default unchanged. */
   defaultEffort?: OcxComboDefaultEffort | null;
   /**
+   * Disable image input even when every target supports it.
+   * Omitted / `"auto"` keeps automatic capability derivation (default: enabled when
+   * the target intersection includes image).
+   */
+  imageInput?: "auto" | "disabled";
+  /**
    * Optional public model name replacing the default `combo/<id>` slug. Bare names
    * without "/" are allowed (e.g. "deepseek-v4-flash") so the combo can answer to a
    * mandated model id; exact-match requests route here before any provider resolution.
@@ -995,6 +1100,19 @@ export interface OcxRoutingProfileUnknownEvidence {
   cost?: OcxRoutingUnknownEvidenceMode;
 }
 
+export interface OcxRoutingProfileCompatibilitySuite {
+  suiteId: string;
+  evidenceLayer: "protocol_conformance" | "live_route_compatibility";
+}
+
+export interface OcxRoutingProfileCompatibility {
+  requiredSuites?: OcxRoutingProfileCompatibilitySuite[];
+  minStatus?: "PROBED" | "VERIFIED";
+  maxEvidenceAgeMs?: number;
+  unknownEvidence?: OcxRoutingUnknownEvidenceMode;
+  degradedEvidence?: OcxRoutingUnknownEvidenceMode;
+}
+
 export interface OcxRoutingProfileConfig {
   /**
    * Explicit candidate allowlist (`provider/model` refs). No implicit
@@ -1010,6 +1128,8 @@ export interface OcxRoutingProfileConfig {
   limits?: OcxRoutingProfileLimits;
   /** How unknown evidence is handled per dimension. */
   unknownEvidence?: OcxRoutingProfileUnknownEvidence;
+  /** Optional Compatibility Lab policy (CL-06). */
+  compatibility?: OcxRoutingProfileCompatibility;
 }
 
 /**
@@ -1111,6 +1231,14 @@ export interface OcxWebSearchSidecarConfig {
    * during a web-search turn. Default 200000. Must be an integer from 1 through 2147483647.
    */
   routedModelStallTimeoutMs?: number;
+  /**
+   * Stream the routed model's leading output (text/thinking deltas) live instead of buffering the
+   * whole iteration. Live delivery stops at the first tool-call boundary so web_search interception
+   * stays atomic. Tradeoff: text the model emits BEFORE deciding to search — which buffered mode
+   * silently drops — becomes visible to the client and may partially repeat in the post-search
+   * answer. Default: false (buffered, previous behavior).
+   */
+  streamRoutedModelOutput?: boolean;
 }
 
 export interface OpenRouterProviderRouting {
@@ -1168,12 +1296,28 @@ export interface ProviderCostOverlay {
   cacheWrite: number;
 }
 
+export interface RequestPacingRule {
+  /** Evenly spread request starts to this many requests per minute. */
+  requestsPerMinute?: number;
+  /** Minimum delay between request starts. The slower configured value wins. */
+  minIntervalMs?: number;
+}
+
+export interface ProviderRequestPacingConfig extends RequestPacingRule {
+  /** False preserves legacy behavior with no client-side waiting. */
+  enabled: boolean;
+  /** Exact upstream model-id overrides; other models inherit the provider rule. */
+  models?: Record<string, RequestPacingRule>;
+}
+
 /**
  * One configured provider entry. `authMode` (default `"key"`) decides whether same-target 429
  * retries are allowed; OAuth/forward credentials and local runtimes are never replayed.
  */
 export interface OcxProviderConfig {
   adapter: string;
+  /** Optional outbound request-start pacing shared by this provider and its model overrides. */
+  requestPacing?: ProviderRequestPacingConfig;
   /** Cursor MCP compatibility bounds; positive integers when configured. */
   mcpMaxTools?: number;
   mcpMaxSchemaBytes?: number;
@@ -1210,14 +1354,16 @@ export interface OcxProviderConfig {
    */
   statelessResponses?: boolean;
   /**
-   * Responses upstream whose parser requires each tool result to immediately follow
-   * its matching call. When enabled, only unambiguous matched pairs are reordered;
-   * intervening messages are preserved after the result instead of being dropped.
+   * Responses upstream whose parser requires an unambiguous call batch and its matched
+   * result batch to remain contiguous. Hook-injected context that splits the batch is
+   * preserved after it, and parallel calls stay together with the reasoning turn that produced them.
    */
   requiresAdjacentResponsesToolResults?: boolean;
   /**
-   * Whether this provider's Responses route honours the OpenAI `service_tier`
-   * parameter. Tri-state: `true` lets fast mode inject/remove the field (an unset
+   * Provider fallback for the OpenAI `service_tier` parameter. On Responses routes this
+   * is the complete wire opt-in; Chat routes additionally require `chatServiceTier` or an
+   * exact-model true declaration.
+   * Tri-state: `true` lets fast mode inject/remove the field (an unset
    * fast mode preserves a caller-supplied value); `false` strips the field and
    * never injects, because an upstream documented as not supporting the parameter
    * must not receive it; absent (`undefined`) leaves the provider unclassified —
@@ -1225,6 +1371,8 @@ export interface OcxProviderConfig {
    * An explicit config value always wins over the registry default.
    */
   supportsServiceTier?: boolean;
+  /** Exact upstream model ids that override the provider-level service-tier capability. */
+  modelSupportsServiceTier?: Record<string, boolean>;
   /**
    * Responses upstream whose native contract accepts plaintext reasoning replay
    * (DeepSeek documents reasoning items with plaintext content). When set, the
@@ -1238,6 +1386,14 @@ export interface OcxProviderConfig {
    * link-local, or unique-local upstreams. Metadata endpoints remain blocked.
    */
   allowPrivateNetwork?: boolean;
+  /**
+   * Pin the HTTP version used for upstream provider requests. Bun's fetch negotiates
+   * HTTP/2 via TLS ALPN by default; some Cloudflare-fronted SSE endpoints hang on
+   * HTTP/2 streaming responses (issue #1668). "http1.1" / "h1" forces HTTP/1.1,
+   * "http2" / "h2" forces HTTP/2. Absent or "auto" keeps Bun's default negotiation
+   * (current behavior unchanged). Only meaningful for https: base URLs.
+   */
+  upstreamHttpVersion?: UpstreamHttpVersion;
   /** Keep provider settings on disk but exclude it from routing and model/catalog listings. */
   disabled?: boolean;
   /**
@@ -1379,6 +1535,12 @@ export interface OcxProviderConfig {
   /** Model ids that reject caller-specified presence/frequency penalty values. */
   noPenaltyModels?: string[];
   /**
+   * Model ids whose Chat Completions endpoint rejects `response_format`.
+   * Structured-output translation remains enabled by default; this is a narrow
+   * per-model compatibility escape hatch for mixed-capability gateways.
+   */
+  noStructuredOutputModels?: string[];
+  /**
    * Allow multiple tool calls per completion. DEFAULT-ON for openai-chat providers (the
    * buffered stream parser assembles interleaved/fragmented multi-call turns safely);
    * set `false` to force `parallel_tool_calls:false` upstream and drop the catalog's
@@ -1387,11 +1549,43 @@ export interface OcxProviderConfig {
    */
   parallelToolCalls?: boolean;
   /**
+   * Opt-in: when `parallelToolCalls` is `false`, actually send `parallel_tool_calls: false`
+   * on the `/chat/completions` wire for this provider. By default an opted-out provider only
+   * OMITS the field (strict OpenAI-compatible hosts reject unknown knobs), and the NVIDIA NIM
+   * baseUrl is the sole built-in exception that pins the wire bit. Some self-hosted gateways
+   * (Kimi/GLM-family, vLLM, etc.) do honor `parallel_tool_calls` and keep emitting concurrent
+   * tool calls unless it is present; enable this to pin the bit without hardcoding their URL.
+   * No effect unless `parallelToolCalls === false`; ignored by non-`openai-chat` adapters.
+   */
+  pinParallelToolCallsFalse?: boolean;
+  /**
+   * Opt-in: extend the no-tool-call terminal continuation guard to this provider's
+   * `openai-chat` routed turns. The guard (originally Anthropic-only, see
+   * devlog/_fin/260706_previous-response-id-400) issues one bounded internal re-ask when a
+   * model announces work but ends the turn without emitting a tool call. Self-hosted
+   * OpenAI-compatible gateways (GLM/Kimi-family, etc.) hit the same premature-completion
+   * pattern, but the heuristic that decides a "suspicious no-tool stop" was tuned on
+   * Anthropic turns, so it stays OFF by default for the many registry providers that share
+   * the `openai-chat` adapter. Enable only for a provider whose models are known to stop
+   * mid-work; non-`openai-chat` adapters ignore this flag.
+   */
+  terminalContinuationGuard?: boolean;
+  /**
    * Opt-in: forward `prompt_cache_key` to the upstream `/chat/completions` body.
    * OpenAI-specific extension; strict backends (Groq, Cerebras, etc.) reject unknown
    * fields. Default off; only enable for providers that document this parameter.
    */
   promptCacheKey?: boolean;
+  /**
+   * Opt-in: forward `service_tier` to the upstream `/chat/completions` body.
+   * OpenAI-specific extension with the same hazard as `promptCacheKey` — strict backends
+   * reject unknown fields, and 66 registry providers share the `openai-chat` adapter, so a
+   * caller-supplied `service_tier` would otherwise turn working requests into upstream 400s.
+   * Exact models may opt in through `modelSupportsServiceTier` instead; provider-level
+   * `supportsServiceTier: false` remains a global denial. Default off; only enable for
+   * providers that document this parameter on the chat wire.
+   */
+  chatServiceTier?: boolean;
   /**
    * Provider-local passthrough SSE repair for broken openai-responses gateways that reuse exact
    * placeholder message/reasoning ids or omit the terminal id after a stable added event.
@@ -1492,6 +1686,21 @@ export interface OcxProviderConfig {
    */
   nativeLocalExec?: "off" | "codex-sandbox" | "on";
 }
+
+/**
+ * Accepted values for the per-provider upstream HTTP-version pin (#1668). Shared by the
+ * zod load schema, the management write boundary (POST/PATCH), and the fetch runtime, so
+ * a value that one boundary accepts can never be rejected by another.
+ */
+export const UPSTREAM_HTTP_VERSION_VALUES = [
+  "auto",
+  "http1.1",
+  "h1",
+  "http2",
+  "h2",
+] as const;
+
+export type UpstreamHttpVersion = (typeof UPSTREAM_HTTP_VERSION_VALUES)[number];
 
 export const REASONING_SUMMARY_DELIVERY_VALUES = [
   "sequential",

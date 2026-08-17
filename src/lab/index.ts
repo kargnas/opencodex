@@ -18,6 +18,7 @@ export * from "./ledger/artifact-refs";
 export * from "./projection/verification";
 export * from "./observe/from-conformance";
 export * from "./observe/from-live";
+export * from "./fabric";
 export * from "./live/manifest";
 export * from "./live/runner";
 export * from "./live/executor";
@@ -34,3 +35,20 @@ export * from "./subject/behavior-fingerprint";
 export * from "./subject/installation-salt";
 export { CL03_LIVE_SUITES } from "./conformance/types";
 export * from "./query";
+export * from "./automation";
+export * from "./public/types";
+export {
+  exportLocalPublicEvidence,
+  importCommunityEvidenceFile,
+  importCommunityEvidenceValue,
+  listCommunityEvidenceContext,
+  previewLocalPublicEvidence,
+  summarizePublicEvidenceVerification,
+  verifyPublicEvidenceFile,
+  type LocalPublicExportV1,
+  type LocalPublicPreviewV1,
+  type PublicOperatorExclusionReason,
+  type PublicOperatorExclusionV1,
+  type PublicVerificationSummaryV1,
+} from "./public/operator";
+export { PublicEvidenceValidationError } from "./public/validate";

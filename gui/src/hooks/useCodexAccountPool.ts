@@ -1,5 +1,9 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { usageSummary30dResourceKey } from "../usage-summary-resource";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { createBoundedFetch } from "../bounded-fetch";
+import { startVisibilityPoll } from "../visibility-poll";
 import { normalizeAccountPriority } from "../account-priority";
+import { useKeyedClientResource } from "../client-resource";
 import { extractAutoSwitchThresholdPayload } from "../codex-auto-switch";
 import type { AccountQuota } from "../codex-quota-utils";
 import { accountNeedsReauth } from "../oauth-health-display";
@@ -24,6 +28,8 @@ export interface CodexAccountEntry {
   id: string;
   email: string;
   alias?: string;
+  /** Stable non-PII identity shared with Logs and per-account usage aggregation. */
+  logLabel?: string;
   plan?: string;
   /** Required, not optional: the API always distinguishes the app-login row. */
   isMain: boolean;
@@ -38,6 +44,11 @@ export interface CodexAccountEntry {
   healthLabel?: string;
   healthSummary?: string;
   healthAction?: string;
+  usage30d?: {
+    totalTokens: number;
+    estimatedCostUsd?: number;
+    usageCoverageRatio: number;
+  };
 }
 
 export type CodexAccountLoadState = "loading" | "ready" | "error";
@@ -104,6 +115,16 @@ export interface CodexAccountPoolController {
 }
 
 const REFRESH_INTERVAL_MS = 30_000;
+interface CodexAccountUsageRow {
+  accountLogLabel: string;
+  totalTokens: number;
+  estimatedCostUsd?: number;
+  usageCoverageRatio: number;
+}
+
+interface CodexAccountUsageSummary {
+  accounts?: CodexAccountUsageRow[];
+}
 
 /** In-memory last-good snapshot (not sessionStorage — accounts carry emails/ids). */
 const lastGoodByBase = new Map<string, { accounts: CodexAccountEntry[]; activeId: string | null }>();
@@ -111,6 +132,16 @@ const lastGoodByBase = new Map<string, { accounts: CodexAccountEntry[]; activeId
 export function useCodexAccountPool(apiBase: string, enabled = true): CodexAccountPoolController {
   const seed = lastGoodByBase.get(apiBase);
   const [accounts, setAccounts] = useState<CodexAccountEntry[]>(() => seed?.accounts ?? []);
+  const usage30d = useKeyedClientResource<CodexAccountUsageSummary>(
+    usageSummary30dResourceKey(apiBase, "codex"),
+    [apiBase],
+    async (signal) => {
+      const response = await fetch(`${apiBase}/api/usage?range=30d&surface=codex`, { signal });
+      if (!response.ok) throw new Error("account usage load failed");
+      return response.json() as Promise<CodexAccountUsageSummary>;
+    },
+    { enabled },
+  );
   const [activeId, setActiveId] = useState<string | null>(() => seed?.activeId ?? null);
   const [loadState, setLoadState] = useState<CodexAccountLoadState>(() => (seed != null ? "ready" : "loading"));
   const [switchingId, setSwitchingId] = useState<string | null>(null);
@@ -174,6 +205,8 @@ export function useCodexAccountPool(apiBase: string, enabled = true): CodexAccou
 
   const load = useCallback(async (refreshQuota = false): Promise<boolean> => {
     const generation = ++loadGenerationRef.current;
+    // Bounded per attempt: a hung accounts/active read must settle, not pin the poll.
+    const bounded = createBoundedFetch(20_000);
     setInflightCount(count => count + 1);
     // The try opens immediately after the increment so even a synchronous throw in the
     // observer snapshot below cannot leave the counter stuck above zero.
@@ -190,16 +223,20 @@ export function useCodexAccountPool(apiBase: string, enabled = true): CodexAccou
 
       const accountsTask = (async (): Promise<boolean> => {
         try {
-          const response = await fetch(`${apiBase}/api/codex-auth/accounts${refreshQuota ? "?refresh=1" : ""}`);
+          const response = await fetch(`${apiBase}/api/codex-auth/accounts${refreshQuota ? "?refresh=1" : ""}`, { signal: bounded.signal });
           if (!response.ok) throw new Error("account load failed");
           const payload = await response.json();
           if (loadGenerationRef.current === generation) {
             // Selection order is required downstream (badge, select). Normalizing here keeps
             // a payload without it from rendering a NaN order on every card.
-            nextAccounts = ((payload.accounts ?? []) as CodexAccountEntry[]).map(account => ({
-              ...account,
-              priority: normalizeAccountPriority(account.priority),
-            }));
+            nextAccounts = ((payload.accounts ?? []) as CodexAccountEntry[]).map(account => {
+              const logLabel = account.isMain ? "main" : account.logLabel;
+              return {
+                ...account,
+                ...(logLabel ? { logLabel } : {}),
+                priority: normalizeAccountPriority(account.priority),
+              };
+            });
             setAccounts(nextAccounts);
             hasAccountsRef.current = nextAccounts.length > 0;
             hasLoadedRef.current = true;
@@ -214,7 +251,7 @@ export function useCodexAccountPool(apiBase: string, enabled = true): CodexAccou
 
       const activeTask = (async (): Promise<boolean> => {
         try {
-          const response = await fetch(`${apiBase}/api/codex-auth/active`);
+          const response = await fetch(`${apiBase}/api/codex-auth/active`, { signal: bounded.signal });
           if (!response.ok) throw new Error("active account load failed");
           const active = await response.json();
           if (loadGenerationRef.current === generation) {
@@ -260,9 +297,11 @@ export function useCodexAccountPool(apiBase: string, enabled = true): CodexAccou
       if (!hasLoadedRef.current) setLoadState("error");
       return false;
     } finally {
+      bounded.clear();
       setInflightCount(count => Math.max(0, count - 1));
       setFirstAttemptSettled(true);
     }
+  // oxlint-disable-next-line react/react-compiler -- preserve existing callback dependency semantics during Oxlint migration
   }, [apiBase]);
 
   // Initial load plus background refresh. Owned here so mounting or unmounting a surface
@@ -302,11 +341,11 @@ export function useCodexAccountPool(apiBase: string, enabled = true): CodexAccou
     };
   }, [enabled, needsQuotaFill, pauseCount, load]);
 
-  // Background refresh, suspended while any pause lease is held.
+  // Background refresh, suspended while any pause lease is held — and fully paused
+  // (no timer, no traffic) while the tab is hidden.
   useEffect(() => {
     if (!enabled || pauseCount > 0) return;
-    const interval = window.setInterval(() => { void load(); }, REFRESH_INTERVAL_MS);
-    return () => window.clearInterval(interval);
+    return startVisibilityPoll(() => { void load(); }, REFRESH_INTERVAL_MS);
   }, [enabled, load, pauseCount]);
 
   const pauseRefresh = useCallback((): PauseToken => {
@@ -518,9 +557,19 @@ export function useCodexAccountPool(apiBase: string, enabled = true): CodexAccou
   // Include health-only reauth so Providers overview attention matches row CTAs.
   const activeAccount = activePoolAccount ?? mainAccount;
   const activeNeedsReauth = !activeAccount?.paused && accountNeedsReauth(activeAccount);
+  const accountsWithUsage = useMemo(() => {
+    const usageByLabel = new Map(
+      (usage30d.data?.accounts ?? []).map(row => [row.accountLogLabel, row] as const),
+    );
+    return accounts.map(account => {
+      const logLabel = account.isMain ? "main" : account.logLabel;
+      const accountUsage = logLabel ? usageByLabel.get(logLabel) : undefined;
+      return accountUsage ? { ...account, usage30d: accountUsage } : account;
+    });
+  }, [accounts, usage30d.data]);
 
   return {
-    accounts,
+    accounts: accountsWithUsage,
     activeId,
     loadState,
     refreshing: inflightCount > 0,

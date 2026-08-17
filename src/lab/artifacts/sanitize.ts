@@ -8,8 +8,8 @@ import { jcsStringify } from "../digest";
 import { redactSecretString } from "../../lib/redact";
 
 const FORBIDDEN_KEY = /^(?:authorization|proxy-authorization|cookie|set-cookie|api[-_]?key|x-api-key|token|secret|password|email|prompt|messages|content|body|url|hostname|baseUrl|path|account|alias)$/i;
-const SECRETISH = /sk-[a-z0-9]{10,}|Bearer\s+[A-Za-z0-9._\-]+|ghp_[A-Za-z0-9]{20,}|xox[baprs]-[A-Za-z0-9-]{10,}/i;
-const SECRETISH_GLOBAL = /sk-[a-z0-9]{10,}|Bearer\s+[A-Za-z0-9._\-]+|ghp_[A-Za-z0-9]{20,}|xox[baprs]-[A-Za-z0-9-]{10,}/gi;
+const SECRETISH = /sk-[a-z0-9]{10,}|credential-canary-[a-z0-9]{10,}|Bearer\s+[A-Za-z0-9._\-]+|ghp_[A-Za-z0-9]{20,}|xox[baprs]-[A-Za-z0-9-]{10,}/i;
+const SECRETISH_GLOBAL = new RegExp(SECRETISH.source, "gi");
 
 export function redactForArtifact(artifactClass: ArtifactClass, payload: unknown): unknown {
   if (
@@ -83,7 +83,7 @@ function scrubValue(value: unknown, depth: number): unknown {
  * Provider-controlled text can carry network and account identifiers that the
  * Compatibility Lab privacy contract forbids persisting. The rules below run in
  * a fixed total order; the order is load-bearing and documented in
- * `devlog/_plan/260810_release_train_and_triage/040_sec02_remediation.md`:
+ * `devlog/_fin/260810_release_train_and_triage/040_sec02_remediation.md`:
  *
  *   email before hostname   - else the hostname rule eats `example.com` in an address
  *   MAC before IPv6         - else `01:23:45:67:89:ab` matches as a mangled address

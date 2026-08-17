@@ -1,6 +1,6 @@
 import { execFileSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { chmodSync, copyFileSync, existsSync, linkSync, lstatSync, mkdirSync, readFileSync, realpathSync, renameSync, truncateSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, constants as fsConstants, copyFileSync, existsSync, linkSync, lstatSync, mkdirSync, readFileSync, realpathSync, renameSync, truncateSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { Database } from "bun:sqlite";
@@ -60,6 +60,7 @@ import {
   OPENAI_PROVIDER_TIER_VERSION,
   pinnedWireAdapter,
   REASONING_SUMMARY_DELIVERY_VALUES,
+  UPSTREAM_HTTP_VERSION_VALUES,
   type OcxClaudeCodeConfig,
   type OcxConfig,
   type OcxApiKeyEntry,
@@ -78,6 +79,7 @@ import { isCodexReasoningEffort, modelRecordValue } from "./reasoning-effort";
 import {
   COST4_RATE_KEYS,
   isValidCost4Rate,
+  refreshPreservedProviderOwner,
   refreshUserCostOverlays,
   withPreservedDiskOnlyProviders,
 } from "./usage/user-cost-overlays";
@@ -372,7 +374,21 @@ export class OpenAiTierBackupRollbackError extends Error {
 }
 
 export class OpenAiTierBackupCollisionError extends Error {
-  constructor() { super("Existing OpenAI tier backup differs from the current config"); this.name = "OpenAiTierBackupCollisionError"; }
+  readonly configPath?: string;
+  constructor(configPath?: string) {
+    super("Existing OpenAI tier backup differs from the current config");
+    this.name = "OpenAiTierBackupCollisionError";
+    this.configPath = configPath;
+  }
+}
+
+export class OpenAiTierRollbackPreserveError extends Error {
+  readonly code?: "missing" | "not-rollback" | "mismatch" | "exhausted";
+  constructor(message: string, options?: ErrorOptions & { code?: OpenAiTierRollbackPreserveError["code"] }) {
+    super(message, options);
+    this.name = "OpenAiTierRollbackPreserveError";
+    this.code = options?.code;
+  }
 }
 
 export class OpenAiTierBackupSecretResidualError extends Error {
@@ -460,7 +476,7 @@ export function backupConfigBeforeOpenAiTierMigration(
       // point would be surprising and potentially destructive.
       const backupBytes = io.read(backup);
       if (classifyOpenAiTierBackup(backupBytes) === "rollback") {
-        throw new OpenAiTierBackupCollisionError();
+        throw new OpenAiTierBackupCollisionError(source);
       }
       console.warn("[openai-provider-migration] Replacing stale pre-migration backup (post-migration config was rewritten since last migration).");
       io.unlink(backup);
@@ -515,7 +531,7 @@ export function backupConfigBeforeOpenAiTierMigration(
     } catch (cause) {
       if (!isAlreadyExistsError(cause)) throw cause;
       const winner = io.read(backup);
-      if (!sameBytes(original, winner)) throw new OpenAiTierBackupCollisionError();
+      if (!sameBytes(original, winner)) throw new OpenAiTierBackupCollisionError(source);
       scrubUnpublishedTemp();
       return "reused";
     }
@@ -549,6 +565,67 @@ export function backupConfigBeforeOpenAiTierMigration(
     }
     throw cause;
   }
+}
+
+export interface OpenAiTierRollbackPreserveIO {
+  exists(path: string): boolean;
+  read(path: string): Uint8Array;
+  copyExclusive(source: string, destination: string): void;
+  unlink(path: string): void;
+}
+
+const DEFAULT_ROLLBACK_PRESERVE_IO: OpenAiTierRollbackPreserveIO = {
+  exists: existsSync,
+  read: target => readFileSync(target),
+  copyExclusive: (source, destination) => {
+    copyFileSync(source, destination, fsConstants.COPYFILE_EXCL);
+  },
+  unlink: unlinkSync,
+};
+
+const OPENAI_TIER_ROLLBACK_PRESERVE_ATTEMPTS = 16;
+
+/**
+ * Copy a rollback-classified `.pre-openai-tiers-v2.bak` to a unique
+ * `.pre-openai-tiers-v1-rollback.<timestamp>[suffix].bak` path, then unlink the
+ * blocking v2 name. The original bytes are copied with no-replace publication;
+ * the v2 path is removed only after the copy is verified. Shared by startup
+ * migration recovery and `ocx init` cleanup so the two paths cannot drift.
+ */
+export function preserveOpenAiTierRollbackSnapshot(
+  configPath = getConfigPath(),
+  io: OpenAiTierRollbackPreserveIO = DEFAULT_ROLLBACK_PRESERVE_IO,
+): string {
+  const backup = `${configPath}.pre-openai-tiers-v2.bak`;
+  if (!io.exists(backup)) {
+    throw new OpenAiTierRollbackPreserveError("OpenAI tier rollback backup is missing", { code: "missing" });
+  }
+  const original = io.read(backup);
+  if (classifyOpenAiTierBackup(original) !== "rollback") {
+    throw new OpenAiTierRollbackPreserveError("OpenAI tier backup is not a rollback snapshot", { code: "not-rollback" });
+  }
+  for (let attempt = 0; attempt < OPENAI_TIER_ROLLBACK_PRESERVE_ATTEMPTS; attempt++) {
+    const preserved = `${configPath}.pre-openai-tiers-v1-rollback.${Date.now()}${attempt ? `-${attempt}` : ""}.bak`;
+    try {
+      io.copyExclusive(backup, preserved);
+    } catch (error) {
+      if (isAlreadyExistsError(error)) continue;
+      throw error;
+    }
+    let copied: Uint8Array;
+    try {
+      copied = io.read(preserved);
+    } catch (error) {
+      throw new OpenAiTierRollbackPreserveError("Failed to read preserved rollback snapshot", { cause: error, code: "mismatch" });
+    }
+    if (!sameBytes(original, copied)) {
+      try { io.unlink(preserved); } catch { /* keep the original backup; incomplete copy is best-effort */ }
+      throw new OpenAiTierRollbackPreserveError("Preserved rollback snapshot does not match source bytes", { code: "mismatch" });
+    }
+    io.unlink(backup);
+    return preserved;
+  }
+  throw new OpenAiTierRollbackPreserveError("Unable to find a unique rollback snapshot path", { code: "exhausted" });
 }
 
 /**
@@ -612,6 +689,33 @@ const retryOn429PolicySchema = z.object({
   respectRetryAfter: z.boolean().optional(),
 }).strict();
 
+const requestPacingRuleSchema = z.object({
+  // Keep the RPM-derived timer within the same one-hour bound as minIntervalMs.
+  requestsPerMinute: z.number().min(1 / 60).max(60_000).optional(),
+  minIntervalMs: z.number().int().min(1).max(3_600_000).optional(),
+}).strict().refine(value => value.requestsPerMinute !== undefined || value.minIntervalMs !== undefined, {
+  message: "request pacing rules need requestsPerMinute or minIntervalMs",
+});
+
+const requestPacingSchema = z.object({
+  enabled: z.boolean(),
+  requestsPerMinute: z.number().min(1 / 60).max(60_000).optional(),
+  minIntervalMs: z.number().int().min(1).max(3_600_000).optional(),
+  models: z.record(z.string().trim().min(1), requestPacingRuleSchema).optional(),
+}).strict().refine(value => value.enabled === false
+  || value.requestsPerMinute !== undefined
+  || value.minIntervalMs !== undefined
+  || (value.models !== undefined && Object.keys(value.models).length > 0), {
+  message: "enabled request pacing needs a provider rule or model override",
+});
+
+export function requestPacingConfigError(value: unknown): string | null {
+  if (value === undefined) return null;
+  const parsed = requestPacingSchema.safeParse(value);
+  if (parsed.success) return null;
+  return "requestPacing must contain enabled and a valid requestsPerMinute/minIntervalMs provider rule or model overrides";
+}
+
 /**
  * Zod schema for one provider entry: known fields are validated strictly while unknown
  * fields pass through (preserved for runtime extensions).
@@ -619,6 +723,7 @@ const retryOn429PolicySchema = z.object({
 const providerConfigSchema = z.object({
   adapter: z.string().min(1),
   baseUrl: z.string().min(1),
+  requestPacing: requestPacingSchema.optional().catch(undefined),
   mcpMaxTools: z.number().int().positive().optional(),
   mcpMaxSchemaBytes: z.number().int().positive().optional(),
   mcpMaxResultBytes: z.number().int().positive().optional(),
@@ -627,8 +732,18 @@ const providerConfigSchema = z.object({
   statelessResponses: z.boolean().optional(),
   requiresAdjacentResponsesToolResults: z.boolean().optional(),
   supportsServiceTier: z.boolean().optional(),
+  modelSupportsServiceTier: z.record(z.string().min(1), z.boolean()).optional(),
   preserveResponsesReasoningContent: z.boolean().optional(),
   allowPrivateNetwork: z.boolean().optional(),
+  // The management API accepts `null` as "clear this", so a config written before the POST
+  // canonicalization below can hold one on disk. Rejecting it here would send the operator
+  // through invalid-config recovery for a value the API told them was fine.
+  upstreamHttpVersion: z.enum(UPSTREAM_HTTP_VERSION_VALUES)
+    .nullish()
+    .transform(value => value ?? undefined),
+  noStructuredOutputModels: z.array(z.string().min(1))
+    .transform(normalizeNonBlankStringArray)
+    .optional(),
   retryOn429: retryOn429PolicySchema.optional(),
   codexAccountMode: z.enum(["pool", "direct"]).optional(),
   responsesItemIdRepair: z.object({
@@ -798,6 +913,20 @@ export function apiKeyTransportConfigError(
   return null;
 }
 
+/**
+ * Shared runtime boundary for the per-provider upstream HTTP-version pin (#1668). Used by
+ * the management write path (providerManagementConfigError / PATCH) so it can never disagree
+ * with the strict zod load schema: a value that survives POST/PATCH is always loadable, and
+ * a value the loader rejects is rejected at write time too.
+ */
+export function upstreamHttpVersionConfigError(value: unknown): string | null {
+  if (value === undefined || value === null) return null;
+  if (typeof value !== "string" || !(UPSTREAM_HTTP_VERSION_VALUES as readonly string[]).includes(value)) {
+    return 'upstreamHttpVersion must be one of "auto", "http1.1", "h1", "http2", "h2", or null to clear';
+  }
+  return null;
+}
+
 export function positiveIntegerRecordConfigError(value: unknown, field: string): string | null {
   if (value === undefined) return null;
   if (!value || typeof value !== "object" || Array.isArray(value)) return `${field} must be a plain object`;
@@ -818,6 +947,26 @@ export function positiveIntegerConfigError(value: unknown, field: string): strin
     return `${field} must be a positive finite integer`;
   }
   return null;
+}
+
+export function nonBlankStringArrayConfigError(value: unknown, field: string): string | null {
+  if (value === undefined) return null;
+  if (!Array.isArray(value)) return `${field} must be an array`;
+  for (const [index, entry] of value.entries()) {
+    if (typeof entry !== "string" || !entry.trim()) {
+      return `${field}.${index} must be a nonblank model id`;
+    }
+  }
+  return null;
+}
+
+/**
+ * Keep hand-edited config and management writes on one canonical model-id list.
+ * Validation happens separately so an all-whitespace value is rejected rather than
+ * normalized into a model id that can never match at runtime.
+ */
+export function normalizeNonBlankStringArray(value: readonly string[]): string[] {
+  return [...new Set(value.map(entry => entry.trim()))];
 }
 
 export function booleanRecordConfigError(value: unknown, field: string): string | null {
@@ -1107,6 +1256,13 @@ const clientIntegrationsSchema = z.object({
   "claude-desktop": z.boolean().optional().catch(undefined),
 }).passthrough();
 
+const agentTaskRecoverySchema = z.object({
+  enabled: z.boolean().optional(),
+  model: z.string().trim().min(1).optional(),
+  timeoutMs: z.number().int().min(1_000).max(120_000).optional(),
+  cacheEntries: z.number().int().min(1).max(512).optional(),
+}).strict();
+
 const configSchema = z.object({
   port: z.number().int().min(0).max(65535).default(10100),
   managementUsageMaxReadBytes: z.number().int().positive().default(64 * 1024 * 1024),
@@ -1138,6 +1294,8 @@ const configSchema = z.object({
   ]).optional().catch(undefined),
   providers: z.record(z.string(), providerConfigSchema),
   defaultProvider: z.string().min(1).default("openai"),
+  // A retry can be billable, so absence and malformed hand edits both stay off.
+  emptyCompletionRetry: z.boolean().optional().catch(false),
   openaiProviderTierVersion: z.union([z.literal(1), z.literal(2)]).optional(),
   // Invalid hand edits must not discard an otherwise usable config.
   googleAntigravityStaticCatalogVersion: z.union([z.literal(1), z.literal(2)]).optional().catch(undefined),
@@ -1145,6 +1303,8 @@ const configSchema = z.object({
   providerContextCaps: z.record(z.string(), z.number().int().positive()).optional(),
   contextCapValue: z.number().int().positive().optional(),
   multiAgentGuidanceEnabled: z.boolean().optional(),
+  // Invalid optional recovery config must not discard unrelated provider/account state.
+  agentTaskRecovery: agentTaskRecoverySchema.optional().catch(undefined),
   // These selections pre-date schema validation and used to pass through as
   // unknown fields. Invalid hand edits must disable only the optional
   // delegation/native-default feature, not reject the whole config and hide
@@ -1375,6 +1535,17 @@ const configSchema = z.object({
         message: reasoningSummariesError,
       });
     }
+    const serviceTierModelsError = booleanRecordConfigError(
+      (provider as { modelSupportsServiceTier?: unknown }).modelSupportsServiceTier,
+      "modelSupportsServiceTier",
+    );
+    if (serviceTierModelsError) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["providers", redactSecretString(name), "modelSupportsServiceTier"],
+        message: serviceTierModelsError,
+      });
+    }
     const reasoningSummaryDeliveryError = reasoningSummaryDeliveryRecordConfigError(
       (provider as { modelReasoningSummaryDelivery?: unknown }).modelReasoningSummaryDelivery,
       (provider as { modelSupportsReasoningSummaries?: unknown }).modelSupportsReasoningSummaries,
@@ -1406,6 +1577,17 @@ const configSchema = z.object({
         code: "custom",
         path: ["providers", redactSecretString(name), "modelMaxOutputTokens"],
         message: maxOutputError,
+      });
+    }
+    const structuredOutputOptOutError = nonBlankStringArrayConfigError(
+      (provider as { noStructuredOutputModels?: unknown }).noStructuredOutputModels,
+      "noStructuredOutputModels",
+    );
+    if (structuredOutputOptOutError) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["providers", redactSecretString(name), "noStructuredOutputModels"],
+        message: structuredOutputOptOutError,
       });
     }
     if (Object.hasOwn(provider, "codexAccountMode") && provider.codexAccountMode !== undefined) {
@@ -1836,12 +2018,30 @@ function normalizePersistedClaudeCode(claudeCode: unknown): OcxConfig["claudeCod
   if (Object.hasOwn(normalized, "subagentEffort") && !isClaudeSubagentEffort(normalized.subagentEffort)) {
     delete normalized.subagentEffort;
   }
+  // A hand-authored config never passes through the management validator, so coerce here too.
+  // A malformed classifierFallbacks (a bare string, or an array with non-string entries) would
+  // otherwise reach the resolver unchecked.
+  if (Object.hasOwn(normalized, "classifierModel")) {
+    const value = typeof normalized.classifierModel === "string" ? normalized.classifierModel.trim() : "";
+    if (value.length > 0) normalized.classifierModel = value;
+    else delete normalized.classifierModel;
+  }
+  if (Object.hasOwn(normalized, "classifierFallbacks")) {
+    const raw = normalized.classifierFallbacks;
+    const kept = Array.isArray(raw)
+      ? raw.filter((entry): entry is string => typeof entry === "string" && entry.trim().length > 0).map(entry => entry.trim())
+      : [];
+    if (kept.length > 0) normalized.classifierFallbacks = kept;
+    else delete normalized.classifierFallbacks;
+  }
   return normalized as OcxConfig["claudeCode"];
 }
 
-function normalizeClaudeSubagentEffort(config: OcxConfig, rawParsed: unknown): OcxConfig {
-  const rawEffort = rawClaudeSubagentEffort(rawParsed);
-  if (rawEffort === undefined || isClaudeSubagentEffort(rawEffort)) return config;
+function normalizeClaudeSubagentEffort(config: OcxConfig, _rawParsed: unknown): OcxConfig {
+  // Unconditional. This used to short-circuit when `subagentEffort` was absent or already valid,
+  // which meant a config whose ONLY defect was elsewhere in `claudeCode` was never normalized.
+  // The specialized subagentEffort WARNING is a separate concern and stays exactly as it is.
+  if (!config.claudeCode) return config;
   return { ...config, claudeCode: normalizePersistedClaudeCode(config.claudeCode) };
 }
 
@@ -1866,6 +2066,20 @@ function malformedUpstreamHostCircuitThresholdWarning(rawParsed: unknown): strin
 
 function warnDegradedUpstreamHostCircuitThreshold(rawParsed: unknown): void {
   const warning = malformedUpstreamHostCircuitThresholdWarning(rawParsed);
+  if (warning) console.warn(`⚠️  config.json ${warning}. Other settings were preserved.`);
+}
+
+function malformedAgentTaskRecoveryWarning(rawParsed: unknown): string | null {
+  const raw = rawConfigRecord(rawParsed);
+  if (!raw || !Object.hasOwn(raw, "agentTaskRecovery")) return null;
+  const result = agentTaskRecoverySchema.safeParse(raw.agentTaskRecovery);
+  if (result.success) return null;
+  const field = result.error.issues[0]?.path.join(".");
+  return `agentTaskRecovery${field ? `.${field}` : ""} ignored: invalid experimental recovery configuration`;
+}
+
+function warnDegradedAgentTaskRecovery(rawParsed: unknown): void {
+  const warning = malformedAgentTaskRecoveryWarning(rawParsed);
   if (warning) console.warn(`⚠️  config.json ${warning}. Other settings were preserved.`);
 }
 
@@ -1971,6 +2185,7 @@ export function loadConfig(): OcxConfig {
       warnDegradedNativeSubagentConfig(parsed, config);
       warnDegradedCodexAccountPicker(parsed);
       warnDegradedUpstreamHostCircuitThreshold(parsed);
+      warnDegradedAgentTaskRecovery(parsed);
       return withRefreshedCostOverlays(normalizeClaudeSubagentEffort(normalizeNativeSubagentSync(config, parsed), parsed));
     }
     // Schema validation failed — merge defaults into the raw object instead of
@@ -1993,7 +2208,28 @@ export function loadConfig(): OcxConfig {
       warnDegradedNativeSubagentConfig(parsed, config);
       warnDegradedCodexAccountPicker(parsed);
       warnDegradedUpstreamHostCircuitThreshold(parsed);
+      warnDegradedAgentTaskRecovery(parsed);
       return withRefreshedCostOverlays(normalizeClaudeSubagentEffort(normalizeNativeSubagentSync(config, parsed), parsed));
+    }
+    // Still failing, but if every complaint is about one or more named entries
+    // in an independent section, drop exactly those and keep the rest. Falling
+    // back to defaults here would silently retire the operator's providers,
+    // keys and prices over a mistake in one routing profile.
+    const salvaged = salvageConfigCandidate(merged, retryResult.error);
+    if (salvaged) {
+      {
+        warnDroppedConfigSections(configPath, salvaged.dropped, salvaged.issues);
+        const config = normalizeApiKeyIds(salvaged.parsed);
+        warnDegradedHostname(parsed, config);
+        warnDegradedApiKeys(parsed, config);
+        warnDegradedCodexAccountPriorities(parsed, config);
+        warnDegradedClaudeSubagentEffort(parsed);
+        warnDegradedNativeSubagentConfig(parsed, config);
+        warnDegradedCodexAccountPicker(parsed);
+        warnDegradedUpstreamHostCircuitThreshold(parsed);
+        warnDegradedAgentTaskRecovery(parsed);
+        return withRefreshedCostOverlays(normalizeClaudeSubagentEffort(normalizeNativeSubagentSync(config, parsed), parsed));
+      }
     }
     // Merge couldn't fix it — truly broken config
     warnAndBackupInvalidConfig(configPath, result.error);
@@ -2052,6 +2288,8 @@ function validFileConfigDiagnostics(config: OcxConfig, rawParsed: unknown): Conf
   if (pickerWarning) warnings.push(pickerWarning);
   const hostCircuitWarning = malformedUpstreamHostCircuitThresholdWarning(rawParsed);
   if (hostCircuitWarning) warnings.push(hostCircuitWarning);
+  const recoveryWarning = malformedAgentTaskRecoveryWarning(rawParsed);
+  if (recoveryWarning) warnings.push(recoveryWarning);
   if (syncDisabledReason) {
     warnings.push(`syncCodexSubagentDefaults ignored: ${syncDisabledReason}`);
   }
@@ -2133,6 +2371,16 @@ function upstreamHostCircuitThresholdError(value: unknown): string | null {
   return `schema_invalid: upstreamHostCircuitThreshold: must be an integer from 0 to ${UPSTREAM_HOST_CIRCUIT_MAX_THRESHOLD}`;
 }
 
+function agentTaskRecoveryError(value: unknown): string | null {
+  const raw = rawConfigRecord(value);
+  if (!raw || !Object.hasOwn(raw, "agentTaskRecovery") || raw.agentTaskRecovery === undefined) return null;
+  const result = agentTaskRecoverySchema.safeParse(raw.agentTaskRecovery);
+  if (result.success) return null;
+  const issue = result.error.issues[0];
+  const field = issue?.path.join(".");
+  return `schema_invalid: agentTaskRecovery${field ? `.${field}` : ""}: ${issue?.message ?? "invalid configuration"}`;
+}
+
 /**
  * Same reasoning as {@link blankHostnameError}, and more urgent: the read path degrades a
  * malformed selection-order map to undefined, which on a write would drop every entry the
@@ -2184,6 +2432,14 @@ function codexAccountPickerEnabledError(value: unknown): string | null {
   return "schema_invalid: codexAccountPickerEnabled: must be a boolean or omitted";
 }
 
+function emptyCompletionRetryError(value: unknown): string | null {
+  const raw = rawConfigRecord(value);
+  if (!raw || !Object.hasOwn(raw, "emptyCompletionRetry")) return null;
+  const enabled = raw.emptyCompletionRetry;
+  if (enabled === undefined || typeof enabled === "boolean") return null;
+  return "schema_invalid: emptyCompletionRetry: must be a boolean or omitted";
+}
+
 /** Validate an in-memory config candidate without touching disk. Used by headless CLI import/set. */
 /**
  * Reject a loopback-listener port that collides with the proxy port (#1102).
@@ -2228,9 +2484,11 @@ export function validateConfigCandidate(value: unknown): { ok: true; config: Ocx
     ?? claudeSubagentEffortError(value)
     ?? appOwnedMemoryBudgetError(value)
     ?? upstreamHostCircuitThresholdError(value)
+    ?? agentTaskRecoveryError(value)
     ?? googleAntigravityStaticCatalogVersionError(value)
     ?? codexAccountPrioritiesError(value)
     ?? codexAccountPickerEnabledError(value)
+    ?? emptyCompletionRetryError(value)
     ?? loopbackListenerPortError(value);
   if (boundaryError) return { ok: false, error: boundaryError };
   const result = configSchema.safeParse(value);
@@ -2251,9 +2509,29 @@ function configDiagnosticsFromRaw(raw: string): ConfigDiagnostics {
       return validFileConfigDiagnostics(normalizeApiKeyIds(result.data as OcxConfig), parsed);
     }
 
-    const retryResult = configSchema.safeParse(mergeConfigDefaults(parsed));
+    const merged = mergeConfigDefaults(parsed);
+    const retryResult = configSchema.safeParse(merged);
     if (retryResult.success) {
       return validFileConfigDiagnostics(normalizeApiKeyIds(retryResult.data as OcxConfig), parsed);
+    }
+
+    // #1785: one invalid routing profile must not make diagnostics report the built-in
+    // defaults AS the config, because a later config write persists those defaults over the
+    // operator's providers, keys and prices.
+    //
+    // The failure is still reported. `source` stays "fallback" and `error` keeps the real
+    // schema message -- diagnostics is the surface that tells callers the file is invalid,
+    // and every consumer that must refuse an invalid config (provider reload, catalog sync,
+    // cost reconcile, codex admission) gates on exactly those two fields. Only `config`
+    // changes: it carries the salvaged document instead of factory defaults, so a caller
+    // that ignores the error and writes it back preserves what the operator configured.
+    const salvaged = salvageConfigCandidate(merged, retryResult.error);
+    if (salvaged) {
+      return {
+        config: normalizeApiKeyIds(salvaged.parsed),
+        source: "fallback",
+        error: schemaDiagnosticsError(result.error),
+      };
     }
 
     return { config: getDefaultConfig(), source: "fallback", error: schemaDiagnosticsError(result.error) };
@@ -2683,6 +2961,12 @@ export function websocketsEnabled(config: Pick<OcxConfig, "websockets">): boolea
  * against, or a later stale save would masquerade as "our own change".
  */
 const claudeCodeBaseline = new WeakMap<OcxConfig, unknown>();
+/**
+ * Full live-config baseline used to rebase unrelated cooperating writes. The
+ * Claude subtree and the bound listener fields remain on their dedicated
+ * reconciliation paths below.
+ */
+const liveConfigBaseline = new WeakMap<OcxConfig, OcxConfig>();
 
 /**
  * The live config retains the address of the socket Bun actually opened, while
@@ -2700,7 +2984,26 @@ const persistedLiveServerBinding = new WeakMap<OcxConfig, PersistedServerBinding
  * save, which is the case the guard exists for.
  */
 export function armClaudeCodeBaseline(config: OcxConfig): void {
+  liveConfigBaseline.set(config, structuredClone(config));
   claudeCodeBaseline.set(config, structuredClone(config.claudeCode));
+}
+
+/**
+ * Adopt one schema-validated provider that was read from the authoritative disk
+ * config into a long-lived server config without rebasing any unrelated field.
+ * Updating the matching baseline row keeps a later guarded save from treating the
+ * adopted provider as an unsaved live edit that should defeat a newer disk change.
+ */
+export function adoptPersistedProviderIntoLiveConfig(
+  config: OcxConfig,
+  name: string,
+  provider: OcxProviderConfig,
+  persistedConfig?: OcxConfig,
+): void {
+  config.providers[name] = structuredClone(provider);
+  const baseline = liveConfigBaseline.get(config);
+  if (baseline) baseline.providers[name] = structuredClone(provider);
+  if (persistedConfig) refreshPreservedProviderOwner(config, persistedConfig);
 }
 
 /** Test seam only: is this instance armed? */
@@ -2747,20 +3050,80 @@ function cloneConfigValue(value: ConfigMergeValue): ConfigMergeValue {
   return value === MISSING_CONFIG_VALUE ? value : structuredClone(value);
 }
 
+type IndexedCustomModels = {
+  order: string[];
+  byId: Map<string, Record<string, unknown>>;
+};
+
+function indexCustomModels(value: ConfigMergeValue): IndexedCustomModels | null {
+  if (!Array.isArray(value)) return null;
+  const order: string[] = [];
+  const byId = new Map<string, Record<string, unknown>>();
+  for (const item of value) {
+    if (!isPlainConfigRecord(item) || typeof item.id !== "string" || item.id.length === 0 || byId.has(item.id)) {
+      return null;
+    }
+    order.push(item.id);
+    byId.set(item.id, item);
+  }
+  return { order, byId };
+}
+
+/**
+ * Merge custom-model rows by their stable id instead of treating the array as
+ * one opaque value. A row changed only on disk is adopted, a row changed only
+ * in the live config is retained, and disjoint edits to the same row recurse
+ * through the normal three-way object merge. A newer persisted row deletion
+ * wins over a stale live edit to that row.
+ */
+function reconcileCustomModels(
+  baseline: ConfigMergeValue,
+  live: ConfigMergeValue,
+  persisted: ConfigMergeValue,
+): ConfigMergeValue | null {
+  const baselineRows = indexCustomModels(baseline);
+  const liveRows = indexCustomModels(live);
+  const persistedRows = indexCustomModels(persisted);
+  if (!baselineRows || !liveRows || !persistedRows) return null;
+
+  const order = [...liveRows.order, ...persistedRows.order.filter(id => !liveRows.byId.has(id))];
+  const merged: Array<Record<string, unknown>> = [];
+  for (const id of order) {
+    const baselineRow = baselineRows.byId.get(id) ?? MISSING_CONFIG_VALUE;
+    const persistedRow = persistedRows.byId.get(id) ?? MISSING_CONFIG_VALUE;
+    const row = baselineRow !== MISSING_CONFIG_VALUE && persistedRow === MISSING_CONFIG_VALUE
+      ? MISSING_CONFIG_VALUE
+      : reconcileConfigValue(
+          baselineRow,
+          liveRows.byId.get(id) ?? MISSING_CONFIG_VALUE,
+          persistedRow,
+        );
+    if (row !== MISSING_CONFIG_VALUE) merged.push(row as Record<string, unknown>);
+  }
+  return merged;
+}
+
 function reconcileConfigRecord(
   live: Record<string, unknown>,
   baseline: Record<string, unknown>,
   persisted: Record<string, unknown>,
   skippedKeys?: ReadonlySet<string>,
+  persistedDeletionsWin = false,
 ): void {
   const keys = new Set([...Object.keys(baseline), ...Object.keys(live), ...Object.keys(persisted)]);
   for (const key of keys) {
     if (skippedKeys?.has(key)) continue;
-    const merged = reconcileConfigValue(
-      ownConfigValue(baseline, key),
-      ownConfigValue(live, key),
-      ownConfigValue(persisted, key),
-    );
+    const baselineValue = ownConfigValue(baseline, key);
+    const liveValue = ownConfigValue(live, key);
+    const persistedValue = ownConfigValue(persisted, key);
+    const merged = persistedDeletionsWin
+        && baselineValue !== MISSING_CONFIG_VALUE
+        && persistedValue === MISSING_CONFIG_VALUE
+      ? MISSING_CONFIG_VALUE
+      : key === "customModels"
+        ? reconcileCustomModels(baselineValue, liveValue, persistedValue)
+          ?? reconcileConfigValue(baselineValue, liveValue, persistedValue)
+        : reconcileConfigValue(baselineValue, liveValue, persistedValue, key === "providers");
     if (merged === MISSING_CONFIG_VALUE) delete live[key];
     else live[key] = merged;
   }
@@ -2770,6 +3133,7 @@ function reconcileConfigValue(
   baseline: ConfigMergeValue,
   live: ConfigMergeValue,
   persisted: ConfigMergeValue,
+  persistedChildDeletionsWin = false,
 ): ConfigMergeValue {
   const liveChanged = !deepEqual(live, baseline);
   const persistedChanged = !deepEqual(persisted, baseline);
@@ -2799,6 +3163,8 @@ function reconcileConfigValue(
       live,
       isPlainConfigRecord(baseline) ? baseline : {},
       persisted,
+      undefined,
+      persistedChildDeletionsWin,
     );
   }
   // Same-leaf conflicts prefer the pending live management mutation.
@@ -2886,13 +3252,14 @@ function readPersistedServerBinding(
  *
  * Conflict policy, chosen deliberately:
  * - disk changed, we did not → their hand edit wins;
- * - disk changed AND we changed → our change wins and the baseline rebases, so the
- *   user's next edit starts from the new value (a three-way merge is out of scope);
+ * - disk changed AND we changed → disjoint fields are merged, while a same-leaf
+ *   conflict keeps the live value;
+ * - a provider or custom-model row deleted on disk stays deleted even if stale
+ *   live state edited that same row;
  * - file missing/unreadable → save what we have, no throw.
  *
- * Scope residual: only `claudeCode` is reconciled. A hand edit to `providers` is still
- * clobbered — recorded and asserted in tests so it cannot drift into an assumed
- * guarantee.
+ * Custom-model rows are merged by their stable `id`, preserving independent
+ * edits and deletions across stale whole-config saves.
  */
 export function saveConfigPreservingClaudeCode(config: OcxConfig): void {
   withConfigMutationLockSync(() => {
@@ -2900,6 +3267,36 @@ export function saveConfigPreservingClaudeCode(config: OcxConfig): void {
     // One authoritative pre-write read feeds both the live-config reconciliation and
     // custom-model deletion migration. A second read could observe different bytes.
     const onDisk = readRawConfigJson();
+    const baseline = liveConfigBaseline.get(config);
+    if (baseline && onDisk !== undefined) {
+      const persistedDiagnostics = configDiagnosticsFromRaw(JSON.stringify(onDisk));
+      if (persistedDiagnostics.source === "file") {
+        // Only keys this live config is actually known to have diverged on may be
+        // rebased. The baseline is captured once when the server arms it, so any key
+        // that appeared on disk afterwards — through saveConfig(), a hand edit, or
+        // another process — is absent from the baseline as well as from the live
+        // config. Reconciling those keys reads "live never changed this" and adopts
+        // the disk value, which resurrects a field the live writer had deliberately
+        // deleted (#1462 regression: PUT /api/grok/selection with an empty list).
+        // Restrict the merge to keys the baseline knew about, plus keys the live
+        // config still carries; a key that exists only on disk is left to the
+        // ordinary whole-config write below.
+        const rebaseableKeys = new Set([
+          ...Object.keys(baseline as unknown as Record<string, unknown>),
+          ...Object.keys(config as unknown as Record<string, unknown>),
+        ]);
+        const skipped = new Set(["hostname", "port", "claudeCode"]);
+        for (const key of Object.keys(persistedDiagnostics.config as unknown as Record<string, unknown>)) {
+          if (!rebaseableKeys.has(key)) skipped.add(key);
+        }
+        reconcileConfigRecord(
+          config as unknown as Record<string, unknown>,
+          baseline as unknown as Record<string, unknown>,
+          persistedDiagnostics.config as unknown as Record<string, unknown>,
+          skipped,
+        );
+      }
+    }
     if (claudeCodeBaseline.has(config)) {
       if (onDisk !== undefined) {
         const baseline = claudeCodeBaseline.get(config);
@@ -2931,6 +3328,9 @@ export function saveConfigPreservingClaudeCode(config: OcxConfig): void {
     if (claudeCodeBaseline.has(config)) {
       claudeCodeBaseline.set(config, structuredClone(config.claudeCode));
     }
+    if (liveConfigBaseline.has(config)) {
+      liveConfigBaseline.set(config, structuredClone(config));
+    }
   });
 }
 
@@ -2959,6 +3359,7 @@ export function getDefaultConfig(): OcxConfig {
   // Adding extra providers (e.g. opencode-go) and switching defaultProvider is a user/runtime choice.
   return {
     port: 10100,
+    emptyCompletionRetry: false,
     managementUsageMaxReadBytes: 64 * 1024 * 1024,
     appOwnedMemoryBudgetMb: DEFAULT_APP_OWNED_MEMORY_BUDGET_BYTES / (1024 * 1024),
     // Fresh/re-initialized configs are already written in the current three-tier
@@ -3104,6 +3505,194 @@ function warnConfigRepaired(configPath: string, error: z.ZodError): void {
   warnedConfigFallbacks.add(configPath);
   const fields = error.issues.map(i => i.path.join(".") || "config").join(", ");
   console.error(`opencodex config at ${configPath}: repaired missing field(s) [${fields}] with defaults. Your providers and accounts are preserved.`);
+}
+
+/**
+ * Sections whose entries are independent of one another, so one bad entry is
+ * safe to drop without changing what the rest mean.
+ *
+ * Both are validated entry-by-entry in the `superRefine` above, which raises
+ * every finding as a *document*-level issue. That is what made a single routing
+ * candidate naming a disabled provider discard the operator's whole config —
+ * all eleven providers, every API key, and the entire `modelCosts` table —
+ * while the proxy carried on serving from built-in defaults and reporting
+ * healthy.
+ */
+const SALVAGEABLE_CONFIG_SECTIONS = ["routingProfiles", "combos"] as const;
+
+/**
+ * Drop just the named entries a parse failure blamed, so the rest of the
+ * document survives.
+ *
+ * Returns `null` when the failure was not confined to those sections — the
+ * caller then keeps its existing behaviour rather than guessing.
+ *
+ * The whole entry goes, not the individual offending candidate. A routing
+ * profile that quietly loses one candidate still routes, just not where the
+ * operator said it should, and a policy that silently changed shape is a worse
+ * outcome than one that is plainly absent. Absent is also the loud option: a
+ * dry-run against it answers `unknown_profile`, which — paired with the warning
+ * this emits — points at the real mistake.
+ */
+function dropInvalidConfigSections(
+  parsed: unknown,
+  error: z.ZodError,
+): { candidate: Record<string, unknown>; dropped: string[] } | null {
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+
+  const doomed = new Map<string, Set<string>>();
+  for (const issue of error.issues) {
+    if (isUnsalvageableIssue(issue)) return null;
+    const [section, id] = issue.path;
+    if (typeof section !== "string" || typeof id !== "string") return null;
+    if (!(SALVAGEABLE_CONFIG_SECTIONS as readonly string[]).includes(section)) return null;
+    // A complaint about the container itself ("combos must be an object") is
+    // not about one entry, so there is nothing selective to drop.
+    if (issue.path.length < 2) return null;
+    let ids = doomed.get(section);
+    if (!ids) doomed.set(section, ids = new Set());
+    ids.add(id);
+  }
+  if (doomed.size === 0) return null;
+
+  const candidate: Record<string, unknown> = { ...(parsed as Record<string, unknown>) };
+  const dropped: string[] = [];
+  for (const [section, ids] of doomed) {
+    const current = candidate[section];
+    if (!current || typeof current !== "object" || Array.isArray(current)) return null;
+    const kept: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(current as Record<string, unknown>)) {
+      if (ids.has(key)) dropped.push(`${section}.${key}`);
+      else kept[key] = value;
+    }
+    candidate[section] = kept;
+  }
+  return dropped.length > 0 ? { candidate, dropped } : null;
+}
+
+/**
+ * Salvage until the document parses, not just once.
+ *
+ * One pass is not enough because the sections depend on each other: routing
+ * profiles are validated against the combo map, so dropping an invalid combo can
+ * expose a profile that referenced it. A single-pass salvage sees that second
+ * failure and gives up, discarding the whole config -- the exact outcome this
+ * code exists to prevent.
+ *
+ * `rawDocument` is the operator's document before defaults were merged in. When
+ * supplied, the same entries are deleted from it too, so a diagnostics caller can
+ * still tell an absent optional setting from one we injected.
+ */
+
+/**
+ * Findings that must never be salvaged away.
+ *
+ * Salvage removes the entry a finding blamed, which is right for an ordinary
+ * validation mistake and wrong for a namespace collision: the collision is a
+ * *relationship* between a combo/profile and a Codex account selector, and it is
+ * reported on the combo. Dropping that combo makes the document parse and quietly
+ * admits the account selector the schema just refused, turning a hard admission
+ * boundary into a config that loads. Refuse the whole document instead.
+ */
+const UNSALVAGEABLE_ISSUE_MESSAGES: readonly string[] = [
+  CODEX_ACCOUNT_NAMESPACE_COMBO_ALIAS_COLLISION_ERROR,
+];
+
+function isUnsalvageableIssue(issue: z.ZodIssue): boolean {
+  return UNSALVAGEABLE_ISSUE_MESSAGES.some(message => issue.message.includes(message));
+}
+function salvageConfigCandidate(
+  merged: unknown,
+  initialError: z.ZodError,
+  rawDocument?: unknown,
+): {
+  candidate: Record<string, unknown>;
+  rawCandidate: unknown;
+  parsed: OcxConfig;
+  dropped: string[];
+  issues: z.ZodIssue[];
+} | null {
+  let candidate: unknown = merged;
+  let rawCandidate: unknown = rawDocument;
+  let error = initialError;
+  const dropped: string[] = [];
+  const issues: z.ZodIssue[] = [];
+  // Bounded by construction: every pass must remove at least one entry, and there
+  // are only so many entries to remove.
+  const budget = countSalvageableEntries(merged) + 1;
+  for (let pass = 0; pass < budget; pass++) {
+    const step = dropInvalidConfigSections(candidate, error);
+    if (!step || step.dropped.length === 0) return null;
+    dropped.push(...step.dropped);
+    issues.push(...error.issues);
+    candidate = step.candidate;
+    rawCandidate = deleteEntryPaths(rawCandidate, step.dropped);
+    const result = configSchema.safeParse(candidate);
+    if (result.success) {
+      return { candidate: step.candidate, rawCandidate, parsed: result.data as OcxConfig, dropped, issues };
+    }
+    error = result.error;
+  }
+  return null;
+}
+
+function countSalvageableEntries(document: unknown): number {
+  if (!document || typeof document !== "object" || Array.isArray(document)) return 0;
+  let total = 0;
+  for (const section of SALVAGEABLE_CONFIG_SECTIONS) {
+    const value = (document as Record<string, unknown>)[section];
+    if (value && typeof value === "object" && !Array.isArray(value)) {
+      total += Object.keys(value as Record<string, unknown>).length;
+    }
+  }
+  return total;
+}
+
+/** Delete `section.id` entries from a copy of the raw document. */
+function deleteEntryPaths(document: unknown, entryPaths: readonly string[]): unknown {
+  if (!document || typeof document !== "object" || Array.isArray(document)) return document;
+  const next: Record<string, unknown> = { ...(document as Record<string, unknown>) };
+  for (const entryPath of entryPaths) {
+    const separator = entryPath.indexOf(".");
+    if (separator <= 0) continue;
+    const section = entryPath.slice(0, separator);
+    const id = entryPath.slice(separator + 1);
+    const container = next[section];
+    if (!container || typeof container !== "object" || Array.isArray(container)) continue;
+    const kept: Record<string, unknown> = { ...(container as Record<string, unknown>) };
+    delete kept[id];
+    next[section] = kept;
+  }
+  return next;
+}
+
+/**
+ * Entry ids are operator-chosen and can be token-shaped, so nothing dynamic reaches
+ * the log unredacted. Static section names stay readable -- they are the part that
+ * tells the operator where to look.
+ */
+function redactEntryPath(entryPath: string): string {
+  const separator = entryPath.indexOf(".");
+  if (separator <= 0) return redactSecretString(entryPath);
+  return entryPath.slice(0, separator) + "." + redactSecretString(entryPath.slice(separator + 1));
+}
+
+function redactIssuePath(path: readonly PropertyKey[]): string {
+  return path
+    .map((segment, index) => (index === 0 && typeof segment === "string" ? segment : redactSecretString(String(segment))))
+    .join(".");
+}
+
+function warnDroppedConfigSections(configPath: string, dropped: string[], issues: readonly z.ZodIssue[]): void {
+  if (warnedConfigFallbacks.has(configPath)) return;
+  warnedConfigFallbacks.add(configPath);
+  const reasons = issues
+    .map(issue => `${redactIssuePath(issue.path)}: ${redactSecretString(issue.message)}`)
+    .join("; ");
+  console.error(
+    `opencodex config at ${configPath}: dropped [${dropped.map(redactEntryPath).join(", ")}] and loaded the rest — ${reasons}. `
+    + "Everything else in your config, including providers and modelCosts, is preserved.",
+  );
 }
 
 export function readPidFileValue(): number | null {
@@ -3308,8 +3897,6 @@ function readProcessCommandLine(pid: number): string | undefined {
         "-NoProfile",
         "-NoLogo",
         "-NonInteractive",
-        "-WindowStyle",
-        "Hidden",
         "-Command",
         `(Get-CimInstance Win32_Process -Filter "ProcessId = ${pid}").CommandLine`,
       ], { encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"], timeout: 3000, windowsHide: true });

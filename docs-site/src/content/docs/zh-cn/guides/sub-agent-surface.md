@@ -27,7 +27,7 @@ description: 控制 Codex 如何在所有模型上生成和管理子代理。
 
 - **v1** 会把所有模型的 `multi_agent_version` 设为 `"v1"`。
 - **base** 会恢复上游固定值。未固定的条目会遵循原生 `multi_agent_v2` 功能开关。
-- **v2** 会把所有模型的 `multi_agent_version` 设为 `"v2"`。
+- **v2** 会把所有模型的 `multi_agent_version` 设为 `"v2"`；但启用 **让 ChatGPT 保持 v1** 时例外：ChatGPT 原生条目保持 `"v1"`，路由/组合条目仍为 `"v2"`。
 
 opencodex 会把这一点作为最后一步同时应用到实时的 `/v1/models` 目录和同步到磁盘的目录。因此，模式更改会一致影响新建的 App、CLI 和 TUI 会话。
 
@@ -85,6 +85,8 @@ opencodex 会安全失败，而不是转发空任务或不可读任务：
 - 可读的明文任务会保持正常的路由和 fallback 行为。
 
 恢复选项是选择原生 ChatGPT 子级、在 combo 中添加原生 ChatGPT 目标、在异构 provider 委派中使用 v1，或者在你控制调用方时将任务作为明文 v2 `agent_message` 内容重新发送。
+
+实验性的 `agentTaskRecovery` 默认关闭。显式启用后，它可以通过向固定 ChatGPT 端点发送额外的认证请求来恢复这种格式，但会消耗配额、增加延迟，并依赖非公开的后端行为。任何失败都会保留原有的 `unreadable_encrypted_agent_task` 错误。详见[英文配置参考](/reference/configuration/agents/#encrypted-v2-task-recovery)。
 
 ## 更改模式
 

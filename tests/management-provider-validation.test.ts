@@ -30,12 +30,15 @@ import {
 } from "../src/server";
 import { handleManagementAPI } from "../src/server/management-api";
 import { providerManagementConfigError } from "../src/server/auth-cors";
+import { providerServiceTierConfigError, withProviderServiceTierDTO } from "../src/server/management/provider-capability-config";
 import { clearModelCache, markProviderDiscoveryFailed } from "../src/codex/model-cache";
 import type { OcxConfig } from "../src/types";
 import { fakeChatGptJwt } from "./helpers/fake-chatgpt-jwt";
 import { installIsolatedCodexHome, type IsolatedCodexHome } from "./helpers/isolated-codex-home";
 import * as destinationPolicy from "../src/lib/destination-policy";
 import { catalogConvergenceFactory } from "./helpers/catalog-convergence";
+import { LOCAL_PROVIDER_RELOAD_NAME_HEADER, LOCAL_PROVIDER_RELOAD_PATH } from "../src/lib/local-provider-reload-contract";
+import { getAccountSet, saveCredential } from "../src/oauth/store";
 
 // Full-suite Windows load: startServer + multi-step provider PATCH/GET flows exceed the
 // default 5s per-test budget (same flake class as 810fa115 / claude-management-api).
@@ -125,6 +128,200 @@ afterEach(() => {
 });
 
 describe("provider management validation", () => {
+  test("provider reload adopts only the validated disk row without rewriting config", async () => {
+    if (existsSync(TEST_DIR)) rmSync(TEST_DIR, { recursive: true });
+    mkdirSync(TEST_DIR, { recursive: true });
+    process.env.OPENCODEX_HOME = TEST_DIR;
+    const liveConfig: OcxConfig = {
+      port: 0,
+      hostname: "127.0.0.1",
+      defaultProvider: "xai",
+      providers: {
+        xai: {
+          adapter: "openai-chat",
+          baseUrl: "https://api.x.ai/v1",
+          apiKey: "old-live-key",
+        },
+        stable: {
+          adapter: "openai-chat",
+          baseUrl: "https://stable.example.test/v1",
+          apiKey: "stable-live-key",
+        },
+      },
+    };
+    saveConfig(liveConfig);
+    const diskConfig = structuredClone(liveConfig);
+    diskConfig.providers.xai = {
+      ...diskConfig.providers.xai!,
+      apiKey: "new-disk-key",
+      headers: { "x-operator-header": "operator-owned" },
+    };
+    saveConfig(diskConfig);
+    const diskBefore = readFileSync(join(TEST_DIR, "config.json"));
+    const stableBefore = structuredClone(liveConfig.providers.stable);
+    const resolvedError = spyOn(destinationPolicy, "providerDestinationResolvedError")
+      .mockResolvedValue(null);
+    try {
+      const request = new Request(`http://127.0.0.1${LOCAL_PROVIDER_RELOAD_PATH}`, {
+        method: "POST",
+        headers: { [LOCAL_PROVIDER_RELOAD_NAME_HEADER]: "xai" },
+      });
+      const response = await handleManagementAPI(
+        request,
+        new URL(request.url),
+        liveConfig,
+        { createManagementConvergeCodex: catalogConvergenceFactory() },
+        "local-provider-reload-capability",
+      );
+      expect(response?.status).toBe(200);
+      expect(liveConfig.providers.xai).toEqual(diskConfig.providers.xai);
+      expect(liveConfig.providers.stable).toEqual(stableBefore);
+      expect(readFileSync(join(TEST_DIR, "config.json"))).toEqual(diskBefore);
+    } finally {
+      resolvedError.mockRestore();
+    }
+  });
+
+  test("provider reload rejects an untrusted principal and a disk rewrite during DNS validation", async () => {
+    if (existsSync(TEST_DIR)) rmSync(TEST_DIR, { recursive: true });
+    mkdirSync(TEST_DIR, { recursive: true });
+    process.env.OPENCODEX_HOME = TEST_DIR;
+    const liveConfig: OcxConfig = {
+      port: 0,
+      hostname: "127.0.0.1",
+      defaultProvider: "xai",
+      providers: {
+        xai: {
+          adapter: "openai-chat",
+          baseUrl: "https://api.x.ai/v1",
+          apiKey: "old-live-key",
+        },
+      },
+    };
+    saveConfig(liveConfig);
+    const diskConfig = structuredClone(liveConfig);
+    diskConfig.providers.xai = { ...diskConfig.providers.xai!, apiKey: "first-disk-key" };
+    saveConfig(diskConfig);
+
+    const untrusted = new Request(`http://127.0.0.1${LOCAL_PROVIDER_RELOAD_PATH}`, {
+      method: "POST",
+      headers: { [LOCAL_PROVIDER_RELOAD_NAME_HEADER]: "xai" },
+    });
+    expect((await handleManagementAPI(
+      untrusted,
+      new URL(untrusted.url),
+      liveConfig,
+      { createManagementConvergeCodex: catalogConvergenceFactory() },
+      "admin-token",
+    ))?.status).toBe(403);
+
+    const resolvedError = spyOn(destinationPolicy, "providerDestinationResolvedError")
+      .mockImplementation(async () => {
+        const changed = loadConfig();
+        changed.providers.xai = { ...changed.providers.xai!, apiKey: "second-disk-key" };
+        saveConfig(changed);
+        return null;
+      });
+    try {
+      const request = new Request(`http://127.0.0.1${LOCAL_PROVIDER_RELOAD_PATH}`, {
+        method: "POST",
+        headers: { [LOCAL_PROVIDER_RELOAD_NAME_HEADER]: "xai" },
+      });
+      const response = await handleManagementAPI(
+        request,
+        new URL(request.url),
+        liveConfig,
+        { createManagementConvergeCodex: catalogConvergenceFactory() },
+        "local-provider-reload-capability",
+      );
+      expect(response?.status).toBe(409);
+      expect(liveConfig.providers.xai?.apiKey).toBe("old-live-key");
+      expect(loadConfig().providers.xai?.apiKey).toBe("second-disk-key");
+    } finally {
+      resolvedError.mockRestore();
+    }
+  });
+
+  test("service-tier validation and public projection stay in the management boundary", () => {
+    expect(providerServiceTierConfigError("relay", {
+      adapter: "openai-chat",
+      baseUrl: "https://relay.example/v1",
+      modelSupportsServiceTier: { verified: true, blocked: false },
+    })).toBeNull();
+    expect(providerServiceTierConfigError("relay", {
+      adapter: "openai-chat",
+      baseUrl: "https://relay.example/v1",
+      modelSupportsServiceTier: { verified: "yes" },
+    })).toContain("modelSupportsServiceTier.verified must be a boolean");
+
+    const config = {
+      providers: {
+        relay: {
+          adapter: "openai-chat",
+          baseUrl: "https://relay.example/v1",
+          apiKey: "sk-never-project",
+          modelSupportsServiceTier: { verified: true },
+        },
+      },
+    } as unknown as OcxConfig;
+    const dto = withProviderServiceTierDTO(
+      { providers: { relay: { hasApiKey: true } } },
+      config,
+    ) as { providers: { relay: Record<string, unknown> } };
+    expect(dto.providers.relay).toMatchObject({
+      hasApiKey: true,
+      modelSupportsServiceTier: { verified: true },
+    });
+    expect(JSON.stringify(dto)).not.toContain("sk-never-project");
+  });
+
+  test("validates and exposes structured-output model opt-outs", () => {
+    const provider = {
+      adapter: "openai-chat",
+      baseUrl: "https://relay.example/v1",
+      noStructuredOutputModels: ["deepseek-v4-flash"],
+    };
+    expect(providerManagementConfigError("relay", provider)).toBeNull();
+    for (const noStructuredOutputModels of [
+      "deepseek-v4-flash",
+      [""],
+      ["   "],
+      [42],
+    ]) {
+      expect(providerManagementConfigError("relay", {
+        ...provider,
+        noStructuredOutputModels,
+      })).toContain("noStructuredOutputModels");
+    }
+
+    const dto = safeConfigDTO({
+      port: 10100,
+      defaultProvider: "relay",
+      providers: { relay: provider },
+    } as OcxConfig) as { providers: Record<string, { noStructuredOutputModels?: string[] }> };
+    expect(dto.providers.relay?.noStructuredOutputModels).toEqual(["deepseek-v4-flash"]);
+  });
+
+  test("normalizes hand-edited structured-output model opt-outs at load", () => {
+    if (existsSync(TEST_DIR)) rmSync(TEST_DIR, { recursive: true });
+    mkdirSync(TEST_DIR, { recursive: true });
+    process.env.OPENCODEX_HOME = TEST_DIR;
+    writeFileSync(join(TEST_DIR, "config.json"), JSON.stringify({
+      ...config("127.0.0.1"),
+      defaultProvider: "relay",
+      providers: {
+        relay: {
+          adapter: "openai-chat",
+          baseUrl: "https://relay.example/v1",
+          noStructuredOutputModels: [" deepseek-v4-flash ", "deepseek-v4-flash", " other-model "],
+        },
+      },
+    }));
+
+    expect(loadConfig().providers.relay?.noStructuredOutputModels)
+      .toEqual(["deepseek-v4-flash", "other-model"]);
+  });
+
   test("provider management rejects modelCosts rows with extra fields", () => {
     const error = providerManagementConfigError("blsc", {
       adapter: "openai-chat",
@@ -277,6 +474,69 @@ describe("provider management validation", () => {
     expect(secretNameError).toContain("[REDACTED]");
   });
 
+  test("provider request pacing PATCH persists provider and model limits without catalog churn", async () => {
+    if (existsSync(TEST_DIR)) rmSync(TEST_DIR, { recursive: true });
+    mkdirSync(TEST_DIR, { recursive: true });
+    process.env.OPENCODEX_HOME = TEST_DIR;
+    const liveConfig: OcxConfig = {
+      port: 0,
+      hostname: "127.0.0.1",
+      defaultProvider: "nvidia",
+      providers: {
+        nvidia: {
+          adapter: "openai-chat",
+          baseUrl: "https://integrate.api.nvidia.com/v1",
+          apiKey: "sk-nvidia",
+        },
+      },
+    };
+    saveConfig(liveConfig);
+    let catalogRefreshes = 0;
+    const request = async (path: string, init?: RequestInit) => {
+      const req = new Request(`http://127.0.0.1${path}`, init);
+      return handleManagementAPI(req, new URL(req.url), liveConfig, {
+        createManagementConvergeCodex: catalogConvergenceFactory(() => { catalogRefreshes += 1; }),
+      });
+    };
+    const policy = {
+      enabled: true,
+      requestsPerMinute: 38,
+      minIntervalMs: 1_600,
+      models: { "deepseek-ai/deepseek-v4-flash-0731": { requestsPerMinute: 10 } },
+    };
+
+    const saved = await request("/api/providers?name=nvidia", {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ requestPacing: policy }),
+    });
+    expect(saved?.status).toBe(200);
+    expect(liveConfig.providers.nvidia?.requestPacing).toEqual(policy);
+    expect(loadConfig().providers.nvidia?.requestPacing).toEqual(policy);
+    expect(catalogRefreshes).toBe(0);
+
+    const providers = await request("/api/providers");
+    expect((await providers?.json()).find((row: { name: string }) => row.name === "nvidia").requestPacing).toEqual(policy);
+    const status = await request("/api/provider-request-pacing?name=nvidia");
+    expect(await status?.json()).toMatchObject({ provider: "nvidia", enabled: true, queued: 0, nextSlotInMs: 0 });
+
+    const invalid = await request("/api/providers?name=nvidia", {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ requestPacing: { enabled: true, requestsPerMinute: -1 } }),
+    });
+    expect(invalid?.status).toBe(400);
+    expect(liveConfig.providers.nvidia?.requestPacing).toEqual(policy);
+
+    const timerOverflow = await request("/api/providers?name=nvidia", {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ requestPacing: { enabled: true, requestsPerMinute: 0.001 } }),
+    });
+    expect(timerOverflow?.status).toBe(400);
+    expect(liveConfig.providers.nvidia?.requestPacing).toEqual(policy);
+  });
+
   test("provider discovery status is additive and omitted before an attempt", async () => {
     markProviderDiscoveryFailed("auth-broken", { reason: "http", httpStatus: 401 });
     try {
@@ -380,6 +640,120 @@ describe("provider management validation", () => {
     }
   });
 
+  // #1409: the add/edit form's payload type has no member for contextWindow or
+  // modelContextWindows, so an overwrite arrives without them. Registry enrichment then fills
+  // the absent fields from the seed and the stored row loses the user's values — for
+  // opencode-go the seed is exactly {"kimi-k3": 262144}, which is what the reporter found in
+  // place of their deepseek-v4-flash override.
+  describe("provider POST overwrite preserves hand-edited context windows (#1409)", () => {
+    async function seedProvider(url: URL, extra: Record<string, unknown>): Promise<Response> {
+      return fetch(new URL("/api/providers", url), {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          name: "opencode-go",
+          provider: { adapter: "openai-chat", baseUrl: "https://opencode.ai/zen/go/v1", apiKey: "k", ...extra },
+        }),
+      });
+    }
+
+    function freshHome(): void {
+      if (existsSync(TEST_DIR)) rmSync(TEST_DIR, { recursive: true });
+      mkdirSync(TEST_DIR, { recursive: true });
+      process.env.OPENCODEX_HOME = TEST_DIR;
+      saveConfig(config("127.0.0.1"));
+    }
+
+    test("an omitted modelContextWindows keeps the user's map, without registry seed keys", async () => {
+      freshHome();
+      const server = startServer(0);
+      try {
+        expect((await seedProvider(server.url, { modelContextWindows: { "deepseek-v4-flash": 900000 } })).status).toBe(200);
+        expect((await seedProvider(server.url, {})).status).toBe(200);
+
+        // The user's key survives, and the registry seed is NOT persisted into user config:
+        // router.ts fills registry values beneath user entries at resolve time, so writing
+        // them here would be a side effect of an unrelated save.
+        expect(loadConfig().providers["opencode-go"]?.modelContextWindows).toEqual({ "deepseek-v4-flash": 900000 });
+      } finally {
+        await server.stop(true);
+      }
+    });
+
+    test("a submitted modelContextWindows updates that key and keeps the others", async () => {
+      freshHome();
+      const server = startServer(0);
+      try {
+        expect((await seedProvider(server.url, { modelContextWindows: { "deepseek-v4-flash": 900000 } })).status).toBe(200);
+        expect((await seedProvider(server.url, { modelContextWindows: { "kimi-k3": 300000 } })).status).toBe(200);
+
+        expect(loadConfig().providers["opencode-go"]?.modelContextWindows)
+          .toEqual({ "deepseek-v4-flash": 900000, "kimi-k3": 300000 });
+      } finally {
+        await server.stop(true);
+      }
+    });
+
+    test("an omitted contextWindow keeps the user's scalar", async () => {
+      freshHome();
+      const server = startServer(0);
+      try {
+        expect((await seedProvider(server.url, { contextWindow: 777000 })).status).toBe(200);
+        expect((await seedProvider(server.url, {})).status).toBe(200);
+
+        expect(loadConfig().providers["opencode-go"]?.contextWindow).toBe(777000);
+      } finally {
+        await server.stop(true);
+      }
+    });
+
+    test("a submitted contextWindow still wins", async () => {
+      freshHome();
+      const server = startServer(0);
+      try {
+        expect((await seedProvider(server.url, { contextWindow: 777000 })).status).toBe(200);
+        expect((await seedProvider(server.url, { contextWindow: 512000 })).status).toBe(200);
+
+        expect(loadConfig().providers["opencode-go"]?.contextWindow).toBe(512000);
+      } finally {
+        await server.stop(true);
+      }
+    });
+
+    test("a brand-new provider still receives the registry seed", async () => {
+      freshHome();
+      const server = startServer(0);
+      try {
+        expect((await seedProvider(server.url, {})).status).toBe(200);
+
+        // No prior row exists, so enrichment is authoritative and the seed must land.
+        expect(loadConfig().providers["opencode-go"]?.modelContextWindows).toBeDefined();
+      } finally {
+        await server.stop(true);
+      }
+    });
+
+    test("PATCH can still delete a key with an explicit null", async () => {
+      freshHome();
+      const server = startServer(0);
+      try {
+        expect((await seedProvider(server.url, { modelContextWindows: { "deepseek-v4-flash": 900000 } })).status).toBe(200);
+
+        const patch = await fetch(new URL("/api/providers?name=opencode-go", server.url), {
+          method: "PATCH",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ modelContextWindows: { "deepseek-v4-flash": null } }),
+        });
+        expect(patch.status).toBe(200);
+
+        // Deletion is an explicit null through PATCH, which the POST carry-over must not undo.
+        expect(loadConfig().providers["opencode-go"]?.modelContextWindows?.["deepseek-v4-flash"]).toBeUndefined();
+      } finally {
+        await server.stop(true);
+      }
+    });
+  });
+
   test("provider management accepts modelCosts on the canonical openai provider", async () => {
     if (existsSync(TEST_DIR)) rmSync(TEST_DIR, { recursive: true });
     mkdirSync(TEST_DIR, { recursive: true });
@@ -456,9 +830,15 @@ describe("provider management validation", () => {
       for (const [, provider] of [
         ["base", { ...canonicalDirect, baseUrl: "https://attacker.example/backend-api/codex" }],
         ["mode", { ...canonicalDirect, authMode: "key" }],
-        ["map", { ...canonicalDirect, modelContextWindows: { "gpt-5.6": 1 } }],
         ["header", { ...canonicalDirect, headers: { "x-forged": "value" } }],
         ["capability", { ...canonicalDirect, noVisionModels: ["gpt-5.6"] }],
+        // The context overlays are admitted now, but only in a shape a reader can trust.
+        ["window-shape", { ...canonicalDirect, contextWindow: "wide" }],
+        ["window-zero", { ...canonicalDirect, contextWindow: 0 }],
+        ["window-null-on-post", { ...canonicalDirect, contextWindow: null }],
+        ["map-shape", { ...canonicalDirect, modelContextWindows: [] }],
+        ["map-value", { ...canonicalDirect, modelContextWindows: { "gpt-5.6-sol": "wide" } }],
+        ["map-key", { ...canonicalDirect, modelContextWindows: { "  ": 500_000 } }],
       ] as const) {
         const response = await fetch(new URL("/api/providers", server.url), {
           method: "POST",
@@ -466,6 +846,21 @@ describe("provider management validation", () => {
           body: JSON.stringify({ name: "openai", provider }),
         });
         expect(response.status).toBe(400);
+      }
+
+      // A user narrowing their own native rows is a supported overlay, like requestPacing:
+      // the accessors only ever lower the measured window with it, so it cannot widen what
+      // the proxy advertises.
+      for (const [, provider] of [
+        ["per-model", { ...canonicalDirect, modelContextWindows: { "gpt-5.6-sol": 500_000 } }],
+        ["provider-wide", { ...canonicalDirect, contextWindow: 500_000 }],
+      ] as const) {
+        const response = await fetch(new URL("/api/providers", server.url), {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ name: "openai", provider }),
+        });
+        expect(response.status).toBe(200);
       }
 
       const acceptedCustom = await fetch(new URL("/api/providers", server.url), {
@@ -1063,6 +1458,68 @@ describe("provider management validation", () => {
     }
   });
 
+  test("provider PATCH persists and clears structured-output model opt-outs", async () => {
+    if (existsSync(TEST_DIR)) rmSync(TEST_DIR, { recursive: true });
+    mkdirSync(TEST_DIR, { recursive: true });
+    process.env.OPENCODEX_HOME = TEST_DIR;
+    saveConfig(config("127.0.0.1"));
+
+    const server = startServer(0);
+    try {
+      const createRes = await fetch(new URL("/api/providers", server.url), {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          name: "structured-output-toggle",
+          provider: {
+            adapter: "openai-chat",
+            baseUrl: "https://relay.example/v1",
+            liveModels: false,
+            models: ["deepseek-v4-flash"],
+          },
+        }),
+      });
+      expect(createRes.status).toBe(200);
+
+      const invalid = await fetch(new URL("/api/providers?name=structured-output-toggle", server.url), {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ noStructuredOutputModels: "deepseek-v4-flash" }),
+      });
+      expect(invalid.status).toBe(400);
+
+      const patchRes = await fetch(new URL("/api/providers?name=structured-output-toggle", server.url), {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          noStructuredOutputModels: [" deepseek-v4-flash ", "deepseek-v4-flash"],
+        }),
+      });
+      expect(patchRes.status).toBe(200);
+
+      const providers = await fetch(new URL("/api/providers", server.url)).then(response => response.json()) as Array<{
+        name: string;
+        noStructuredOutputModels?: string[];
+      }>;
+      expect(providers.find(provider => provider.name === "structured-output-toggle")?.noStructuredOutputModels)
+        .toEqual(["deepseek-v4-flash"]);
+
+      const clearRes = await fetch(new URL("/api/providers?name=structured-output-toggle", server.url), {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ noStructuredOutputModels: null }),
+      });
+      expect(clearRes.status).toBe(200);
+
+      const saved = await fetch(new URL("/api/config", server.url)).then(response => response.json()) as {
+        providers: Record<string, { noStructuredOutputModels?: string[] }>;
+      };
+      expect(saved.providers["structured-output-toggle"].noStructuredOutputModels).toBeUndefined();
+    } finally {
+      await server.stop(true);
+    }
+  });
+
  test("provider management rejects sensitive or injectable provider headers", async () => {
     if (existsSync(TEST_DIR)) rmSync(TEST_DIR, { recursive: true });
     mkdirSync(TEST_DIR, { recursive: true });
@@ -1110,6 +1567,51 @@ describe("provider management validation", () => {
         method: "DELETE",
       });
       expect(response.status).toBe(404);
+    } finally {
+      await server.stop(true);
+    }
+  });
+
+  test("provider deletion removes the deleted provider's OAuth credential", async () => {
+    if (existsSync(TEST_DIR)) rmSync(TEST_DIR, { recursive: true });
+    mkdirSync(TEST_DIR, { recursive: true });
+    process.env.OPENCODEX_HOME = TEST_DIR;
+    saveConfig({
+      port: 0,
+      defaultProvider: "test-openai",
+      providers: {
+        "test-openai": {
+          adapter: "openai-chat",
+          baseUrl: "https://api.example.test/v1",
+          apiKey: "test-key",
+        },
+        removable: {
+          adapter: "openai-chat",
+          baseUrl: "https://api.removable.test/v1",
+          apiKey: "test-key",
+        },
+      },
+    });
+    await saveCredential("removable", {
+      access: "credential-to-delete",
+      refresh: "refresh-to-delete",
+      expires: Date.now() + 60_000,
+    });
+    await saveCredential("retained", {
+      access: "credential-to-keep",
+      refresh: "refresh-to-keep",
+      expires: Date.now() + 60_000,
+    });
+
+    const server = startServer(0);
+    try {
+      const response = await fetch(new URL("/api/providers?name=removable", server.url), {
+        method: "DELETE",
+      });
+      expect(response.status).toBe(200);
+
+      expect(getAccountSet("removable")).toBeNull();
+      expect(getAccountSet("retained")).not.toBeNull();
     } finally {
       await server.stop(true);
     }
@@ -2131,9 +2633,11 @@ describe("provider management validation", () => {
           adapter: "openai-chat",
           baseUrl: "https://relay.example.test/v1",
           apiKey: "sk-existing",
+          allowPrivateNetwork: true,
           models: ["wide", "narrow"],
           contextWindow: 256_000,
           modelContextWindows: { narrow: 64_000 },
+          modelSupportsServiceTier: { narrow: false },
         },
       },
     };
@@ -2160,20 +2664,24 @@ describe("provider management validation", () => {
     expect(rows.find(row => row.name === "relay")).toMatchObject({
       contextWindow: 256_000,
       modelContextWindows: { narrow: 64_000 },
+      modelSupportsServiceTier: { narrow: false },
     });
 
     const updated = await request("PATCH", {
       contextWindow: 350_000,
       modelContextWindows: { wide: 350_000 },
+      modelSupportsServiceTier: { wide: true },
     });
     expect(updated?.status).toBe(200);
     expect(liveConfig.providers.relay).toMatchObject({
       contextWindow: 350_000,
       modelContextWindows: { wide: 350_000, narrow: 64_000 },
+      modelSupportsServiceTier: { wide: true, narrow: false },
     });
     expect(loadConfig().providers.relay).toMatchObject({
       contextWindow: 350_000,
       modelContextWindows: { wide: 350_000, narrow: 64_000 },
+      modelSupportsServiceTier: { wide: true, narrow: false },
     });
 
     for (const invalid of [
@@ -2186,24 +2694,32 @@ describe("provider management validation", () => {
       { modelContextWindows: { wide: 1e100 } },
       { modelContextWindows: { "": 100_000 } },
       { modelContextWindows: { wide: -1 } },
+      { modelSupportsServiceTier: { wide: "yes" } },
+      { modelSupportsServiceTier: { "": true } },
     ]) {
       expect((await request("PATCH", invalid))?.status).toBe(400);
     }
     expect(liveConfig.providers.relay).toMatchObject({
       contextWindow: 350_000,
       modelContextWindows: { wide: 350_000, narrow: 64_000 },
+      modelSupportsServiceTier: { wide: true, narrow: false },
     });
 
     expect((await request("PATCH", { modelContextWindows: { wide: null } }))?.status).toBe(200);
     expect(liveConfig.providers.relay.modelContextWindows).toEqual({ narrow: 64_000 });
 
+    expect((await request("PATCH", { modelSupportsServiceTier: { wide: null } }))?.status).toBe(200);
+    expect(liveConfig.providers.relay.modelSupportsServiceTier).toEqual({ narrow: false });
+
     const cleared = await request("PATCH", {
       contextWindow: null,
       modelContextWindows: null,
+      modelSupportsServiceTier: null,
     });
     expect(cleared?.status).toBe(200);
     expect(liveConfig.providers.relay.contextWindow).toBeUndefined();
     expect(liveConfig.providers.relay.modelContextWindows).toBeUndefined();
+    expect(liveConfig.providers.relay.modelSupportsServiceTier).toBeUndefined();
   });
 
   test("provider PATCH manages custom headers with merge and clear semantics", async () => {
@@ -2673,5 +3189,230 @@ describe("provider management validation", () => {
     } finally {
       await server.stop(true);
     }
+  });
+});
+
+describe("provider upstreamHttpVersion management contract (#1668)", () => {
+  function makeConfig(): OcxConfig {
+    return {
+      port: 0,
+      hostname: "127.0.0.1",
+      defaultProvider: "nvidia",
+      providers: {
+        nvidia: {
+          adapter: "openai-chat",
+          baseUrl: "https://integrate.api.nvidia.com/v1",
+          apiKey: "sk-nvidia",
+        },
+      },
+    };
+  }
+
+  // Direct handleManagementAPI calls (no startServer) keep the whole contract in one
+  // synchronous authority, matching the request-pacing PATCH tests above.
+  async function withRequest(liveConfig: OcxConfig, run: (request: (path: string, init?: RequestInit) => Promise<Response | null>) => Promise<void>): Promise<void> {
+    const resolvedError = spyOn(destinationPolicy, "providerDestinationResolvedError")
+      .mockResolvedValue(null);
+    try {
+      const request = async (path: string, init?: RequestInit) => {
+        const req = new Request(`http://127.0.0.1${path}`, init);
+        return handleManagementAPI(req, new URL(req.url), liveConfig, {
+          createManagementConvergeCodex: catalogConvergenceFactory(),
+        });
+      };
+      await run(request);
+    } finally {
+      resolvedError.mockRestore();
+    }
+  }
+
+  test("POST accepts a valid upstreamHttpVersion and persists it; GET exposes it", async () => {
+    if (existsSync(TEST_DIR)) rmSync(TEST_DIR, { recursive: true });
+    mkdirSync(TEST_DIR, { recursive: true });
+    process.env.OPENCODEX_HOME = TEST_DIR;
+    const liveConfig = makeConfig();
+    saveConfig(liveConfig);
+    await withRequest(liveConfig, async (request) => {
+      const created = await request("/api/providers", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          name: "h1-provider",
+          provider: {
+            adapter: "openai-chat",
+            baseUrl: "https://api.example.test/v1",
+            upstreamHttpVersion: "http1.1",
+          },
+        }),
+      });
+      expect(created?.status).toBe(200);
+      // Live config, disk reload, and the public GET row must all carry the pin.
+      expect(liveConfig.providers["h1-provider"]?.upstreamHttpVersion).toBe("http1.1");
+      expect(loadConfig().providers["h1-provider"]?.upstreamHttpVersion).toBe("http1.1");
+      const list = await request("/api/providers");
+      expect(await list?.json()).toContainEqual(expect.objectContaining({
+        name: "h1-provider",
+        upstreamHttpVersion: "http1.1",
+      }));
+    });
+  });
+
+
+  test("POST with upstreamHttpVersion: null persists nothing and survives a reload", async () => {
+    // The management validator accepts null as "clear this", but POST persisted the body as
+    // submitted while the loader schema rejected null. The provider then failed to parse on the
+    // next start and the operator landed in invalid-config recovery for a value the API accepted.
+    if (existsSync(TEST_DIR)) rmSync(TEST_DIR, { recursive: true });
+    mkdirSync(TEST_DIR, { recursive: true });
+    process.env.OPENCODEX_HOME = TEST_DIR;
+    const liveConfig = makeConfig();
+    saveConfig(liveConfig);
+    await withRequest(liveConfig, async (request) => {
+      const created = await request("/api/providers", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          name: "null-provider",
+          provider: {
+            adapter: "openai-chat",
+            baseUrl: "https://api.example.test/v1",
+            upstreamHttpVersion: null,
+          },
+        }),
+      });
+      expect(created?.status).toBe(200);
+
+      // Absent, not null: live, on disk, and after a full reload.
+      expect(liveConfig.providers["null-provider"]).toBeDefined();
+      expect(Object.hasOwn(liveConfig.providers["null-provider"]!, "upstreamHttpVersion")).toBe(false);
+
+      const onDisk = JSON.parse(readFileSync(join(TEST_DIR, "config.json"), "utf-8")) as any;
+      expect(onDisk.providers["null-provider"].upstreamHttpVersion).toBeUndefined();
+
+      const reloaded = loadConfig();
+      expect(reloaded.providers["null-provider"]).toBeDefined();
+      expect(reloaded.providers["null-provider"]?.upstreamHttpVersion).toBeUndefined();
+      // The other providers survived, i.e. the reload did not fall into recovery.
+      expect(Object.keys(reloaded.providers).length).toBeGreaterThan(1);
+
+      const list = await request("/api/providers");
+      const rows = await list?.json() as any[];
+      const row = rows.find(r => r.name === "null-provider");
+      expect(row).toBeDefined();
+      expect(row.upstreamHttpVersion).toBeUndefined();
+    });
+  });
+
+  test("a config already holding upstreamHttpVersion: null still loads", async () => {
+    // Compatibility for anything the old POST path already wrote to disk.
+    if (existsSync(TEST_DIR)) rmSync(TEST_DIR, { recursive: true });
+    mkdirSync(TEST_DIR, { recursive: true });
+    process.env.OPENCODEX_HOME = TEST_DIR;
+    const liveConfig = makeConfig();
+    saveConfig(liveConfig);
+    const raw = JSON.parse(readFileSync(join(TEST_DIR, "config.json"), "utf-8")) as any;
+    const firstProvider = Object.keys(raw.providers)[0]!;
+    raw.providers[firstProvider].upstreamHttpVersion = null;
+    writeFileSync(join(TEST_DIR, "config.json"), JSON.stringify(raw, null, 2));
+
+    const reloaded = loadConfig();
+    expect(reloaded.providers[firstProvider]).toBeDefined();
+    expect(reloaded.providers[firstProvider]?.upstreamHttpVersion).toBeUndefined();
+    expect(Object.keys(reloaded.providers).length).toBe(Object.keys(raw.providers).length);
+  });
+  test("POST rejects an invalid upstreamHttpVersion at the write boundary without persisting", async () => {
+    if (existsSync(TEST_DIR)) rmSync(TEST_DIR, { recursive: true });
+    mkdirSync(TEST_DIR, { recursive: true });
+    process.env.OPENCODEX_HOME = TEST_DIR;
+    const liveConfig = makeConfig();
+    saveConfig(liveConfig);
+    await withRequest(liveConfig, async (request) => {
+      const rejected = await request("/api/providers", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          name: "bad-version",
+          provider: {
+            adapter: "openai-chat",
+            baseUrl: "https://api.example.test/v1",
+            upstreamHttpVersion: "http3",
+          },
+        }),
+      });
+      expect(rejected?.status).toBe(400);
+      expect(await rejected?.json()).toMatchObject({
+        error: expect.stringContaining("upstreamHttpVersion"),
+      });
+      expect(loadConfig().providers["bad-version"]).toBeUndefined();
+    });
+  });
+
+  test("PATCH sets, then clears upstreamHttpVersion with live + disk persistence", async () => {
+    if (existsSync(TEST_DIR)) rmSync(TEST_DIR, { recursive: true });
+    mkdirSync(TEST_DIR, { recursive: true });
+    process.env.OPENCODEX_HOME = TEST_DIR;
+    const liveConfig = makeConfig();
+    saveConfig(liveConfig);
+    await withRequest(liveConfig, async (request) => {
+      const set = await request("/api/providers?name=nvidia", {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ upstreamHttpVersion: "http1.1" }),
+      });
+      expect(set?.status).toBe(200);
+      expect(liveConfig.providers.nvidia?.upstreamHttpVersion).toBe("http1.1");
+      expect(loadConfig().providers.nvidia?.upstreamHttpVersion).toBe("http1.1");
+
+      const invalid = await request("/api/providers?name=nvidia", {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ upstreamHttpVersion: "h3" }),
+      });
+      expect(invalid?.status).toBe(400);
+      expect(liveConfig.providers.nvidia?.upstreamHttpVersion).toBe("http1.1");
+
+      const clear = await request("/api/providers?name=nvidia", {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ upstreamHttpVersion: null }),
+      });
+      expect(clear?.status).toBe(200);
+      expect(liveConfig.providers.nvidia?.upstreamHttpVersion).toBeUndefined();
+      expect(loadConfig().providers.nvidia?.upstreamHttpVersion).toBeUndefined();
+    });
+  });
+
+  test("safeConfigDTO exposes upstreamHttpVersion without leaking it into the live row", async () => {
+    if (existsSync(TEST_DIR)) rmSync(TEST_DIR, { recursive: true });
+    mkdirSync(TEST_DIR, { recursive: true });
+    process.env.OPENCODEX_HOME = TEST_DIR;
+    const liveConfig = makeConfig();
+    liveConfig.providers.nvidia = {
+      ...liveConfig.providers.nvidia!,
+      upstreamHttpVersion: "http1.1",
+    };
+    saveConfig(liveConfig);
+    const dto = safeConfigDTO(loadConfig()) as {
+      providers?: Record<string, Record<string, unknown>>;
+    };
+    expect(dto.providers?.nvidia?.upstreamHttpVersion).toBe("http1.1");
+  });
+
+  test("providerManagementConfigError rejects invalid upstreamHttpVersion values", () => {
+    expect(providerManagementConfigError("x", {
+      adapter: "openai-chat",
+      baseUrl: "https://api.example.test/v1",
+      upstreamHttpVersion: "http3",
+    })).toContain("upstreamHttpVersion");
+    expect(providerManagementConfigError("x", {
+      adapter: "openai-chat",
+      baseUrl: "https://api.example.test/v1",
+      upstreamHttpVersion: "http1.1",
+    })).toBeNull();
+    expect(providerManagementConfigError("x", {
+      adapter: "openai-chat",
+      baseUrl: "https://api.example.test/v1",
+      upstreamHttpVersion: 42,
+    })).toContain("upstreamHttpVersion");
   });
 });

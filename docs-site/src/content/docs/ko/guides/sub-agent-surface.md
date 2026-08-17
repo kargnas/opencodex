@@ -27,7 +27,7 @@ description: Codex가 모든 모델에서 서브에이전트를 생성하고 관
 
 - **v1**은 모든 모델에 `multi_agent_version = "v1"`을 설정합니다.
 - **base**는 업스트림 핀을 복원합니다. 핀이 없는 항목은 기본 `multi_agent_v2` 기능 플래그를 따릅니다.
-- **v2**는 모든 모델에 `multi_agent_version = "v2"`를 설정합니다.
+- **v2**는 모든 모델에 `multi_agent_version = "v2"`를 설정합니다. 단 **ChatGPT를 v1로 유지**를 켜면 예외입니다: ChatGPT 네이티브 항목은 `"v1"`로 남고, 라우팅/콤보 항목은 `"v2"`가 됩니다.
 
 opencodex는 이 값을 Codex가 읽는 실시간 `/v1/models` 카탈로그와 디스크에 동기화된 카탈로그 모두에 마지막 단계로 적용합니다. 그래서 모드를 바꾸면 새로 만들어지는 App, CLI, TUI 세션에 일관되게 반영됩니다.
 
@@ -85,6 +85,8 @@ opencodex는 읽을 수 없거나 빈 작업을 그대로 넘기지 않고 안�
 - 읽을 수 있는 평문 작업은 정상 라우트와 폴백 동작을 그대로 유지합니다.
 
 복구 방법은 네이티브 ChatGPT 자식을 선택하거나, 콤보에 네이티브 ChatGPT 대상을 추가하거나, 이종 프로바이더 위임에는 v1을 사용하거나, 호출자를 제어할 수 있을 때 작업을 평문 v2 `agent_message` 콘텐츠로 다시 보내는 것입니다.
+
+실험적인 `agentTaskRecovery`는 기본적으로 꺼져 있습니다. 명시적으로 켜면 고정된 ChatGPT 엔드포인트로 인증된 요청을 하나 더 보내 이 형식을 복구할 수 있지만, 할당량과 지연 시간이 늘고 비공개 백엔드 동작에 의존합니다. 실패하면 기존 `unreadable_encrypted_agent_task` 오류를 그대로 유지합니다. 자세한 내용은 [영문 설정 참고 문서](/reference/configuration/agents/#encrypted-v2-task-recovery)를 보세요.
 
 ## 모드 변경
 

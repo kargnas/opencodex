@@ -36,12 +36,16 @@ import {
 } from "../src/server";
 import { clearRequestLogsForTests, getRequestLogEntries } from "../src/server/request-log";
 import { handleManagementAPI } from "../src/server/management-api";
+import { handleResponses } from "../src/server/responses";
 import type { OcxConfig } from "../src/types";
 import { fakeChatGptJwt } from "./helpers/fake-chatgpt-jwt";
 import { installIsolatedCodexHome, type IsolatedCodexHome } from "./helpers/isolated-codex-home";
+import { ownedServiceHomeInspection } from "./helpers/owned-service-home-inspection";
 import { configuredAdminToken } from "../src/lib/admin-secrets";
 import { SYSTEM_RESTART_CAPABILITY_VERSION } from "../src/lib/system-restart-contract";
+import { LOCAL_PROVIDER_RELOAD_CAPABILITY_VERSION } from "../src/lib/local-provider-reload-contract";
 
+import { watchdogMs } from "./helpers/ci-watchdog";
 const previousApiToken = process.env.OPENCODEX_API_AUTH_TOKEN;
 const previousOpencodexHome = process.env.OPENCODEX_HOME;
 const originalGlobalFetch = globalThis.fetch;
@@ -349,6 +353,132 @@ describe("server local API auth", () => {
     })).toBe(false);
   });
 
+  test("responses handler keeps the request timeout until the body is fully accepted", async () => {
+    let controller!: ReadableStreamDefaultController<Uint8Array>;
+    const body = new ReadableStream<Uint8Array>({
+      start(value) {
+        controller = value;
+      },
+    });
+    const cfg = config();
+    cfg.defaultProvider = "fixture";
+    cfg.providers = {
+      fixture: { ...cfg.providers.openai!, disabled: true },
+    };
+    const req = new Request("http://localhost/v1/responses", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body,
+    });
+    let accepted = false;
+    const responsePromise = handleResponses(req, cfg, {
+      model: "unknown",
+      provider: "unknown",
+    }, {
+      onRequestBodyRead: () => {
+        accepted = true;
+      },
+    });
+
+    controller.enqueue(new TextEncoder().encode('{"model":"fixture/gpt-test","input":"hello"'));
+    await Bun.sleep(10);
+    expect(accepted).toBe(false);
+
+    controller.enqueue(new TextEncoder().encode("}"));
+    controller.close();
+    const response = await responsePromise;
+    expect(accepted).toBe(true);
+    expect(response.status).toBe(404);
+  });
+
+  test("responses handler classifies an aborted pending body as client cancellation", async () => {
+    let bodyController!: ReadableStreamDefaultController<Uint8Array>;
+    const body = new ReadableStream<Uint8Array>({
+      start(value) {
+        bodyController = value;
+      },
+    });
+    const abortController = new AbortController();
+    const req = new Request("http://localhost/v1/responses", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body,
+      signal: abortController.signal,
+    });
+    let accepted = false;
+    const responsePromise = handleResponses(req, config(), {
+      model: "unknown",
+      provider: "unknown",
+    }, {
+      abortSignal: abortController.signal,
+      onRequestBodyRead: () => {
+        accepted = true;
+      },
+    });
+
+    bodyController.enqueue(new TextEncoder().encode('{"model":"openai/gpt-test","input":"hello"'));
+    await Bun.sleep(10);
+    expect(accepted).toBe(false);
+
+    abortController.abort();
+    const response = await responsePromise;
+    expect(response.status).toBe(499);
+    expect(accepted).toBe(false);
+  });
+
+  test("responses handler accepts a combo body exactly once across failover children", async () => {
+    const upstreamModels: string[] = [];
+    const upstream = Bun.serve({
+      hostname: "127.0.0.1",
+      port: 0,
+      async fetch(request) {
+        const body = await request.json() as { model?: string };
+        upstreamModels.push(body.model ?? "missing");
+        return Response.json({ error: { message: "rate limited; try the next combo target" } }, {
+          status: 429,
+          headers: { "retry-after": "1" },
+        });
+      },
+    });
+    const baseUrl = `${upstream.url.toString().replace(/\/$/, "")}/v1`;
+    const cfg: OcxConfig = {
+      port: 0,
+      defaultProvider: "first",
+      providers: {
+        first: { adapter: "openai-responses", baseUrl, apiKey: "first-key", allowPrivateNetwork: true },
+        second: { adapter: "openai-responses", baseUrl, apiKey: "second-key", allowPrivateNetwork: true },
+      },
+      combos: {
+        request_timeout: {
+          strategy: "failover",
+          targets: [
+            { provider: "first", model: "first-model" },
+            { provider: "second", model: "second-model" },
+          ],
+        },
+      },
+    };
+    let acceptedCount = 0;
+
+    try {
+      const response = await handleResponses(new Request("http://localhost/v1/responses", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ model: "combo/request_timeout", input: "hello", stream: false }),
+      }), cfg, { model: "unknown", provider: "unknown" }, {
+        onRequestBodyRead: () => {
+          acceptedCount += 1;
+        },
+      });
+
+      expect(response.status).toBe(429);
+      expect(acceptedCount).toBe(1);
+      expect(upstreamModels).toEqual(["first-model", "second-model"]);
+    } finally {
+      await upstream.stop(true);
+    }
+  });
+
   test("loopback hostnames do not require opencodex API auth", () => {
     expect(isLoopbackHostname(undefined)).toBe(true);
     expect(isLoopbackHostname("")).toBe(true);
@@ -390,6 +520,56 @@ describe("server local API auth", () => {
     const allowed = corsHeaders()["Access-Control-Allow-Headers"];
     expect(allowed).toContain("X-OpenCodex-API-Key");
     expect(allowed).toContain("ChatGPT-Account-Id");
+  });
+
+  test("CORS preflight echoes vendor SDK request headers only for an allowed origin (#1773)", async () => {
+    if (existsSync(TEST_DIR)) rmSync(TEST_DIR, { recursive: true });
+    mkdirSync(TEST_DIR, { recursive: true });
+    process.env.OPENCODEX_HOME = TEST_DIR;
+    saveConfig(config("127.0.0.1"));
+
+    const server = startServer(0);
+    const loopbackOrigin = `http://127.0.0.1:${server.port}`;
+    const stainless = "x-stainless-lang, x-stainless-runtime, x-stainless-retry-count";
+    try {
+      // Every browser-SDK inbound route must answer the same preflight contract; a route that
+      // omits one Stainless header blocks the real request before it is ever sent.
+      for (const path of ["/v1/messages", "/v1/responses", "/v1/chat/completions"]) {
+        const res = await fetch(new URL(path, server.url), {
+          method: "OPTIONS",
+          headers: {
+            origin: loopbackOrigin,
+            "access-control-request-method": "POST",
+            "access-control-request-headers": `content-type, ${stainless}`,
+          },
+        });
+        expect(res.status).toBe(204);
+        const allowed = (res.headers.get("access-control-allow-headers") ?? "").toLowerCase();
+        for (const header of stainless.split(",").map(h => h.trim())) {
+          expect(allowed).toContain(header);
+        }
+        // The static contract survives alongside the echoed headers, and content-type is not
+        // duplicated just because the caller also asked for it.
+        expect(allowed).toContain("x-opencodex-api-key");
+        expect(allowed.split(",").filter(h => h.trim() === "content-type")).toHaveLength(1);
+        expect(res.headers.get("vary")).toContain("Access-Control-Request-Headers");
+      }
+
+      // A rejected origin never reaches the echo: it is refused before any allow-list is built.
+      const rejected = await fetch(new URL("/v1/responses", server.url), {
+        method: "OPTIONS",
+        headers: {
+          origin: "https://attacker.test",
+          "access-control-request-method": "POST",
+          "access-control-request-headers": "x-stainless-lang",
+        },
+      });
+      expect(rejected.status).toBe(403);
+      expect((rejected.headers.get("access-control-allow-headers") ?? "").toLowerCase())
+        .not.toContain("x-stainless-lang");
+    } finally {
+      await server.stop(true);
+    }
   });
 
   test("safeConfigDTO redacts provider secrets and exposes booleans", () => {
@@ -688,6 +868,7 @@ describe("server local API auth", () => {
       expect(Object.keys(healthBody).sort()).toEqual([
         "pid",
         "port",
+        "providerReloadCapability",
         "restartCapability",
         "service",
         "status",
@@ -695,6 +876,7 @@ describe("server local API auth", () => {
         "version",
       ]);
       expect(healthBody.restartCapability).toBe(SYSTEM_RESTART_CAPABILITY_VERSION);
+      expect(healthBody.providerReloadCapability).toBe(LOCAL_PROVIDER_RELOAD_CAPABILITY_VERSION);
       expect("rss" in healthBody).toBe(false);
     } finally {
       await server.stop(true);
@@ -1133,6 +1315,13 @@ describe("server local API auth", () => {
   // Windows CI under the full suite can spend >1s opening WS turns and >5s on this
   // multi-server matrix; tight budgets flake as "tier websocket timeout" and cascade
   // into the next test via a late fetch restore (502 instead of the mocked 500).
+  /**
+   * This matrix points OPENCODEX_HOME at its own temp dir, so the service
+   * installed on the developer's machine is not evidence about it.
+   * See tests/helpers/owned-service-home.ts.
+   */
+  const inspectNativeCodexOwnership = ownedServiceHomeInspection("OpenAI option auth matrix test");
+
   test("OpenAI option auth matrix keeps direct, pool, and API credentials independent", async () => {
     if (existsSync(TEST_DIR)) rmSync(TEST_DIR, { recursive: true });
     mkdirSync(TEST_DIR, { recursive: true });
@@ -1196,7 +1385,7 @@ describe("server local API auth", () => {
       url.protocol = "ws:";
       const ws = new WebSocket(url, { headers: { "x-opencodex-api-key": "local-secret", ...(headers ?? {}) } } as unknown as string[]);
       return new Promise<string>((resolve, reject) => {
-        const timer = setTimeout(() => reject(new Error("tier websocket timeout")), 5_000);
+        const timer = setTimeout(() => reject(new Error("tier websocket timeout")), watchdogMs(5_000));
         ws.addEventListener("open", () => {
           ws.send(JSON.stringify({ type: "response.create", model, input: "hello" }));
         }, { once: true });
@@ -1231,7 +1420,7 @@ describe("server local API auth", () => {
       markAccountNeedsReauth("direct-unusable");
       recordCodexUpstreamOutcome(directConfig, "direct-unusable", 429, { retryAfter: "60" });
       saveConfig(directConfig);
-      const direct = startServer(0);
+      const direct = startServer(0, { inspectNativeCodexOwnership });
       const directBaseline = {
         config: readFileSync(join(TEST_DIR, "config.json"), "utf8"),
         accounts: readFileSync(join(TEST_DIR, "codex-accounts.json"), "utf8"),
@@ -1287,7 +1476,7 @@ describe("server local API auth", () => {
         writeMainToken(state === "expired" ? `header.${expiredPayload}.signature` : "opaque-live-main-token");
         saveConfig(cfg);
         const before = seen.length;
-        const unusableMain = startServer(0);
+        const unusableMain = startServer(0, { inspectNativeCodexOwnership });
         try {
           await waitForNativeMainStartupGate();
           if (state === "reauth") markAccountNeedsReauth(MAIN_CODEX_ACCOUNT_ID);
@@ -1316,7 +1505,7 @@ describe("server local API auth", () => {
         autoSwitchThreshold: 0,
       } as OcxConfig);
       const beforeMissingPool = seen.length;
-      const missingPool = startServer(0);
+      const missingPool = startServer(0, { inspectNativeCodexOwnership });
       try {
         expect((await request(missingPool)).status).toBe(401);
         expect((await compact(missingPool)).status).toBe(401);
@@ -1341,7 +1530,7 @@ describe("server local API auth", () => {
         providers: cooldownCfg,
       } as OcxConfig, "pool-a", 429, { retryAfter: "60" });
       const beforeCooldown = seen.length;
-      const cooledMulti = startServer(0);
+      const cooledMulti = startServer(0, { inspectNativeCodexOwnership });
       try {
         expect((await compact(cooledMulti)).status).toBe(429);
         expect(seen).toHaveLength(beforeCooldown);
@@ -1349,7 +1538,7 @@ describe("server local API auth", () => {
         await cooledMulti.stop(true);
       }
       clearCodexUpstreamHealth();
-      const multi = startServer(0);
+      const multi = startServer(0, { inspectNativeCodexOwnership });
       try {
         expect((await request(multi, { authorization: "Bearer local-secret" })).status).toBe(200);
         expect((await compact(multi, { authorization: "Bearer local-secret" })).status).toBe(200);
@@ -1374,7 +1563,7 @@ describe("server local API auth", () => {
           "openai-apikey": { adapter: "openai-responses", baseUrl: "https://api.openai.com/v1", apiKey: "sk-platform" },
         },
       } as OcxConfig);
-      const api = startServer(0);
+      const api = startServer(0, { inspectNativeCodexOwnership });
       try {
         expect((await request(api, { authorization: "Bearer local-secret" }, "openai-apikey/gpt-test")).status).toBe(200);
         expect((await compact(api, { authorization: "Bearer local-secret" }, "openai-apikey/gpt-test")).status).toBe(200);
@@ -1430,7 +1619,7 @@ describe("server local API auth", () => {
       const sendFrame = async (model: string) => {
         const before = seen.length;
         const message = new Promise<string>((resolve, reject) => {
-          const timer = setTimeout(() => reject(new Error(`sequential websocket timeout: ${model}`)), 5_000);
+          const timer = setTimeout(() => reject(new Error(`sequential websocket timeout: ${model}`)), watchdogMs(5_000));
           const onMessage = (event: MessageEvent) => {
             const value = typeof event.data === "string" ? event.data : "";
             if (!value.includes('"type":"response.completed"')) return;
@@ -1700,7 +1889,7 @@ describe("server local API auth", () => {
         },
       } as unknown as string[]);
       const wsFailure = new Promise<string>((resolve, reject) => {
-        const timer = setTimeout(() => reject(new Error("websocket affinity timeout")), 1000);
+        const timer = setTimeout(() => reject(new Error("websocket affinity timeout")), watchdogMs(1000));
         ws.addEventListener("open", () => {
           ws.send(JSON.stringify({ type: "response.create", model: "gpt-test", input: "hello" }));
         }, { once: true });
@@ -1788,7 +1977,7 @@ describe("server local API auth", () => {
         ws.addEventListener("error", () => reject(new Error("websocket failed to open")), { once: true });
       });
       const waitForTerminal = () => new Promise<void>((resolve, reject) => {
-        const timer = setTimeout(() => reject(new Error("websocket terminal timeout")), 1000);
+        const timer = setTimeout(() => reject(new Error("websocket terminal timeout")), watchdogMs(1000));
         const onMessage = (event: MessageEvent) => {
           const text = typeof event.data === "string" ? event.data : "";
           if (text.includes('"type":"response.completed"')) {
@@ -1864,7 +2053,7 @@ describe("server local API auth", () => {
         ws.addEventListener("error", () => reject(new Error("websocket failed to open")), { once: true });
       });
       const waitForTerminal = () => new Promise<void>((resolve, reject) => {
-        const timer = setTimeout(() => reject(new Error("websocket terminal timeout")), 1000);
+        const timer = setTimeout(() => reject(new Error("websocket terminal timeout")), watchdogMs(1000));
         const onMessage = (event: MessageEvent) => {
           const text = typeof event.data === "string" ? event.data : "";
           if (text.includes('"type":"response.completed"')) {
@@ -2993,6 +3182,78 @@ describe("server local API auth", () => {
     } finally {
       await server.stop(true);
       await upstream.stop(true);
+    }
+  });
+
+  test("passthrough SSE cyber terminal is logged as 400 cyber_policy", async () => {
+    if (existsSync(TEST_DIR)) rmSync(TEST_DIR, { recursive: true });
+    mkdirSync(TEST_DIR, { recursive: true });
+    process.env.OPENCODEX_HOME = TEST_DIR;
+    clearRequestLogsForTests();
+
+    const message = "This content was flagged for possible cybersecurity risk. To get authorized for security work, join the Trusted Access for Cyber program.";
+    const upstream = Bun.serve({
+      port: 0,
+      fetch() {
+        return new Response([
+          "event: response.failed",
+          `data: ${JSON.stringify({
+            type: "response.failed",
+            response: {
+              status: "failed",
+              error: { type: "invalid_request_error", code: "cyber_policy", message },
+            },
+          })}`,
+          "",
+          "",
+        ].join("\n"), { headers: { "content-type": "text/event-stream" } });
+      },
+    });
+    redirectCanonicalCodexTo(upstream.url.toString());
+    saveConfig({
+      port: 0,
+      defaultProvider: "openai",
+      openaiProviderTierVersion: 2,
+      providers: poolProviders(),
+      codexAccounts: [
+        { id: "main", email: "main@example.test", isMain: true },
+        { id: "pool-a", email: "pool@example.test", isMain: false, chatgptAccountId: "acct-pool-a" },
+      ],
+      activeCodexAccountId: "pool-a",
+    } as OcxConfig);
+    saveCodexAccountCredential("pool-a", {
+      accessToken: "pool-access-token",
+      refreshToken: "pool-refresh-token",
+      expiresAt: Date.now() + 5 * 60_000,
+      chatgptAccountId: "acct-pool-a",
+    });
+
+    const server = startServer(0);
+    try {
+      const response = await fetch(new URL("/v1/responses", server.url), {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: "Bearer inbound-main-token",
+        },
+        body: JSON.stringify({ model: "gpt-test", input: "hello", stream: true }),
+      });
+
+      expect(response.status).toBe(200);
+      expect(await response.text()).toContain("response.failed");
+      const logs = logsFromApiBody(await fetch(new URL("/api/logs?tail=1", server.url), { headers: managementHeaders() }).then(r => r.json()));
+      expect(logs.at(-1)).toMatchObject({
+        status: 400,
+        errorCode: "cyber_policy",
+        terminalStatus: "failed",
+        closeReason: "terminal",
+        upstreamError: message,
+        attempts: [expect.objectContaining({ status: 400, errorCode: "cyber_policy" })],
+      });
+    } finally {
+      await server.stop(true);
+      await upstream.stop(true);
+      clearRequestLogsForTests();
     }
   });
 

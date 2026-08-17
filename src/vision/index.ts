@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import type { OcxConfig, OcxContentPart, OcxMessage, OcxParsedRequest, OcxProviderConfig, OcxTextContent } from "../types";
 import { modelInList } from "../types";
+import { modelRecordValue } from "../reasoning-effort";
 import type { VisionReasoningEffort } from "../reasoning-effort";
 import { describeImage, type DescribeOutcome, type VisionSettings } from "./describe";
 import { describeImageAnthropic } from "./anthropic-describe";
@@ -11,8 +12,29 @@ import type { ResolvedOpenAiForwardSidecar } from "../providers/openai-sidecar";
 import type { SidecarOutcomeRecorder } from "../web-search/executor";
 import { enforceAppOwnedMemoryBudget } from "../lib/app-owned-memory";
 import type { TranslatorBudget } from "../lib/translator-budget";
+import {
+  DEFAULT_VISION_TIMEOUT_MS,
+  MAX_VISION_TIMEOUT_MS,
+  MIN_VISION_TIMEOUT_MS,
+} from "./timeout-bounds";
 
 export { describeImage } from "./describe";
+
+/**
+ * True when the model is explicitly known to be text-only — either listed in
+ * `noVisionModels` or declared with `modelInputModalities` that exclude "image".
+ * Returns false for unknown models (no evidence either way) so they fall through
+ * to native image passthrough, which is the safe default for an unclassified model.
+ */
+export function isModelTextOnly(
+  provider: OcxProviderConfig,
+  modelId: string,
+): boolean {
+  if (modelInList(provider.noVisionModels, modelId)) return true;
+  const modalities = modelRecordValue(provider.modelInputModalities, modelId);
+  if (Array.isArray(modalities) && modalities.length > 0 && !modalities.includes("image")) return true;
+  return false;
+}
 export { describeImageAnthropic, parseAnthropicVisionSSE } from "./anthropic-describe";
 export {
   BASELINE_VISION_MODELS,
@@ -23,12 +45,16 @@ export {
   visionEligibleModelOptions,
 } from "./eligibility";
 export type { VisionCandidateModel, VisionModelOption, VisionSidecarBackend } from "./eligibility";
+export {
+  DEFAULT_VISION_TIMEOUT_MS,
+  MAX_VISION_TIMEOUT_MS,
+  MIN_VISION_TIMEOUT_MS,
+};
 
 const DEFAULT_VISION_MODEL = "gpt-5.4-mini";
 const DEFAULT_ANTHROPIC_VISION_MODEL = "claude-sonnet-5";
-const DEFAULT_TIMEOUT_MS = 45_000;
 const DEFAULT_REASONING: VisionReasoningEffort = "low";
-const DEFAULT_MAX_DESCRIPTIONS_PER_TURN = 8;
+export const DEFAULT_MAX_DESCRIPTIONS_PER_TURN = 8;
 const DESCRIPTION_CACHE_MAX_ENTRIES = 256;
 export const VISION_DESCRIPTION_CACHE_MAX_BYTES = 1024 * 1024;
 const descriptionEncoder = new TextEncoder();
@@ -154,6 +180,18 @@ export function resolveMaxDescriptionsPerTurn(value: unknown): number {
     : DEFAULT_MAX_DESCRIPTIONS_PER_TURN;
 }
 
+export function isValidVisionTimeoutMs(value: unknown): value is number {
+  return typeof value === "number"
+    && Number.isInteger(value)
+    && value >= MIN_VISION_TIMEOUT_MS
+    && value <= MAX_VISION_TIMEOUT_MS;
+}
+
+/** Runtime config is permissive: malformed or out-of-range values fall back to the default. */
+export function resolveVisionTimeoutMs(value: unknown): number {
+  return isValidVisionTimeoutMs(value) ? value : DEFAULT_VISION_TIMEOUT_MS;
+}
+
 /** Run `worker` over `items` with bounded concurrency, preserving input order in the result array. */
 async function runBounded<T, R>(items: T[], limit: number, worker: (item: T) => Promise<R>): Promise<R[]> {
   const results = new Array<R>(items.length);
@@ -224,10 +262,10 @@ function messagesHaveImage(parsed: OcxParsedRequest): boolean {
 export function shouldResolveOpenAiVisionSidecar(
   config: OcxConfig,
   provider: OcxProviderConfig,
-  modelId: string,
-  parsed: OcxParsedRequest,
+ modelId: string,
+ parsed: OcxParsedRequest,
 ): boolean {
-  if (!modelInList(provider.noVisionModels, modelId) || !messagesHaveImage(parsed)) return false;
+  if (!isModelTextOnly(provider, modelId) || !messagesHaveImage(parsed)) return false;
   const cfg = config.visionSidecar ?? {};
   if (cfg.enabled === false) return false;
   return resolveVisionBackend(cfg.backend, findAnthropicVisionProvider(config)) === "openai";
@@ -254,7 +292,7 @@ export function planVisionSidecar(
   parsed: OcxParsedRequest,
   openAiSidecar?: ResolvedOpenAiForwardSidecar,
 ): VisionPlan | undefined {
-  if (!modelInList(provider.noVisionModels, modelId)) return undefined;
+  if (!isModelTextOnly(provider, modelId)) return undefined;
   if (!messagesHaveImage(parsed)) return undefined;
   const cfg = config.visionSidecar ?? {};
   if (cfg.enabled === false) return undefined;
@@ -271,7 +309,7 @@ export function planVisionSidecar(
       settings: {
         model,
         reasoning: normalizeVisionReasoningForModel(model, cfg.reasoning) ?? DEFAULT_REASONING,
-        timeoutMs: cfg.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+        timeoutMs: resolveVisionTimeoutMs(cfg.timeoutMs),
       },
       maxDescriptionsPerTurn,
     };
@@ -284,7 +322,7 @@ export function planVisionSidecar(
     settings: {
       model,
       reasoning: normalizeVisionReasoningForModel(model, cfg.reasoning) ?? DEFAULT_REASONING,
-      timeoutMs: cfg.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+        timeoutMs: resolveVisionTimeoutMs(cfg.timeoutMs),
     },
     maxDescriptionsPerTurn,
   };

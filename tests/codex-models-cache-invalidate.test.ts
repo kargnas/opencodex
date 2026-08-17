@@ -54,6 +54,35 @@ describe("invalidateCodexModelsCache write gate (#476 / #518)", () => {
     expect(cache.models).toEqual([{ slug: "gpt-5.5" }]);
   });
 
+  test("preserves an observed unknown native as a hidden sync observation", () => {
+    writeFileSync(join(codexHome, "opencodex-catalog.json"), JSON.stringify({
+      models: [{ slug: "gpt-5.5" }],
+    }, null, 2) + "\n");
+    writeFileSync(join(codexHome, "models_cache.json"), JSON.stringify({
+      models: [{
+        // gpt-daybreak-blue-latest is a KNOWN global native now (devlog 260816_.../011),
+        // so it can no longer stand in for an unknown observed id.
+        slug: "gpt-future-unlisted",
+        visibility: "list",
+        supported_in_api: true,
+        shell_type: "shell_command",
+        comp_hash: "native-comp-hash",
+        model_messages: { instructions_template: "You are Codex." },
+        base_instructions: "You are Codex.",
+        supported_reasoning_levels: [{ effort: "medium", description: "Medium" }],
+      }],
+    }, null, 2) + "\n");
+
+    expect(invalidateCodexModelsCache()).toBe(true);
+    const cache = JSON.parse(readFileSync(join(codexHome, "models_cache.json"), "utf8")) as {
+      models: Array<Record<string, unknown>>;
+    };
+    expect(cache.models.find(model => model.slug === "gpt-future-unlisted")).toMatchObject({
+      visibility: "hide",
+      opencodex_account_observed_native: true,
+    });
+  });
+
   test("refuses the cache rewrite when desired state flipped OFF between commit and reacquisition", () => {
     // The commit-path desired-state check runs under the FIRST catalog permit;
     // refreshCodexModelCatalog then releases K before invalidateCodexModelsCache

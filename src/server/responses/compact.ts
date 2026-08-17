@@ -51,6 +51,8 @@ import {
   CodexPoolAuthenticationError,
   CodexThreadAffinityExpiredError,
   headersForCodexAuthContext,
+  materializeCodexUpstreamAuth,
+  CodexMainSubstitutionUnavailableError,
   isCodexAuthContextUsable,
   resolveCodexAuthContext,
   codexProbeLeaseId,
@@ -81,8 +83,9 @@ import {
   type UpstreamHostAdmissionLease,
 } from "../../codex/upstream-host-health";
 import { ForwardAdmissionCredentialError, validateForwardAdmissionCredential } from "../auth-cors";
+import type { DataPlaneAdmission } from "../auth-cors";
 import { listOpenAiForwardSidecarCandidates, resolveFirstUsableOpenAiSidecar, type ResolvedOpenAiForwardSidecar } from "../../providers/openai-sidecar";
-import { isCanonicalOpenAiForwardProvider, supportsNativeResponsesCompactEndpoint } from "../../providers/openai-tiers";
+import { CODEX_FORWARD_BASE_URL, isCanonicalOpenAiForwardProvider, supportsNativeResponsesCompactEndpoint } from "../../providers/openai-tiers";
 import { slugsEquivalent } from "../../providers/slug-codec";
 import { applyOpenAiVirtualModel, resolveOpenAiCompactModel } from "../../providers/openai-virtual-models";
 import { isUsageDebugEnabled } from "../../usage/debug";
@@ -120,6 +123,7 @@ import {
 } from "../relay";
 import { hasResponsesItemIdRepair, relaySseWithResponsesItemIdRepair } from "../responses-item-id-repair";
 import type { EffectiveSubagentRoster, SpawnAgentSurface } from "../../codex/catalog";
+import { codexAuthContextLogLabel } from "../../codex/account-label";
 
 import {
   decodeRequestErrorResponse,
@@ -268,6 +272,7 @@ export async function handleResponsesCompact(
   config: OcxConfig,
   logCtx: RequestLogContext,
   turnAdmissionLease?: AdmissionLease,
+  admission?: DataPlaneAdmission,
 ): Promise<Response> {
   let body: unknown;
   try {
@@ -315,7 +320,10 @@ export async function handleResponsesCompact(
     logCtx.resolvedModel = route.modelId;
   }
 
-  if (route.codexAccountMode === "direct") {
+  // #1686: a bearer-presented admission secret is one of ours, so the stored main credential
+  // is substituted below instead of the caller bearer being forwarded.
+  const substituteMainCredential = admission?.source === "bearer";
+  if (route.codexAccountMode === "direct" && !substituteMainCredential) {
     try { validateForwardAdmissionCredential(req.headers, config); }
     catch (err) {
       if (err instanceof ForwardAdmissionCredentialError) return formatErrorResponse(401, "authentication_error", err.message);
@@ -362,7 +370,8 @@ export async function handleResponsesCompact(
           modelId: selectedModelId,
           beginCodexAccountSelection: codexAccountSelectionForTurn(turnAdmissionLease),
         });
-        const selected = headersForCodexAuthContext(req.headers, authCtx);
+        logCtx.accountLogLabel = codexAuthContextLogLabel(authCtx, config);
+        const selected = materializeCodexUpstreamAuth(req.headers, authCtx, { substituteMainCredential });
         compactProvider = applyCodexAuthContextToProvider(route.provider, authCtx, route.codexAccountMode);
         for (const name of FORWARD_HEADERS) {
           const value = selected.get(name);
@@ -390,7 +399,9 @@ export async function handleResponsesCompact(
       }
       throw err;
     }
-    const base = (compactProvider.baseUrl ?? "").replace(/\/$/, "");
+    const base = isCanonicalOpenAiForwardProvider(compactProvider)
+      ? CODEX_FORWARD_BASE_URL
+      : (compactProvider.baseUrl ?? "").replace(/\/+$/, "");
     if (compactProvider.authMode !== "forward" && compactProvider.apiKey) {
       headers.set("authorization", `Bearer ${resolveEnvValue(compactProvider.apiKey)}`);
     }
@@ -486,7 +497,10 @@ export async function handleResponsesCompact(
         req.signal,
         connectMs,
         false,
-        providerFetch(sendProvider),
+        providerFetch(sendProvider, undefined, {
+          providerName: route.providerName,
+          modelId: route.modelId,
+        }),
         // Every credential-bearing forward send gets manual redirects, not only
         // pool sends: direct mode carries the caller's credential too (#914).
         sendProvider.authMode === "forward",
@@ -590,6 +604,7 @@ export async function handleResponsesCompact(
         });
         await upstream.body?.cancel().catch(() => undefined);
         outcomeCtx = alternate.authCtx;
+        logCtx.accountLogLabel = codexAuthContextLogLabel(alternate.authCtx, config);
         try {
           upstream = await sendCompactAttempt(alternate.provider, alternate.headers, "single");
         } catch (err) {
@@ -663,7 +678,7 @@ export async function handleResponsesCompact(
     headers: internalHeaders,
     body: JSON.stringify(internalBody),
   });
-  const response = await handleResponses(internalReq, config, logCtx, { abortSignal: req.signal, turnAdmissionLease });
+  const response = await handleResponses(internalReq, config, logCtx, { abortSignal: req.signal, turnAdmissionLease, ...(admission ? { admission } : {}) });
   if (!response.ok) return response;
   let json: { output?: unknown[]; status?: unknown; error?: unknown };
   try {

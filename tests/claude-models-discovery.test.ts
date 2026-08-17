@@ -3,10 +3,12 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { saveConfig } from "../src/config";
+import { handleManagementAPI } from "../src/server/management-api";
 import { startServer } from "../src/server";
 import { modelDiscoveryFlavor } from "../src/server/model-discovery";
 import type { OcxConfig } from "../src/types";
 import { installIsolatedCodexHome, type IsolatedCodexHome } from "./helpers/isolated-codex-home";
+import { ManagementRequest } from "./helpers/management-auth";
 
 // Full-suite Windows load: startServer + discovery GETs exceed the default 5s budget
 // (same flake class as 810fa115 / claude-management-api).
@@ -199,6 +201,37 @@ test("model discovery는 서로 다른 Bearer와 X-Api-Key를 catalog 생성 전
   }
 });
 
+test("Codex discovery applies the OpenAI context cap to native rows (#1430)", async () => {
+  const config = configWithStaticModels();
+  config.providers.openai = {
+    adapter: "openai-responses",
+    baseUrl: "https://chatgpt.com/backend-api/codex",
+    liveModels: false,
+  };
+  config.providerContextCaps = { openai: 272_000 };
+  saveConfig(config);
+  const server = startServer(0);
+  try {
+    const response = await fetch(new URL("/v1/models?client_version=1.0.0", server.url));
+    expect(response.status).toBe(200);
+    const json = await response.json() as {
+      models: Array<{
+        slug: string;
+        context_window?: number;
+        max_context_window?: number;
+        auto_compact_token_limit?: number;
+      }>;
+    };
+    expect(json.models.find(model => model.slug === "gpt-5.6-sol")).toMatchObject({
+      context_window: 272_000,
+      max_context_window: 272_000,
+      auto_compact_token_limit: 244_800,
+    });
+  } finally {
+    await server.stop(true);
+  }
+});
+
 test("exact account disables affect only the matching OpenAI and Codex discovery row", async () => {
   const config = configWithStaticModels();
   config.providers.openai = {
@@ -343,6 +376,91 @@ test("Codex discovery restores account rows for supported natives hidden on disk
       .toBe("hide");
     expect(catalog.models.find(model => model.slug === "team/gpt-5.4-mini")?.visibility)
       .toBe("list");
+  } finally {
+    await server.stop(true);
+  }
+});
+
+test("Codex discovery exposes the observed native as a selector row plus one global bare row", async () => {
+  const config = configWithStaticModels();
+  config.providers.openai = {
+    adapter: "openai-responses",
+    baseUrl: "https://chatgpt.com/backend-api/codex",
+    liveModels: false,
+  };
+  config.codexAccountNamespaces = { team: "@main" };
+  saveConfig(config);
+
+  const catalogPath = join(isolatedCodexHome!.path, "observed-native-catalog.json");
+  writeFileSync(
+    join(isolatedCodexHome!.path, "config.toml"),
+    'model_catalog_json = "observed-native-catalog.json"\n',
+    "utf8",
+  );
+  writeFileSync(catalogPath, JSON.stringify({
+    models: [
+      { slug: "gpt-5.5", visibility: "list", supported_in_api: true },
+    ],
+  }), "utf8");
+  writeFileSync(join(isolatedCodexHome!.path, "models_cache.json"), JSON.stringify({
+    models: [{
+      slug: "gpt-daybreak-blue-latest",
+      visibility: "hide",
+      supported_in_api: true,
+      shell_type: "shell_command",
+      comp_hash: "native-comp-hash",
+      model_messages: { instructions_template: "You are Codex." },
+      base_instructions: "You are Codex.",
+      supported_reasoning_levels: [{ effort: "medium", description: "Medium" }],
+      opencodex_account_observed_native: true,
+    }],
+  }), "utf8");
+
+  const { resetCatalogRuntimeStateForTests } = await import("../src/codex/catalog");
+  resetCatalogRuntimeStateForTests();
+  const server = startServer(0);
+  try {
+    const plain = await fetch(new URL("/v1/models", server.url))
+      .then(response => response.json()) as { data: Array<{ id: string }> };
+    expect(plain.data).toContainEqual(expect.objectContaining({ id: "team/gpt-daybreak-blue-latest" }));
+    // Daybreak is globally allowlisted (owner decision, devlog 260816_.../011), so the bare
+    // id is now discoverable too, exactly once.
+    expect(plain.data.filter(model => model.id === "gpt-daybreak-blue-latest")).toHaveLength(1);
+
+    const managementUrl = new URL("http://localhost/api/models");
+    const managementResponse = await handleManagementAPI(
+      new ManagementRequest(managementUrl),
+      managementUrl,
+      config,
+    );
+    const management = await managementResponse!.json() as Array<{ id: string; native?: boolean }>;
+    // Once Daybreak is globally allowlisted the management surface reports it under its
+    // GLOBAL bare identity rather than as an account-qualified discovery row
+    // (model-rows.ts:59 / metadata.ts:243). Exactly one row, and no selector duplicate.
+    expect(management).toContainEqual(expect.objectContaining({
+      id: "gpt-daybreak-blue-latest",
+      native: true,
+    }));
+    expect(management.filter(model => model.id === "gpt-daybreak-blue-latest")).toHaveLength(1);
+    expect(management.some(model => model.id === "team/gpt-daybreak-blue-latest")).toBe(false);
+
+    const catalog = await fetch(new URL("/v1/models?client_version=1.0.0", server.url))
+      .then(response => response.json()) as { models: Array<{ slug: string; visibility?: string }> };
+    expect(catalog.models.find(model => model.slug === "team/gpt-daybreak-blue-latest"))
+      .toMatchObject({ visibility: "list" });
+    expect(catalog.models.find(model => model.slug === "gpt-daybreak-blue-latest")?.visibility).toBe("hide");
+
+    const { claudeCodeNativeAlias } = await import("../src/claude/alias");
+    const anthropic = await fetch(new URL("/v1/models?flavor=anthropic&ids=cli", server.url), {
+      headers: { "anthropic-version": "2023-06-01" },
+    }).then(response => response.json()) as { data: Array<{ id: string }> };
+    // Claude discovery advertises only rows visible in the Codex catalog. The global bare
+    // Daybreak row is synthesized as visibility "hide" (asserted above), and the
+    // account-qualified projection is no longer produced now that the slug is globally
+    // allowlisted, so neither identity reaches the Anthropic surface. Verified empirically:
+    // the filtered id list contained gpt-5.5 only.
+    expect(anthropic.data.some(model => model.id === claudeCodeNativeAlias("gpt-daybreak-blue-latest"))).toBe(false);
+    expect(anthropic.data.some(model => model.id === claudeCodeNativeAlias("team/gpt-daybreak-blue-latest"))).toBe(false);
   } finally {
     await server.stop(true);
   }

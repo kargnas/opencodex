@@ -31,7 +31,7 @@ import { redactSecretString } from "../../lib/redact";
 import upstreamModelsSnapshot from "../data/upstream-models.json";
 
 
-import { NATIVE_OPENAI_CONTEXT_OVERRIDES, SUPPORTED_NATIVE_OPENAI_SLUGS, UPSTREAM_NATIVE_ENTRIES, nativeMultiAgentVersion } from "./metadata";
+import { NATIVE_OPENAI_CONTEXT_OVERRIDES, SUPPORTED_NATIVE_OPENAI_SLUGS, UPSTREAM_NATIVE_ENTRIES, isNativeOpenAiCapabilityAliasModel, nativeMultiAgentVersion, nativeOpenAiContextWindow, nativeOpenAiMaxInputTokens, type NativeContextLimitsInput } from "./metadata";
 import { trustedAccountBoundNativeCatalogSlug } from "./account-models";
 import { CODEX_NATIVE_ALIAS_CATALOG_KIND } from "./kinds";
 
@@ -116,8 +116,15 @@ export interface CatalogModel {
   inputModalities?: string[];
   /** Provider opted into parallel tool calls (OcxProviderConfig.parallelToolCalls). */
   parallelToolCalls?: boolean;
+  /**
+   * This routed row is an explicitly configured account-native alias on the canonical ChatGPT
+   * forward provider. It may inherit pinned native Codex metadata without changing its wire id.
+   */
+  codexForwardNativeCapabilityAlias?: boolean;
   /** Whether Codex may send Responses text.verbosity for this routed model. */
   supportsVerbosity?: boolean;
+  /** Whether this exact routed model has a verified OpenAI-compatible service tier. */
+  supportsServiceTier?: boolean;
   supportsReasoningSummaries?: boolean;
   /** Normalized upstream capability names retained for management/API consumers (#485 follow-up). */
   capabilities?: string[];
@@ -259,18 +266,83 @@ export function isNativeOpenAiEntry(entry: RawEntry): boolean {
   return typeof entry.slug === "string" && !entry.slug.includes("/");
 }
 
-export function applyNativeOpenAiContextOverride(entry: RawEntry): void {
+/**
+ * Auto-compaction threshold for a native row.
+ *
+ * The usual rule is 90% of the window, but a row whose input ceiling sits below that has to
+ * clamp to the ceiling instead — otherwise the client keeps filling until upstream answers
+ * `context_length_exceeded` and compaction never gets a chance to run. Native GPT-5.6 no
+ * longer trips this (922,000 window, 829,800 at 90%), but the routed and API-key rows carry
+ * the same family at a 1,050,000 window where 90% would be 945,000 — past the ceiling.
+ */
+function nativeAutoCompactLimit(contextWindow: number, maxInputTokens: number | undefined, contextCap?: number): number {
+  const ninety = Math.floor(contextWindow * 0.9);
+  if (typeof maxInputTokens !== "number" || maxInputTokens <= 0) return ninety;
+  const cappedMaxInput = applyProviderContextCap(maxInputTokens, contextCap) ?? maxInputTokens;
+  return Math.min(ninety, cappedMaxInput, contextWindow);
+}
+
+/**
+ * Narrow any already-resolved native window by the user levers.
+ *
+ * Used for the fields the accessors do not own (`max_context_window`, and preserved rows
+ * that carry no static override) so every field on a row lands at the same width.
+ */
+function narrowNativeMaxContextWindow(
+  slug: string,
+  value: number | undefined,
+  limits?: NativeContextLimitsInput,
+): number | undefined {
+  if (typeof value !== "number" || value <= 0) return value;
+  const resolved = nativeOpenAiContextWindow(slug, limits);
+  const authoritative = nativeOpenAiContextWindow(slug);
+  // The accessor pair tells us how far the levers moved this slug; apply the same delta to a
+  // field the accessor does not model, without ever raising it.
+  if (resolved === undefined || authoritative === undefined) return value;
+  return Math.min(value, Math.max(resolved, 1));
+}
+
+export function applyNativeOpenAiContextOverride(entry: RawEntry, limits?: NativeContextLimitsInput): void {
   const nativeSlug = trustedAccountBoundNativeCatalogSlug(entry)
     ?? (isNativeOpenAiEntry(entry) ? entry.slug as string : undefined);
   if (!nativeSlug) return;
   const override = NATIVE_OPENAI_CONTEXT_OVERRIDES[nativeSlug];
-  if (!override) return;
-  if (typeof override.contextWindow === "number") {
-    entry.context_window = override.contextWindow;
-    entry.auto_compact_token_limit = Math.floor(override.contextWindow * 0.9);
+  if (override) {
+    // Read the effective values through the accessors rather than re-deriving them from the
+    // static table: this function used to apply only the provider cap, so a per-model window
+    // the dashboard had already accepted was silently written back at full width here.
+    if (typeof override.contextWindow === "number") {
+      const contextWindow = nativeOpenAiContextWindow(nativeSlug, limits) ?? override.contextWindow;
+      entry.context_window = contextWindow;
+      entry.auto_compact_token_limit = nativeAutoCompactLimit(
+        contextWindow,
+        nativeOpenAiMaxInputTokens(nativeSlug, limits) ?? override.maxInputTokens,
+        undefined,
+      );
+    }
+    if (typeof override.maxContextWindow === "number") {
+      const maxContextWindow = narrowNativeMaxContextWindow(nativeSlug, override.maxContextWindow, limits);
+      entry.max_context_window = maxContextWindow;
+    }
   }
-  if (typeof override.maxContextWindow === "number") {
-    entry.max_context_window = override.maxContextWindow;
+  // providerContextCaps.openai is a ceiling for native OpenAI rows regardless of where the
+  // advertised window came from (#1430): preserved rows without a hardcoded override (e.g.
+  // gpt-5.4-mini) must stay under the cap too, and auto-compaction follows the capped window.
+  // The per-model window narrows the same rows for the same reason.
+  const currentContext = typeof entry.context_window === "number" ? entry.context_window : undefined;
+  const cappedContext = narrowNativeMaxContextWindow(nativeSlug, currentContext, limits);
+  if (cappedContext !== currentContext && typeof cappedContext === "number") {
+    entry.context_window = cappedContext;
+    entry.auto_compact_token_limit = nativeAutoCompactLimit(
+      cappedContext,
+      nativeOpenAiMaxInputTokens(nativeSlug, limits) ?? override?.maxInputTokens,
+      undefined,
+    );
+  }
+  const currentMax = typeof entry.max_context_window === "number" ? entry.max_context_window : undefined;
+  const cappedMax = narrowNativeMaxContextWindow(nativeSlug, currentMax, limits);
+  if (cappedMax !== currentMax) {
+    entry.max_context_window = cappedMax;
   }
 }
 
@@ -318,6 +390,44 @@ export function ensureStrictCatalogFields(
 
 export type MultiAgentMode = "v1" | "default" | "v2";
 
+export interface MultiAgentModeOptions {
+  /**
+   * When the catalog is in v2 mode, stamp ChatGPT-native rows as v1 instead.
+   * Routed parents get v2 (plaintext child tasks). Native Sol/Terra stay on v1
+   * so they can still spawn Grok/Claude — ChatGPT encrypts v2 NEW_TASK bodies.
+   */
+  keepNativeChatGptOnV1?: boolean;
+}
+
+/** Catalog rows that run on the ChatGPT backend (encrypt v2 child tasks). */
+export function catalogEntryIsNativeChatGpt(entry: RawEntry): boolean {
+  const slug = typeof entry.slug === "string" ? entry.slug : "";
+  // combo-native-alias-v1 occupies a bare native slug but is routed through
+  // OpenCodex. Keep those on v2 unless the row still carries the ChatGPT-forward
+  // contract (`use_responses_lite`).
+  if (entry.opencodex_catalog_kind === CODEX_NATIVE_ALIAS_CATALOG_KIND) {
+    return entry.use_responses_lite === true;
+  }
+  if (trustedAccountBoundNativeCatalogSlug(entry)) return true;
+  const routedNativeSlug = slug.startsWith(`${OPENAI_CODEX_PROVIDER_ID}/`)
+    ? slug.slice(OPENAI_CODEX_PROVIDER_ID.length + 1)
+    : "";
+  if (
+    entry.opencodex_catalog_kind === CODEX_CUSTOM_MODEL_CATALOG_KIND
+    && entry.use_responses_lite === true
+    && isNativeOpenAiCapabilityAliasModel(routedNativeSlug)
+  ) return true;
+  if (UPSTREAM_NATIVE_ENTRIES.has(slug) || SUPPORTED_NATIVE_OPENAI_SLUGS.has(slug)) return true;
+  return false;
+}
+
+export const ROUTED_CODEX_TOOL_MODE = "code_mode_only";
+
+export function applyRoutedCodexToolMode(entry: RawEntry): RawEntry {
+  entry.tool_mode = ROUTED_CODEX_TOOL_MODE;
+  return entry;
+}
+
 /**
  * @param v2FeatureEnabled When the native multi_agent_v2 feature is on, "default"
  *   mode stamps unpinned entries as "v2" instead of deleting the key. The native
@@ -328,17 +438,42 @@ export type MultiAgentMode = "v1" | "default" | "v2";
  *   260730_codex_rs_upstream_v2_live_handoff/060). Upstream pins are always
  *   preserved: a genuine "v1" pin is a real capability statement and stays excluded.
  *   With the feature off the output is byte-identical to the historical behavior.
+ *
+ * `keepNativeChatGptOnV1` only applies when `mode === "v2"`. It leaves Sol/Terra
+ * (and other ChatGPT-native rows) on v1 so a native parent can still spawn a
+ * routed child. See issue #92.
  */
-export function applyMultiAgentMode(entries: RawEntry[], mode: MultiAgentMode, v2FeatureEnabled = false): RawEntry[] {
+export function applyMultiAgentMode(
+  entries: RawEntry[],
+  mode: MultiAgentMode,
+  v2FeatureEnabled = false,
+  options: MultiAgentModeOptions = {},
+): RawEntry[] {
+  if (mode === "v2" && options.keepNativeChatGptOnV1 === true) {
+    for (const entry of entries) {
+      entry.multi_agent_version = catalogEntryIsNativeChatGpt(entry) ? "v1" : "v2";
+    }
+    return entries;
+  }
   if (mode === "default") {
     // Restore upstream defaults: clear any stale forced multi_agent_version and
     // re-apply upstream pins from the snapshot for native entries that have one.
     for (const entry of entries) {
       const slug = typeof entry.slug === "string" ? entry.slug : "";
       const nativeAlias = entry.opencodex_catalog_kind === CODEX_NATIVE_ALIAS_CATALOG_KIND;
+      const routedNativeSlug = slug.startsWith(`${OPENAI_CODEX_PROVIDER_ID}/`)
+        ? slug.slice(OPENAI_CODEX_PROVIDER_ID.length + 1)
+        : "";
+      const codexForwardCapabilityAlias = entry.opencodex_catalog_kind === CODEX_CUSTOM_MODEL_CATALOG_KIND
+        && entry.use_responses_lite === true
+        && isNativeOpenAiCapabilityAliasModel(routedNativeSlug)
+        ? routedNativeSlug
+        : undefined;
       const upstreamPin = nativeAlias
         ? nativeMultiAgentVersion(slug)
-        : UPSTREAM_NATIVE_ENTRIES.get(trustedAccountBoundNativeCatalogSlug(entry) ?? slug)?.multi_agent_version;
+        : codexForwardCapabilityAlias
+          ? nativeMultiAgentVersion(codexForwardCapabilityAlias)
+          : UPSTREAM_NATIVE_ENTRIES.get(trustedAccountBoundNativeCatalogSlug(entry) ?? slug)?.multi_agent_version;
       if (typeof upstreamPin === "string") {
         entry.multi_agent_version = upstreamPin;
       } else if (v2FeatureEnabled) {
@@ -358,6 +493,7 @@ export function applyMultiAgentMode(entries: RawEntry[], mode: MultiAgentMode, v
 export function normalizeRoutedCatalogEntry(entry: RawEntry, parallelToolCalls = false): RawEntry {
   delete entry.model_messages;
   delete entry.tool_mode;
+  applyRoutedCodexToolMode(entry);
   delete entry.multi_agent_version;
   delete entry.use_responses_lite;
   delete entry.supports_websockets;
@@ -366,20 +502,24 @@ export function normalizeRoutedCatalogEntry(entry: RawEntry, parallelToolCalls =
   delete entry.service_tiers;
   delete entry.default_service_tier;
   // Routed rows cloned from native templates must not inherit OpenAI-only summary delivery.
-  // Per-model routed opt-ins can be added once provider metadata exposes this capability.
+  // Explicit provider/model metadata is re-applied after this normalization step.
   delete entry.supports_reasoning_summaries;
   const isCursorEntry = typeof entry.slug === "string" && entry.slug.startsWith("cursor/");
-  // Routed providers use opencodex sidecars and client-executed tool discovery. The sidecar
-  // runs through native gpt-5.4-mini, so image search is available and verbalized for text-only
-  // models. EXCEPT cursor: its runTurn transport bypasses the web-search plan entirely and
-  // rejects server search queries — advertising the tool would make models call into a void.
+  // `supports_search_tool` selects Codex's deferred tool-discovery surface; it is not the hosted
+  // web-search capability. Routed rows also carry tool_mode=code_mode_only (below), and under code
+  // mode DEFERRED MCP tools remain callable through exec's `tools` global / ALL_TOOLS without any
+  // tool_search round-trip (upstream codex-rs code_mode suite; live canary 2026-08-13: routed
+  // kimi/k3 called tools.mcp__node_repl__js → isError:false). Stamping false here instead forces
+  // every MCP declaration into exec.description — a measured 2.7x turn-1 payload regression
+  // (96,699 → 258,929 chars; devlog/_plan/260813_tool_catalog_deferral/010). So every routed
+  // code-mode row advertises deferred discovery. Cursor still omits hosted web-search metadata below,
+  // but disabling this separate exposure bit can inflate `exec` past Cursor's 120 KB wire cap (#1830).
   if (isCursorEntry) {
     delete entry.web_search_tool_type;
-    entry.supports_search_tool = false;
   } else {
     entry.web_search_tool_type = "text_and_image";
-    entry.supports_search_tool = true;
   }
+  entry.supports_search_tool = true;
   // Cursor's transport already serializes overlapping tool calls into atomic Responses tool events.
   // Advertising parallel calls lets Codex send the same native capability bit it sends for OpenAI.
   // Opt-in providers (OcxProviderConfig.parallelToolCalls, e.g. xAI) advertise it too: the
@@ -409,11 +549,25 @@ export function catalogModelSupportsReasoningSummaries(modelId: string): boolean
   return values.size === 1 ? values.values().next().value : undefined;
 }
 
-export function applyCatalogMetadata(entry: RawEntry, provider: string, modelId: string, contextCap?: number): void {
+/**
+ * Resolve the generated jawcode metadata row for a provider/model pair.
+ *
+ * Exported because it is the SECOND source of real capability assertions:
+ * `applyCatalogMetadata` writes context/modalities from it without ever
+ * touching a `CatalogModel`, so the routing-evidence provenance stamp in
+ * `applyCatalogModelMetadata` has to consult the same table. Both callers share
+ * this one lookup rather than duplicating the resolve/case-fold rules, which is
+ * what keeps the serialized entry and its provenance from drifting apart.
+ */
+export function generatedModelMetadata(provider: string, modelId: string) {
   const jawcodeProvider = resolveMetadataProvider(provider);
-  if (!jawcodeProvider) return;
-  const meta = getModelMetadata(jawcodeProvider, modelId)
+  if (!jawcodeProvider) return undefined;
+  return getModelMetadata(jawcodeProvider, modelId)
     ?? (shouldCaseFoldMetadataModelId(provider) ? getModelMetadataCaseInsensitive(jawcodeProvider, modelId) : undefined);
+}
+
+export function applyCatalogMetadata(entry: RawEntry, provider: string, modelId: string, contextCap?: number): void {
+  const meta = generatedModelMetadata(provider, modelId);
   if (!meta) return;
   if (typeof meta.contextWindow === "number" && meta.contextWindow > 0) {
     const contextWindow = applyProviderContextCap(meta.contextWindow, contextCap) ?? meta.contextWindow;

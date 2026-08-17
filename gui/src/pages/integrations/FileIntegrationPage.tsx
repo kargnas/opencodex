@@ -24,6 +24,8 @@ const SEMANTICS_KEY: Record<FileIntegrationClientId, TKey> = {
   openclaw: "integrations.semantics.openclaw",
   kimi: "integrations.semantics.kimi",
   gajae: "integrations.semantics.gajae",
+  dsh: "integrations.semantics.dsh",
+  mcode: "integrations.semantics.mcode",
 };
 
 const TAB_LABEL_KEY: Record<FileIntegrationClientId, TKey> = {
@@ -34,6 +36,8 @@ const TAB_LABEL_KEY: Record<FileIntegrationClientId, TKey> = {
   openclaw: "integrations.tab.openclaw",
   kimi: "integrations.tab.kimi",
   gajae: "integrations.tab.gajae",
+  dsh: "integrations.tab.dsh",
+  mcode: "integrations.tab.mcode",
 };
 
 const KIND_KEY: Record<IntegrationJournalRow["kind"], TKey> = {
@@ -70,13 +74,21 @@ export default function FileIntegrationPage({
     `integration-state:${apiBase}:${client}`,
     [apiBase, client],
     fetchState,
-    { isEmpty: () => false, enabled: active },
+    {
+      isEmpty: () => false,
+      enabled: active,
+      sessionCacheKey: `ocx.integrations.state.v1:${apiBase}:${client}`,
+    },
   );
   const historyResource = useDataSurface<IntegrationJournalRow[]>(
     `integration-journal:${apiBase}:${client}`,
     [apiBase, client],
     fetchHistory,
-    { isEmpty: rows => rows.length === 0, enabled: active },
+    {
+      isEmpty: rows => rows.length === 0,
+      enabled: active,
+      sessionCacheKey: `ocx.integrations.client-journal.v1:${apiBase}:${client}`,
+    },
   );
 
   const status = stateResource.state.data ?? null;

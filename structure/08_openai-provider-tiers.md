@@ -68,7 +68,10 @@ view exactly when it is doing the most work — suppressing every higher tier.
 
 ```text
 gpt-5.6-sol                         # openai; Pool or Direct follows the provider option
+main/gpt-daybreak-blue-latest       # openai; observed account-native Daybreak, Sol capability metadata
+openai/gpt-daybreak-blue-latest     # Codex forward; explicit Daybreak row with Sol native metadata
 openai-apikey/gpt-5.6-sol           # OpenAI API key
+openai-apikey/daybreak-blue-latest  # API Daybreak alias; separate approval/provisioning
 openai-apikey/gpt-5.6-sol-pro       # API Pro virtual model
 ```
 
@@ -96,10 +99,11 @@ shipped v1 shape; the next startup re-migrates to the same marker-2 bytes.
 
 A pre-existing snapshot that differs from the current config is classified before anything is written
 (`src/config.ts` `classifyOpenAiTierBackup`): a snapshot that parses as a valid pre-migration (v1)
-config is a user-intentional rollback point and blocks migration; a snapshot that is unparseable or
-already tier-v2 is stale and is replaced with a warning. The distinction matters because silently
-discarding a rollback point is destructive, while preserving a stale one would block every later
-migration.
+config is a user-intentional rollback point and is copied to a unique
+`config.json.pre-openai-tiers-v1-rollback.<timestamp>.bak` path before startup retries the v2
+migration backup; a snapshot that is unparseable or already tier-v2 is stale and is replaced with a
+warning. The distinction matters because silently discarding a rollback point is destructive, while
+preserving a stale one would block every later migration.
 
 ## Model and wire identity
 
@@ -107,8 +111,27 @@ migration.
   change catalog, selected, requested, or wire model identity.
 - `openai-apikey` exposes namespaced API rows. Its trusted catalog contains `gpt-5.5`, `gpt-5.6`,
   Sol/Terra/Luna, and the three corresponding Pro variants. No generic `gpt-5.6-pro` alias exists.
-- API GPT-5.6 rows use 1,050,000 context tokens and 922,000 max input tokens. Codex-login rows keep
-  the native 372,000-token contract.
+- The selector-qualified account-native `*/gpt-daybreak-blue-latest` and API-key
+  `daybreak-blue-latest` are distinct wire surfaces. An observed native row follows the pinned Sol
+  capability metadata, but routing strips only the account selector and keeps
+  `gpt-daybreak-blue-latest` byte-for-byte; it never expands the bare list or substitutes Sol.
+- The two GPT-5.6 surfaces advertise different windows on purpose. API rows use 1,050,000
+  context with 922,000 max input. Codex-login rows use 922,000 context with 829,800
+  auto-compaction.
+
+  The ceiling is the same on both — probing a real Codex-login account accepted 921,508 input
+  tokens and refused 922,013 with `context_length_exceeded` on Sol, Terra and Luna alike,
+  matching the 922,000 the API surface already declared. What differs is that a Codex-login
+  `context_window` is a spending budget, not a label: Codex fills
+  `context_window * effective_context_window_percent` (95% by default, codex-rs
+  `turn_context.rs`). Advertising 1,050,000 there spent 997,500 and blew past the ceiling.
+
+  922,000 is therefore an OPERATING CAP, the same shape upstream uses — the live catalog
+  reports 272,000 against a 872,000 `max_context_window`. It yields a 875,900-token budget
+  and keeps ~46k of headroom. Do not back-solve it from the ceiling: 970,000 would land the
+  budget at 921,500, inside the 1,840-token gap between the last success and the first
+  refusal. Evidence: `devlog/_plan/260817_native_gpt56_1m_context/001_measurement_evidence.md`
+  and `014_final_922k_with_margin.md`.
 - `*-pro` selected ids rewrite to the base wire id with `reasoning.mode: "pro"`; request logs,
   usage, model visibility, subagent state, and injection state retain the selected virtual id.
 - Compact preserves provider/selected identity but sends the base model without a reasoning object.

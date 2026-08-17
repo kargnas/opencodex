@@ -1,6 +1,6 @@
 import type { AdapterFetchContext, AdapterRequest, ProviderAdapter } from "./base";
 import { debugDroppedFrame } from "../lib/debug";
-import { createHash } from "node:crypto";
+import { createToolCallIdAllocator } from "./tool-call-id";
 import { createImageBudget, materializeInlineImage, MAX_ENCODED_BYTES_PER_IMAGE, artifactHttpUrl } from "../images/artifacts";
 import type {
   AdapterEvent,
@@ -8,8 +8,10 @@ import type {
   OcxContentPart,
   OcxParsedRequest,
   OcxProviderConfig,
+  OcxProviderOpaqueToolCallMetadata,
   OcxTextContent,
   OcxToolCall,
+  OcxToolResultMessage,
   OcxUsage,
 } from "../types";
 import { isAllowedToolChoice, namespacedToolName, resolveToolChoiceWireName, toolAllowedByChoice } from "../types";
@@ -45,6 +47,25 @@ const GOOGLE_BREVITY_INSTRUCTION = [
   "- This applies only to intermediate progress text. Your final answer after the work is done is exempt: write it in full and at whatever length the task requires.",
 ].join("\n");
 
+/**
+ * Google renamed the current Gemini Flash generations on the Generative Language API,
+ * appending a `-tiered` suffix (`gemini-3.7-flash` -> `gemini-3.7-flash-tiered`). The
+ * old `gemini-3.7-flash` path 404s, so a saved config or registry entry naming the base
+ * id must be resolved here before it reaches the URL. The user-facing id is deliberately
+ * left alone: the picker, the catalog, the usage log and the price overlays all stay
+ * keyed on the base id, and only the wire path learns the new spelling.
+ */
+const GEMINI_DIRECT_WIRE_RENAMES: Record<string, string> = {
+  "gemini-3.7-flash": "gemini-3.7-flash-tiered",
+  "gemini-3.6-flash": "gemini-3.6-flash-tiered",
+};
+
+function resolveDirectGeminiWireModelId(modelId: string): string {
+  return Object.hasOwn(GEMINI_DIRECT_WIRE_RENAMES, modelId)
+    ? GEMINI_DIRECT_WIRE_RENAMES[modelId]!
+    : modelId;
+}
+
 /** Vertex API key: provider.apiKey if it looks real (not a sentinel), else GOOGLE_CLOUD_API_KEY env. */
 function resolveVertexApiKey(optKey?: string): string | undefined {
   const realKey = optKey && !optKey.startsWith("<") && optKey !== "N/A" ? optKey : undefined;
@@ -75,15 +96,9 @@ function vertexReplaySessionId(parsed: OcxParsedRequest): string {
  * the call/response pairing is preserved. Returns `undefined` for an empty id so the caller omits the
  * field entirely rather than inventing a non-matching one.
  */
-function geminiToolCallId(rawId: string | undefined): string | undefined {
-  const raw = rawId ?? "";
-  if (raw.length === 0) return undefined;
-  const cleaned = raw.replace(/[^a-zA-Z0-9_-]/g, "_");
-  if (cleaned === raw) return cleaned;
-  // Lossy rewrite happened: disambiguate with a deterministic suffix derived from the raw id.
-  const suffix = createHash("sha256").update(raw).digest("hex").slice(0, 8);
-  return `${cleaned}_${suffix}`;
-}
+// Aliasing the stateless transform here would reintroduce the collision it cannot prevent:
+// a rewritten id can equal a distinct raw id that already conforms. Use a request-scoped
+// allocator, exactly as the Anthropic adapter does, so call/response pairing stays injective.
 
 /**
  * Inline image parts (Gemini `inline_data`) extracted from tool-result content. Only base64 data URLs
@@ -146,6 +161,16 @@ function messagesToGeminiFormat(
 
   const contents: unknown[] = [];
 
+  const callIds = createToolCallIdAllocator();
+  for (const msg of parsed.context.messages) {
+    if (msg.role === "assistant") {
+      for (const part of (msg as OcxAssistantMessage).content) {
+        if (part.type === "toolCall") callIds.reserve((part as OcxToolCall).id);
+      }
+    } else if (msg.role === "toolResult") {
+      callIds.reserve((msg as OcxToolResultMessage).toolCallId);
+    }
+  }
   for (const msg of parsed.context.messages) {
     switch (msg.role) {
       case "user":
@@ -184,13 +209,16 @@ function messagesToGeminiFormat(
             // streaming covered by the replay cache. Only forward a REAL upstream signature — the
             // Responses parser also stashes synthetic item ids (`fc_...`) on this field, and sending
             // those as a thoughtSignature breaks continuity (the replay cache supplies the real one).
-            const callId = geminiToolCallId(tc.id);
+            const callId = callIds.allocate(tc.id);
             const functionCall: Record<string, unknown> = { name: namespacedToolName(tc.namespace, tc.name), args: tc.arguments };
             // Claude-on-Antigravity maps this id to Anthropic `tool_use.id`; without it the upstream
             // conversion 400s. Gemini accepts the optional id and pairs call/response by it.
             if (callId !== undefined) functionCall.id = callId;
             const part: Record<string, unknown> = { functionCall };
-            if (isLikelyRealThoughtSignature(tc.thoughtSignature)) part.thoughtSignature = tc.thoughtSignature;
+            // Prefer the metadata that travelled with this exact call; fall back to the legacy
+            // field for callers that have not been migrated. Never merge or synthesize.
+            const signature = tc.providerMetadata?.google?.thoughtSignature ?? tc.thoughtSignature;
+            if (isLikelyRealThoughtSignature(signature)) part.thoughtSignature = signature;
             parts.push(part);
           }
         }
@@ -206,7 +234,8 @@ function messagesToGeminiFormat(
         // functionResponse, but it does accept sibling inline_data parts in the same user turn, so
         // tool-result screenshots (e.g. Computer Use) ride along as inline_data instead of being
         // flattened to a "[image]" marker the model can't actually see.
-        const responseId = geminiToolCallId(msg.toolCallId);
+        // lookup(), not allocate(): a response must reuse its call's id and must never mint a new one.
+        const responseId = callIds.lookup(msg.toolCallId);
         const functionResponse: Record<string, unknown> = { name: namespacedToolName(msg.toolNamespace, msg.toolName), response: { result: geminiToolResultText(msg.content) } };
         // Mirror the matching functionCall id so Claude-on-Antigravity can pair this result with its
         // `tool_use` block (-> Anthropic `tool_result.tool_use_id`).
@@ -304,6 +333,38 @@ function artifactMarkdownUrl(filePath: string): string {
   return artifactHttpUrl(filePath).replace(/([()])/g, "\\$1");
 }
 
+interface GoogleResponsePart {
+  text?: string;
+  thought?: boolean;
+  thoughtSignature?: string;
+  functionCall?: { name: string; args: unknown };
+}
+
+/**
+ * Carry a Gemini thought signature with the exact function-call part that produced it. Google
+ * validates the signature against that specific part, so it must ride the individual tool call
+ * rather than be re-matched by name/arguments later (issue #1735).
+ */
+function googleToolCallMetadataFromPart(
+  part: GoogleResponsePart,
+): { providerMetadata: OcxProviderOpaqueToolCallMetadata } | undefined {
+  const signature = part.thoughtSignature;
+  if (!isLikelyRealThoughtSignature(signature)) return undefined;
+  return { providerMetadata: { google: { thoughtSignature: signature } } };
+}
+
+/**
+ * Google marks model-internal reasoning as a normal text-bearing part plus `thought: true`.
+ * Keep that provider visibility bit authoritative here so the streaming and buffered parsers
+ * cannot accidentally expose the same hidden reasoning through different event types.
+ */
+function googlePartTextEvent(part: GoogleResponsePart): AdapterEvent | undefined {
+  if (!part.text) return undefined;
+  return part.thought === true
+    ? { type: "reasoning_raw_delta", text: part.text }
+    : { type: "text_delta", text: part.text };
+}
+
 export function createGoogleAdapter(provider: OcxProviderConfig): ProviderAdapter {
   // Per-request closure: resolveAdapter builds a fresh adapter per request (server.ts), so buildRequest
   // can stash the CCA model/session for parseStream's reasoning-replay observation.
@@ -335,7 +396,7 @@ export function createGoogleAdapter(provider: OcxProviderConfig): ProviderAdapte
             parsed.modelId,
             mapReasoningEffort(provider, parsed.modelId, parsed.options.reasoning),
           ).wireModelId
-        : parsed.modelId;
+        : resolveDirectGeminiWireModelId(parsed.modelId);
       const { systemInstruction, contents } = messagesToGeminiFormat(parsed, routedModelId);
       const tools = toolsToGeminiFormat(parsed);
 
@@ -432,7 +493,7 @@ export function createGoogleAdapter(provider: OcxProviderConfig): ProviderAdapte
         const envelope = {
           model: wireModelId,
           // The envelope's `userAgent` field is a protocol constant ("antigravity"), distinct from
-          // the HTTP `User-Agent` header (the real CLI UA). CLIProxyAPI `geminiToAntigravity` hardcodes
+          // the HTTP `User-Agent` header (the real IDE UA). CLIProxyAPI `geminiToAntigravity` hardcodes
           // the body field; only the header carries the versioned client string.
           userAgent: "antigravity",
           requestType: "agent",
@@ -483,7 +544,7 @@ export function createGoogleAdapter(provider: OcxProviderConfig): ProviderAdapte
       }
 
       // ai-studio (default): Generative Language API + x-goog-api-key.
-      const url = `${provider.baseUrl}/v1beta/models/${parsed.modelId}:${method}${streamParam}`;
+      const url = `${provider.baseUrl}/v1beta/models/${routedModelId}:${method}${streamParam}`;
       const apiKey = provider.apiKey?.trim();
       if (!apiKey) throw new Error("google (AI Studio) requires a non-empty API key");
       headers["x-goog-api-key"] = apiKey;
@@ -602,7 +663,7 @@ export function createGoogleAdapter(provider: OcxProviderConfig): ProviderAdapte
           sawTerminalSignal = true;
         }
 
-        const parts = candidate.content?.parts as { text?: string; functionCall?: { name: string; args: unknown } }[] | undefined;
+        const parts = candidate.content?.parts as GoogleResponsePart[] | undefined;
         // Record Gemini thought signatures for the next stateless tool-result turn. Vertex and
         // Antigravity use separate model namespaces so opaque provider state cannot cross routes.
         const replayModel = provider.googleMode === "cloud-code-assist" ? antigravityModel : vertexReplayModel;
@@ -613,9 +674,10 @@ export function createGoogleAdapter(provider: OcxProviderConfig): ProviderAdapte
         }
         if (parts) {
           for (const part of parts) {
-            if (part.text) {
+            const textEvent = googlePartTextEvent(part);
+            if (textEvent) {
               emittedContentEvent = true;
-              yield { type: "text_delta", text: part.text };
+              yield textEvent;
             }
             const inline = (part as { inlineData?: { mimeType?: string; data?: string } }).inlineData;
             if (inline && typeof inline.data === "string") {
@@ -636,7 +698,12 @@ export function createGoogleAdapter(provider: OcxProviderConfig): ProviderAdapte
               const id = `call_${crypto.randomUUID().slice(0, 8)}`;
               toolCallsStarted++;
               emittedContentEvent = true;
-              yield { type: "tool_call_start", id, name: restoreGoogleToolName(part.functionCall.name) };
+              yield {
+                type: "tool_call_start",
+                id,
+                name: restoreGoogleToolName(part.functionCall.name),
+                ...googleToolCallMetadataFromPart(part),
+              };
               yield { type: "tool_call_delta", arguments: JSON.stringify(part.functionCall.args ?? {}) };
               yield { type: "tool_call_end" };
             }
@@ -817,7 +884,7 @@ export function createGoogleAdapter(provider: OcxProviderConfig): ProviderAdapte
       }
       const events: AdapterEvent[] = [];
 
-      const candidates = json.candidates as { content?: { parts?: { text?: string; functionCall?: { name: string; args: unknown } }[] }; finishReason?: string }[] | undefined;
+      const candidates = json.candidates as { content?: { parts?: GoogleResponsePart[] }; finishReason?: string }[] | undefined;
       if (!candidates?.length) {
         return finish([{ type: "error", message: "google response contained no candidates" }]);
       }
@@ -833,7 +900,8 @@ export function createGoogleAdapter(provider: OcxProviderConfig): ProviderAdapte
           observeAntigravityReplay(replayModel, replaySession, candidates[0].content.parts as unknown[]);
         }
         for (const part of candidates[0].content.parts) {
-          if (part.text) events.push({ type: "text_delta", text: part.text });
+          const textEvent = googlePartTextEvent(part);
+          if (textEvent) events.push(textEvent);
           const inline = (part as { inlineData?: { mimeType?: string; data?: string } }).inlineData;
           if (inline && typeof inline.data === "string") {
             if (inline.data.length > MAX_ENCODED_BYTES_PER_IMAGE) {
@@ -851,7 +919,12 @@ export function createGoogleAdapter(provider: OcxProviderConfig): ProviderAdapte
           if (part.functionCall) {
             const id = `call_${crypto.randomUUID().slice(0, 8)}`;
             toolCallsStarted++;
-            events.push({ type: "tool_call_start", id, name: restoreGoogleToolName(part.functionCall.name) });
+            events.push({
+              type: "tool_call_start",
+              id,
+              name: restoreGoogleToolName(part.functionCall.name),
+              ...googleToolCallMetadataFromPart(part),
+            });
             events.push({ type: "tool_call_delta", arguments: JSON.stringify(part.functionCall.args ?? {}) });
             events.push({ type: "tool_call_end" });
           }

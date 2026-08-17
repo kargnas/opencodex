@@ -2,7 +2,7 @@ import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { applyNativeVisibility, augmentRoutedModelsWithMetadata, augmentRoutedModelsWithRegistryOpenAiApiRows, buildCatalogEntries, buildComboCatalogOmission, catalogModelSlug, clampCatalogModelsToCodexSupport, clampEntryToCodexSupportedEfforts, clampedDefaultEffort, CODEX_ACCOUNT_BOUND_CATALOG_KIND, CODEX_NATIVE_ALIAS_CATALOG_KIND, comboCatalogOmissionReason, deriveComboCatalogModel, exactComboCatalogSlugs, filterCatalogVisibleModels, filterSupportedNativeSlugs, gatherRoutedModels as gatherRoutedModelsDirect, isDatedVariantId, isMediaGenerationModelId, loadBundledCodexCatalog, materializeBundledCodexCatalog, mergeCatalogEntriesForSync, NATIVE_OPENAI_MODELS, normalizeRoutedCatalogEntry, resetCatalogRuntimeStateForTests, resetOpenAiApiCatalogWarningStateForTests, resolveComboCatalogMember, shouldExposeRoutedModel } from "../src/codex/catalog";
+import { applyNativeVisibility, augmentRoutedModelsWithMetadata, augmentRoutedModelsWithRegistryOpenAiApiRows, buildCatalogEntries, buildComboCatalogOmission, catalogModelSlug, clampCatalogModelsToCodexSupport, clampEntryToCodexSupportedEfforts, clampedDefaultEffort, CODEX_ACCOUNT_BOUND_CATALOG_KIND, CODEX_NATIVE_ALIAS_CATALOG_KIND, comboCatalogOmissionReason, deriveComboCatalogModel, exactComboCatalogSlugs, filterCatalogVisibleModels, filterSupportedNativeSlugs, gatherRoutedModels as gatherRoutedModelsDirect, isDatedVariantId, isMediaGenerationModelId, loadBundledCodexCatalog, materializeBundledCodexCatalog, mergeCatalogEntriesForSync, NATIVE_DAYBREAK_BLUE_MODEL, NATIVE_OPENAI_MODELS, nativeDefaultReasoningEffort, nativeInputModalities, nativeOpenAiCapabilitySourceSlug, nativeOpenAiContextWindow, nativeReasoningEfforts, normalizeRoutedCatalogEntry, resetCatalogRuntimeStateForTests, resetOpenAiApiCatalogWarningStateForTests, resolveComboCatalogMember, shouldExposeRoutedModel, upstreamNativeEntry } from "../src/codex/catalog";
 import {
   CODEX_CUSTOM_MODEL_CATALOG_KIND,
   CODEX_PROVIDER_MODEL_CATALOG_KIND,
@@ -66,6 +66,7 @@ function normalizedCombo(
     strategy: "failover",
     stickyLimit: 1,
     defaultEffort: "medium",
+    imageInput: "auto",
     alias: null,
     nativeAlias: false,
     displayName: null,
@@ -154,6 +155,18 @@ describe("live model provenance (#448 custom-model misclassification)", () => {
 });
 
 describe("combo catalog capability intersection", () => {
+
+  test("imageInput disabled strips image even when every member supports it", () => {
+    const visionMembers = [
+      { provider: "a", id: "m1", contextWindow: 128_000, maxInputTokens: 100_000, inputModalities: ["text", "image"], reasoningEfforts: ["low"] },
+      { provider: "b", id: "m2", contextWindow: 128_000, maxInputTokens: 100_000, inputModalities: ["text", "image"], reasoningEfforts: ["low"] },
+    ];
+    expect(deriveComboCatalogModel("text-only", normalizedCombo({ imageInput: "disabled" }), visionMembers))
+      .toEqual(expect.objectContaining({ inputModalities: ["text"] }));
+    expect(deriveComboCatalogModel("vision", normalizedCombo({ imageInput: "auto" }), visionMembers))
+      .toEqual(expect.objectContaining({ inputModalities: expect.arrayContaining(["text", "image"]) }));
+  });
+
   const memberA = {
     provider: "a",
     id: "m1",
@@ -323,7 +336,7 @@ describe("combo catalog capability intersection", () => {
       expect(row.owned_by).toBe("combo");
       expect(row.base_instructions).toContain("mixed");
       expect(row).not.toHaveProperty("model_messages");
-      expect(row).not.toHaveProperty("tool_mode");
+      expect(row.tool_mode).toBe("code_mode_only");
       expect(row.web_search_tool_type).toBe("text_and_image");
       expect(row.supports_search_tool).toBe(true);
     }
@@ -1081,8 +1094,8 @@ describe("combo catalog capability intersection", () => {
     expect(rows.find(row => row.provider === "combo" && row.id === "nova-sol")).toMatchObject({
       alias: "gpt-5.6-sol",
       nativeAlias: true,
-      contextWindow: 372_000,
-      maxInputTokens: 372_000,
+      contextWindow: 922_000,
+      maxInputTokens: 922_000,
       inputModalities: ["text", "image"],
       reasoningEfforts: ["low", "medium", "high", "xhigh", "max", "ultra"],
       defaultReasoningEffort: "low",
@@ -1704,8 +1717,10 @@ describe("Google Gemini catalog metadata", () => {
     const entry = buildCatalogEntries(nativeTemplate(), [], models)
       .find(row => row.slug === "google/gemini-3.6-flash");
 
+    // The registry ladder declares minimal for Gemini 3.6 Flash; it now flows through
+    // (previously sanitize silently dropped it) plus the mock top rungs for subagent spawns.
     expect((entry?.supported_reasoning_levels as Array<{ effort: string }>).map(level => level.effort))
-      .toEqual(["low", "medium", "high", "max", "ultra"]);
+      .toEqual(["minimal", "low", "medium", "high", "max", "ultra"]);
     expect(entry?.input_modalities).toEqual(["text", "image"]);
     expect(entry?.context_window).toBe(1_048_576);
   });
@@ -1872,6 +1887,243 @@ describe("configured CatalogModel displayName -> catalog display_name", () => {
       expect(row?.display_name).toBe("Renamed Model");
       expect(row?.slug).toBe("custom-provider/renamed-model");
       expect(row?.opencodex_catalog_kind).toBe(CODEX_CUSTOM_MODEL_CATALOG_KIND);
+    } finally {
+      globalThis.fetch = originalFetch;
+      clearModelCache("custom-provider");
+    }
+  });
+
+  test("a customModel reasoning ladder overrides the inherited provider ladder end-to-end", async () => {
+    clearModelCache("custom-provider");
+    const originalFetch = globalThis.fetch;
+    let fetchCalls = 0;
+    globalThis.fetch = (() => {
+      fetchCalls += 1;
+      throw new Error("fetch should not be called");
+    }) as typeof fetch;
+    try {
+      const models = await gatherRoutedModels({
+        port: 10100,
+        defaultProvider: "custom-provider",
+        providers: {
+          "custom-provider": {
+            baseUrl: "https://example.invalid/v1",
+            adapter: "openai-chat",
+            authMode: "key",
+            liveModels: false,
+            models: ["baseline-model", "renamed-model"],
+            // The provider row for the same slug advertises low/high; the custom row must win.
+            modelReasoningEfforts: { "baseline-model": ["low", "high"], "renamed-model": ["low", "high"] },
+          },
+        },
+        customModels: [
+          {
+            id: "cm-1",
+            provider: "custom-provider",
+            modelId: "renamed-model",
+            displayName: "Renamed Model",
+            reasoningEfforts: ["medium", "max"],
+            defaultReasoningEffort: "max",
+            addedAt: "2026-01-01T00:00:00.000Z",
+          },
+        ],
+      });
+
+      expect(fetchCalls).toBe(0);
+      const custom = models.find(m => m.provider === "custom-provider" && m.id === "renamed-model");
+      // The explicit ladder rides on the row itself, not on the replaced provider row.
+      expect(custom?.reasoningEfforts).toEqual(["medium", "max"]);
+      expect(custom?.defaultReasoningEffort).toBe("max");
+
+      const entries = buildCatalogEntries(nativeTemplate(), [], models);
+      const row = entries.find(e => e.slug === "custom-provider/renamed-model");
+      const levels = (row?.supported_reasoning_levels ?? []).map((l: { effort: string }) => l.effort);
+      // The sync appends the mock top rungs (max/ultra) for subagent spawn compatibility;
+      // the declared medium/max survive verbatim, the inherited low/high does not.
+      expect(levels).toEqual(["medium", "max", "ultra"]);
+      expect(row?.default_reasoning_level).toBe("max");
+    } finally {
+      globalThis.fetch = originalFetch;
+      clearModelCache("custom-provider");
+    }
+  });
+
+  test("an explicit empty customModel ladder hides the effort control despite an inherited one", async () => {
+    clearModelCache("custom-provider");
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (() => {
+      throw new Error("fetch should not be called");
+    }) as typeof fetch;
+    try {
+      const models = await gatherRoutedModels({
+        port: 10100,
+        defaultProvider: "custom-provider",
+        providers: {
+          "custom-provider": {
+            baseUrl: "https://example.invalid/v1",
+            adapter: "openai-chat",
+            authMode: "key",
+            liveModels: false,
+            models: ["renamed-model"],
+            modelReasoningEfforts: { "renamed-model": ["low", "high"] },
+          },
+        },
+        customModels: [
+          {
+            id: "cm-1",
+            provider: "custom-provider",
+            modelId: "renamed-model",
+            reasoningEfforts: [],
+            addedAt: "2026-01-01T00:00:00.000Z",
+          },
+        ],
+      });
+
+      const custom = models.find(m => m.provider === "custom-provider" && m.id === "renamed-model");
+      expect(custom?.reasoningEfforts).toEqual([]);
+
+      const entries = buildCatalogEntries(nativeTemplate(), [], models);
+      const row = entries.find(e => e.slug === "custom-provider/renamed-model");
+      expect(row?.supported_reasoning_levels).toEqual([]);
+      expect(row).not.toHaveProperty("default_reasoning_level");
+    } finally {
+      globalThis.fetch = originalFetch;
+      clearModelCache("custom-provider");
+    }
+  });
+
+  test("a none-only custom ladder advertises no synthetic top rungs", async () => {
+    clearModelCache("custom-provider");
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (() => {
+      throw new Error("fetch should not be called");
+    }) as typeof fetch;
+    try {
+      const models = await gatherRoutedModels({
+        port: 10100,
+        defaultProvider: "custom-provider",
+        providers: {
+          "custom-provider": {
+            baseUrl: "https://example.invalid/v1",
+            adapter: "openai-chat",
+            authMode: "key",
+            liveModels: false,
+            models: ["renamed-model"],
+          },
+        },
+        customModels: [
+          {
+            id: "cm-1",
+            provider: "custom-provider",
+            modelId: "renamed-model",
+            reasoningEfforts: ["none"],
+            addedAt: "2026-01-01T00:00:00.000Z",
+          },
+        ],
+      });
+
+      const custom = models.find(m => m.provider === "custom-provider" && m.id === "renamed-model");
+      expect(custom?.reasoningEfforts).toEqual(["none"]);
+
+      const entries = buildCatalogEntries(nativeTemplate(), [], models);
+      const row = entries.find(e => e.slug === "custom-provider/renamed-model");
+      const levels = (row?.supported_reasoning_levels ?? []).map((l: { effort: string }) => l.effort);
+      // No reasoning-capable rung -> the mock max/ultra repair must not fire.
+      expect(levels).toEqual(["none"]);
+      expect(row?.default_reasoning_level).toBe("none");
+    } finally {
+      globalThis.fetch = originalFetch;
+      clearModelCache("custom-provider");
+    }
+  });
+
+  test("a mixed none+low custom ladder keeps none first and gets the mock top rungs", async () => {
+    clearModelCache("custom-provider");
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (() => {
+      throw new Error("fetch should not be called");
+    }) as typeof fetch;
+    try {
+      const models = await gatherRoutedModels({
+        port: 10100,
+        defaultProvider: "custom-provider",
+        providers: {
+          "custom-provider": {
+            baseUrl: "https://example.invalid/v1",
+            adapter: "openai-chat",
+            authMode: "key",
+            liveModels: false,
+            models: ["renamed-model"],
+          },
+        },
+        customModels: [
+          {
+            id: "cm-1",
+            provider: "custom-provider",
+            modelId: "renamed-model",
+            reasoningEfforts: ["none", "low"],
+            addedAt: "2026-01-01T00:00:00.000Z",
+          },
+        ],
+      });
+
+      const entries = buildCatalogEntries(nativeTemplate(), [], models);
+      const row = entries.find(e => e.slug === "custom-provider/renamed-model");
+      const levels = (row?.supported_reasoning_levels ?? []).map((l: { effort: string }) => l.effort);
+      expect(levels).toEqual(["none", "low", "max", "ultra"]);
+      // `none` is declared but real rungs exist: the implicit default must be low, not none.
+      expect(row?.default_reasoning_level).toBe("low");
+    } finally {
+      globalThis.fetch = originalFetch;
+      clearModelCache("custom-provider");
+    }
+  });
+
+  test("an inherited provider default does not ride onto a custom ladder that excludes it", async () => {
+    clearModelCache("custom-provider");
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (() => {
+      throw new Error("fetch should not be called");
+    }) as typeof fetch;
+    try {
+      const models = await gatherRoutedModels({
+        port: 10100,
+        defaultProvider: "custom-provider",
+        providers: {
+          "custom-provider": {
+            baseUrl: "https://example.invalid/v1",
+            adapter: "openai-chat",
+            authMode: "key",
+            liveModels: false,
+            models: ["renamed-model"],
+            // The provider row advertises low/high with a high default; the custom ladder
+            // drops high, so the merged row must not keep advertising high as default.
+            modelReasoningEfforts: { "renamed-model": ["low", "high"] },
+            modelDefaultReasoningEfforts: { "renamed-model": "high" },
+          },
+        },
+        customModels: [
+          {
+            id: "cm-1",
+            provider: "custom-provider",
+            modelId: "renamed-model",
+            reasoningEfforts: ["low"],
+            addedAt: "2026-01-01T00:00:00.000Z",
+          },
+        ],
+      });
+
+      const custom = models.find(m => m.provider === "custom-provider" && m.id === "renamed-model");
+      expect(custom?.reasoningEfforts).toEqual(["low"]);
+      expect(custom?.defaultReasoningEffort).toBeUndefined();
+
+      const entries = buildCatalogEntries(nativeTemplate(), [], models);
+      const row = entries.find(e => e.slug === "custom-provider/renamed-model");
+      const levels = (row?.supported_reasoning_levels ?? []).map((l: { effort: string }) => l.effort);
+      expect(levels).toEqual(["low", "max", "ultra"]);
+      // No high in the ladder, so the fallback default is medium? low is the first rung —
+      // applyReasoningLevels picks medium when present, else high, else the first entry.
+      expect(row?.default_reasoning_level).toBe("low");
     } finally {
       globalThis.fetch = originalFetch;
       clearModelCache("custom-provider");
@@ -2231,13 +2483,13 @@ describe("Codex catalog routed normalization", () => {
     }
   });
 
-  test("normalizeRoutedCatalogEntry strips native-only routed selectors", () => {
+  test("normalizeRoutedCatalogEntry strips native-only selectors and applies routed tool mode", () => {
     const entry = nativeTemplate();
 
     normalizeRoutedCatalogEntry(entry);
 
     expect(entry).not.toHaveProperty("model_messages");
-    expect(entry).not.toHaveProperty("tool_mode");
+    expect(entry.tool_mode).toBe("code_mode_only");
     expect(entry).not.toHaveProperty("multi_agent_version");
     expect(entry).not.toHaveProperty("use_responses_lite");
     expect(entry).not.toHaveProperty("supports_websockets");
@@ -2257,7 +2509,7 @@ describe("Codex catalog routed normalization", () => {
 
     expect(routed).toBeDefined();
     expect(routed).not.toHaveProperty("model_messages");
-    expect(routed).not.toHaveProperty("tool_mode");
+    expect(routed?.tool_mode).toBe("code_mode_only");
     // Routed entries do not inherit a native template's surface pin; the global
     // Codex v2 flag can choose the surface freely unless upstream pins the model.
     expect(routed).not.toHaveProperty("multi_agent_version");
@@ -2273,6 +2525,28 @@ describe("Codex catalog routed normalization", () => {
     expect(routed?.base_instructions).not.toBe(nativeTemplate().base_instructions);
     expect(routed?.base_instructions).toContain("claude-sonnet-4-6");
     expect(routed?.default_reasoning_level).toBe("medium");
+  });
+
+  test("buildCatalogEntries restores Fast metadata only for an explicit routed capability", () => {
+    const entries = buildCatalogEntries(nativeTemplate(), [], [
+      { provider: "verified-relay", id: "gpt-5.6-sol", supportsServiceTier: true },
+      { provider: "unverified-relay", id: "gpt-5.6-sol" },
+      { provider: "blocked-relay", id: "gpt-5.6-sol", supportsServiceTier: false },
+    ]);
+    const verified = entries.find(e => e.slug === "verified-relay/gpt-5.6-sol");
+    const unverified = entries.find(e => e.slug === "unverified-relay/gpt-5.6-sol");
+    const blocked = entries.find(e => e.slug === "blocked-relay/gpt-5.6-sol");
+
+    expect(verified?.service_tiers).toEqual([{
+      id: "priority",
+      name: "Fast",
+      description: "1.5x speed, increased usage",
+    }]);
+    expect(verified?.additional_speed_tiers).toEqual(["fast"]);
+    expect(unverified).not.toHaveProperty("service_tiers");
+    expect(unverified).not.toHaveProperty("additional_speed_tiers");
+    expect(blocked).not.toHaveProperty("service_tiers");
+    expect(blocked).not.toHaveProperty("additional_speed_tiers");
   });
   test("buildCatalogEntries advertises parallel tool calls only for Cursor routed models", () => {
     const entries = buildCatalogEntries(nativeTemplate(), [], [
@@ -2345,9 +2619,9 @@ describe("Codex catalog routed normalization", () => {
     expect((gpt56?.supported_reasoning_levels as { effort: string }[]).map(l => l.effort)).toEqual([
       "low", "medium", "high", "xhigh", "max", "ultra",
     ]);
-    expect(gpt56?.context_window).toBe(372_000);
-    expect(gpt56?.max_context_window).toBe(372_000);
-    expect(gpt56?.auto_compact_token_limit).toBe(334_800);
+    expect(gpt56?.context_window).toBe(922_000);
+    expect(gpt56?.max_context_window).toBe(922_000);
+    expect(gpt56?.auto_compact_token_limit).toBe(829_800);
     expect((gpt55?.supported_reasoning_levels as { effort: string }[]).map(l => l.effort)).toEqual([
       "low", "medium", "high", "xhigh", "max", "ultra",
     ]);
@@ -2389,7 +2663,7 @@ describe("Codex catalog routed normalization", () => {
       expect(e).not.toHaveProperty("minimal_client_version");
       expect(e).not.toHaveProperty("prefer_websockets");
       expect(e).not.toHaveProperty("supports_websockets");
-      expect(e?.context_window).toBe(372_000);
+      expect(e?.context_window).toBe(922_000);
       expect(e?.tool_mode).toBe("code_mode_only");
       expect(e?.use_responses_lite).toBe(true);
     }
@@ -2400,6 +2674,336 @@ describe("Codex catalog routed normalization", () => {
     const sol = entries.find(e => e.slug === "gpt-5.6-sol");
     expect(sol?.prefer_websockets).toBe(true);
     expect(sol?.supports_websockets).toBe(true);
+  });
+
+  test("providerContextCaps.openai ceilings native GPT-5.6 catalog rows (#1430)", () => {
+    const cap = 272_000;
+    const entries = buildCatalogEntries(
+      nativeTemplate(),
+      ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"],
+      [],
+      undefined,
+      false,
+      "default",
+      new Set(),
+      [],
+      new Set(),
+      new Set(),
+      cap,
+    );
+    for (const slug of ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]) {
+      const entry = entries.find(e => e.slug === slug);
+      expect(entry?.context_window).toBe(cap);
+      expect(entry?.max_context_window).toBe(cap);
+      expect(entry?.auto_compact_token_limit).toBe(244_800);
+    }
+  });
+
+  test("mergeCatalogEntriesForSync re-applies the openai cap to preserved and upgraded native rows (#1430)", () => {
+    const cap = 272_000;
+    const template = nativeTemplate();
+    // A preserved genuine row and a fallback-quality row (display_name stamped with
+    // the bare slug) both pass through the final native-override pass on merge.
+    const genuineSol = {
+      ...template,
+      slug: "gpt-5.6-sol",
+      display_name: "GPT-5.6-Sol",
+      context_window: 922_000,
+      max_context_window: 922_000,
+      auto_compact_token_limit: 829_800,
+      supported_reasoning_levels: [
+        { effort: "low", description: "l" }, { effort: "high", description: "h" },
+        { effort: "max", description: "m" }, { effort: "ultra", description: "u" },
+      ],
+    };
+    const merged = mergeCatalogEntriesForSync(
+      [genuineSol],
+      [],
+      new Map(),
+      [],
+      false,
+      new Set(),
+      template,
+      new Set(),
+      new Set(),
+      "default",
+      new Set(),
+      false,
+      true,
+      [],
+      new Set(),
+      new Set(),
+      cap,
+    );
+    const sol = merged.find(e => e.slug === "gpt-5.6-sol");
+    expect(sol?.context_window).toBe(cap);
+    expect(sol?.max_context_window).toBe(cap);
+    expect(sol?.auto_compact_token_limit).toBe(244_800);
+    // The backfilled luna row (upstream snapshot) is capped the same way.
+    const luna = merged.find(e => e.slug === "gpt-5.6-luna");
+    expect(luna?.context_window).toBe(cap);
+    expect(luna?.max_context_window).toBe(cap);
+    expect(luna?.auto_compact_token_limit).toBe(244_800);
+  });
+
+  test("preserved gpt-5.4-mini rows get the openai cap without a hardcoded override (#1430)", () => {
+    const cap = 200_000;
+    const template = nativeTemplate();
+    // gpt-5.4-mini has no NATIVE_OPENAI_CONTEXT_OVERRIDES entry; its windows come
+    // from the preserved disk row and must still be capped on merge.
+    const genuine54Mini = {
+      ...template,
+      slug: "gpt-5.4-mini",
+      display_name: "GPT-5.4-Mini",
+      context_window: 272_000,
+      max_context_window: 272_000,
+      auto_compact_token_limit: 244_800,
+    };
+    const merged = mergeCatalogEntriesForSync(
+      [genuine54Mini],
+      [],
+      new Map(),
+      [],
+      false,
+      new Set(),
+      template,
+      new Set(),
+      new Set(),
+      "default",
+      new Set(),
+      false,
+      true,
+      [],
+      new Set(),
+      new Set(),
+      cap,
+    );
+    const mini = merged.find(e => e.slug === "gpt-5.4-mini");
+    expect(mini?.context_window).toBe(cap);
+    expect(mini?.max_context_window).toBe(cap);
+    expect(mini?.auto_compact_token_limit).toBe(180_000);
+  });
+
+  test("nativeOpenAiContextWindow applies the openai cap as a ceiling only when provided", () => {
+    expect(nativeOpenAiContextWindow("gpt-5.6-sol")).toBe(922_000);
+    expect(nativeOpenAiContextWindow("gpt-5.6-sol", 272_000)).toBe(272_000);
+    // A cap below the native value lowers it; the 5.6 family now sits at 1.05M, so 500k caps.
+    expect(nativeOpenAiContextWindow("gpt-5.6-sol", 500_000)).toBe(500_000);
+    // A cap ABOVE the native value is a ceiling, not a floor.
+    expect(nativeOpenAiContextWindow("gpt-5.6-sol", 2_000_000)).toBe(922_000);
+    // Non-5.6 natives are capped the same way.
+    expect(nativeOpenAiContextWindow("gpt-5.4", 272_000)).toBe(272_000);
+  });
+
+  // Owner decision (devlog 260816_.../011 §4-bis): Daybreak Blue is now a GLOBALLY
+  // allowlisted native, so a bare row IS expected. It still inherits Sol's capability
+  // shape, and the overlap between NATIVE_OPENAI_MODELS and
+  // NATIVE_OPENAI_CAPABILITY_ALIAS_MODELS must not duplicate any row.
+  test("Daybreak Blue inherits Sol capabilities and ships one bare row plus one row per selector", () => {
+    expect(NATIVE_DAYBREAK_BLUE_MODEL).toBe("gpt-daybreak-blue-latest");
+    expect(nativeOpenAiCapabilitySourceSlug(NATIVE_DAYBREAK_BLUE_MODEL)).toBe("gpt-5.6-sol");
+    expect(nativeOpenAiContextWindow(NATIVE_DAYBREAK_BLUE_MODEL)).toBe(922_000);
+    expect(nativeInputModalities(NATIVE_DAYBREAK_BLUE_MODEL)).toEqual(["text", "image"]);
+    expect(nativeReasoningEfforts(NATIVE_DAYBREAK_BLUE_MODEL))
+      .toEqual(["low", "medium", "high", "xhigh", "max", "ultra"]);
+    expect(nativeDefaultReasoningEffort(NATIVE_DAYBREAK_BLUE_MODEL)).toBe("low");
+
+    const source = upstreamNativeEntry(NATIVE_DAYBREAK_BLUE_MODEL);
+    expect(source).toMatchObject({
+      slug: NATIVE_DAYBREAK_BLUE_MODEL,
+      display_name: "Daybreak Blue",
+      // The pinned snapshot stays a verbatim copy of what upstream shipped; the live
+      // contract (1,050,000 / 922,000) is carried by NATIVE_OPENAI_CONTEXT_OVERRIDES and
+      // applied on top by applyNativeOpenAiContextOverride, so the raw entry still reads 372k.
+      context_window: 372_000,
+      max_context_window: 372_000,
+      comp_hash: "3000",
+      tool_mode: "code_mode_only",
+      use_responses_lite: true,
+      supports_parallel_tool_calls: true,
+      supports_search_tool: true,
+      multi_agent_version: "v2",
+    });
+    expect(source).not.toHaveProperty("availability_nux");
+    expect(source?.base_instructions).toContain("powered by the gpt-daybreak-blue-latest");
+    expect(source?.base_instructions).not.toContain("based on GPT-5");
+    expect((source?.model_messages as { instructions_template?: string })?.instructions_template)
+      .toContain("powered by the gpt-daybreak-blue-latest");
+
+    // NATIVE_OPENAI_MODELS already contains the slug; passing it again would double it.
+    const projected = buildCatalogEntries(
+      nativeTemplate(),
+      NATIVE_OPENAI_MODELS,
+      [],
+      undefined,
+      false,
+      "default",
+      new Set(),
+      ["main"],
+      new Set(),
+      new Set(),
+      undefined,
+      [...NATIVE_OPENAI_MODELS],
+      new Map([["main", [...NATIVE_OPENAI_MODELS]]]),
+    );
+    const daybreak = projected.find(entry => entry.slug === `main/${NATIVE_DAYBREAK_BLUE_MODEL}`);
+    const sol = projected.find(entry => entry.slug === "gpt-5.6-sol");
+    expect(daybreak).toBeDefined();
+    expect(daybreak?.auto_compact_token_limit).toBe(829_800);
+    expect(daybreak).toMatchObject({
+      context_window: sol?.context_window,
+      max_context_window: sol?.max_context_window,
+      comp_hash: sol?.comp_hash,
+      tool_mode: sol?.tool_mode,
+      use_responses_lite: sol?.use_responses_lite,
+      supports_parallel_tool_calls: sol?.supports_parallel_tool_calls,
+      input_modalities: sol?.input_modalities,
+    });
+    // The bare row now exists (owner decision) and appears exactly once, proving the
+    // two-list overlap does not duplicate it.
+    expect(projected.filter(entry => entry.slug === NATIVE_DAYBREAK_BLUE_MODEL)).toHaveLength(1);
+    expect(projected.filter(entry => entry.slug === `main/${NATIVE_DAYBREAK_BLUE_MODEL}`)).toHaveLength(1);
+    // The separately billed API-key alias must still never appear on the Codex surface.
+    expect(projected.some(entry => entry.slug === "daybreak-blue-latest")).toBe(false);
+  });
+
+  test("configured ChatGPT-forward Daybreak gets Sol native metadata without API-key crossover", async () => {
+    globalThis.fetch = (() => { throw new Error("forward providers must not fetch /models"); }) as typeof fetch;
+    const forwardConfig: OcxConfig = {
+      port: 10100,
+      defaultProvider: "openai",
+      providers: {
+        openai: {
+          adapter: "openai-responses",
+          baseUrl: "https://chatgpt.com/backend-api/codex",
+          // The built-in OpenAI provider defaults an omitted authMode to forward.
+          codexAccountMode: "pool",
+        },
+      },
+      codexAccountPickerEnabled: false,
+      codexAccountNamespaces: { main: "@main" },
+      customModels: [{
+        id: "daybreak-codex-forward",
+        provider: "openai",
+        modelId: NATIVE_DAYBREAK_BLUE_MODEL,
+        // An API-sized user value may lower neither the installed Codex native contract nor
+        // accidentally collapse this row into the separately billed API-key surface.
+        contextWindow: 922_000,
+      }],
+    };
+
+    const models = await gatherRoutedModels(forwardConfig);
+    const model = models.find(row => row.provider === "openai" && row.id === NATIVE_DAYBREAK_BLUE_MODEL);
+    expect(model).toMatchObject({
+      id: NATIVE_DAYBREAK_BLUE_MODEL,
+      provider: "openai",
+      displayName: "Daybreak Blue",
+      catalogKind: CODEX_CUSTOM_MODEL_CATALOG_KIND,
+      codexForwardNativeCapabilityAlias: true,
+      contextWindow: 922_000,
+      inputModalities: ["text", "image"],
+      reasoningEfforts: ["low", "medium", "high", "xhigh", "max", "ultra"],
+      defaultReasoningEffort: "low",
+      parallelToolCalls: true,
+    });
+
+    const entries = buildCatalogEntries(nativeTemplate(), [], models);
+    const daybreak = entries.find(entry => entry.slug === `openai/${NATIVE_DAYBREAK_BLUE_MODEL}`);
+    expect(daybreak).toMatchObject({
+      slug: `openai/${NATIVE_DAYBREAK_BLUE_MODEL}`,
+      display_name: "Daybreak Blue",
+      context_window: 922_000,
+      max_context_window: 922_000,
+      auto_compact_token_limit: 829_800,
+      comp_hash: "3000",
+      tool_mode: "code_mode_only",
+      use_responses_lite: true,
+      supports_parallel_tool_calls: true,
+      supports_search_tool: true,
+      multi_agent_version: "v2",
+      opencodex_catalog_kind: CODEX_CUSTOM_MODEL_CATALOG_KIND,
+    });
+    expect(daybreak?.base_instructions).toContain("powered by the gpt-daybreak-blue-latest");
+    expect(daybreak?.model_messages).toBeDefined();
+    expect(entries.some(entry => entry.slug === NATIVE_DAYBREAK_BLUE_MODEL)).toBe(false);
+    expect(entries.some(entry => entry.slug === `main/${NATIVE_DAYBREAK_BLUE_MODEL}`)).toBe(false);
+
+    const apiRows = augmentRoutedModelsWithRegistryOpenAiApiRows([], openAiApiCatalogConfig());
+    expect(apiRows.find(row => row.provider === "openai-apikey" && row.id === "daybreak-blue-latest"))
+      .toMatchObject({ contextWindow: 1_050_000, maxInputTokens: 922_000 });
+  });
+
+  test("Daybreak metadata inheritance rejects noncanonical providers", async () => {
+    const models = await gatherRoutedModels({
+      port: 10100,
+      defaultProvider: "openai",
+      providers: {
+        openai: {
+          adapter: "openai-responses",
+          baseUrl: "https://example.invalid/v1",
+          authMode: "key",
+          liveModels: false,
+        },
+      },
+      customModels: [{
+        id: "not-codex-forward",
+        provider: "openai",
+        modelId: NATIVE_DAYBREAK_BLUE_MODEL,
+      }],
+    });
+    const model = models.find(row => row.provider === "openai" && row.id === NATIVE_DAYBREAK_BLUE_MODEL);
+    expect(model?.codexForwardNativeCapabilityAlias).toBeUndefined();
+    const row = buildCatalogEntries(nativeTemplate(), [], models)
+      .find(entry => entry.slug === `openai/${NATIVE_DAYBREAK_BLUE_MODEL}`);
+    expect(row?.context_window).toBe(128_000);
+    expect(row?.use_responses_lite).toBeUndefined();
+    // Not a Daybreak-inheritance signal: `supports_search_tool` is the ordinary routed default for
+    // every non-Cursor row since fcbef381e restored deferred tool discovery. The inheritance
+    // rejection is proven by the native-only fields above and below.
+    expect(row?.supports_search_tool).toBe(true);
+    expect(row?.multi_agent_version).toBeUndefined();
+  });
+
+  test("an explicit empty custom ladder beats the native-alias ladder on a forward row", async () => {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (() => { throw new Error("forward providers must not fetch /models"); }) as typeof fetch;
+    try {
+      const models = await gatherRoutedModels({
+      port: 10100,
+      defaultProvider: "openai",
+      providers: {
+        openai: {
+          adapter: "openai-responses",
+          baseUrl: "https://chatgpt.com/backend-api/codex",
+          codexAccountMode: "pool",
+        },
+      },
+      codexAccountPickerEnabled: false,
+      codexAccountNamespaces: { main: "@main" },
+      customModels: [{
+        id: "daybreak-no-reasoning",
+        provider: "openai",
+        modelId: NATIVE_DAYBREAK_BLUE_MODEL,
+        // Explicit "no reasoning": the alias's native ladder (low..ultra, default low) must
+        // not overwrite it — otherwise the catalog would advertise reasoning the user
+        // explicitly disabled for this row.
+        reasoningEfforts: [],
+      }],
+    });
+    const model = models.find(row => row.provider === "openai" && row.id === NATIVE_DAYBREAK_BLUE_MODEL);
+    expect(model).toMatchObject({
+      codexForwardNativeCapabilityAlias: true,
+      reasoningEfforts: [],
+    });
+    expect(model?.defaultReasoningEffort).toBeUndefined();
+
+      const entries = buildCatalogEntries(nativeTemplate(), [], models);
+      const daybreak = entries.find(entry => entry.slug === `openai/${NATIVE_DAYBREAK_BLUE_MODEL}`);
+      expect(daybreak?.supported_reasoning_levels).toEqual([]);
+      expect(daybreak).not.toHaveProperty("default_reasoning_level");
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
   });
 
   test("catalog sync upgrades fallback-quality gpt-5.6 entries but preserves genuine ones", () => {
@@ -2522,6 +3126,31 @@ describe("Codex catalog routed normalization", () => {
     expect(native?.service_tiers).toEqual([{ id: "priority" }]);
   });
 
+  test("buildCatalogEntries assigns code-only tools to routed fallback rows", () => {
+    const rows = buildCatalogEntries(null, [], [
+      { provider: "deepseek", id: "deepseek-v4-flash", owned_by: "deepseek" },
+    ]);
+
+    const routed = rows.find(row => row.slug === "deepseek/deepseek-v4-flash");
+    expect(routed?.tool_mode).toBe("code_mode_only");
+  });
+
+  test("buildCatalogEntries preserves native tool mode on account-qualified rows", () => {
+    const rows = buildCatalogEntries(
+      nativeTemplate(),
+      ["gpt-5.5"],
+      [],
+      undefined,
+      false,
+      "default",
+      new Set(),
+      ["team"],
+    );
+
+    expect(rows.find(row => row.slug === "gpt-5.5")?.tool_mode).toBe("code");
+    expect(rows.find(row => row.slug === "team/gpt-5.5")?.tool_mode).toBe("code");
+  });
+
   test("catalog sync keeps native OpenAI rows when adopted providers expose matching ids", () => {
     const native = {
       ...nativeTemplate(),
@@ -2581,7 +3210,7 @@ describe("Codex catalog routed normalization", () => {
     expect(off.find(e => e.slug === "anthropic/claude-sonnet-4-6")).not.toHaveProperty("supports_websockets");
   });
 
-  test("fallback routed entries still receive explicit search metadata", () => {
+  test("fallback routed entries keep hosted search metadata and deferred discovery", () => {
     const entries = buildCatalogEntries(null, [], [
       { provider: "local", id: "qwen3-coder" },
     ]);
@@ -3813,9 +4442,9 @@ describe("Codex catalog routed normalization", () => {
   test("built-in DeepSeek and GLM effort models opt into Codex reasoning propagation (#1100)", async () => {
     const expected = [
       { slug: "deepseek/deepseek-v4-flash", efforts: ["low", "high", "max", "ultra"] },
-      { slug: "deepseek/deepseek-v4-pro", efforts: ["high", "max", "ultra"] },
+      { slug: "deepseek/deepseek-v4-pro", efforts: ["low", "high", "max", "ultra"] },
       { slug: "opencode-go/deepseek-v4-flash", efforts: ["low", "high", "max", "ultra"] },
-      { slug: "opencode-go/deepseek-v4-pro", efforts: ["high", "max", "ultra"] },
+      { slug: "opencode-go/deepseek-v4-pro", efforts: ["low", "high", "max", "ultra"] },
       { slug: "opencode-go/glm-5.2", efforts: ["low", "medium", "high", "xhigh", "max", "ultra"] },
       { slug: "opencode-go/glm-5.1", efforts: ["low", "medium", "high", "xhigh", "max", "ultra"] },
       { slug: "opencode-go/glm-5", efforts: ["low", "medium", "high", "xhigh", "max", "ultra"] },
@@ -3936,6 +4565,8 @@ describe("Codex catalog routed normalization", () => {
     expect(opinionated.modelSupportsReasoningSummaries).toEqual({
       "glm-5.2": false,
       "glm-5.2[1m]": true,
+      "glm-5.3": true,
+      "glm-5.3[1m]": true,
     });
   });
 
@@ -4412,6 +5043,7 @@ describe("OpenAI API trusted catalog augmentation", () => {
   const exactIds = [
     "gpt-5.5", "gpt-5.6", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna",
     "gpt-5.6-sol-pro", "gpt-5.6-terra-pro", "gpt-5.6-luna-pro",
+    "daybreak-red-latest", "daybreak-blue-latest",
   ];
 
   test("rebuilds the exact eight rows after partial/conflicting successful discovery", () => {
@@ -4462,6 +5094,21 @@ describe("OpenAI API trusted catalog augmentation", () => {
           reasoningEfforts: ["low", "medium", "high", "xhigh", "max"],
         });
       }
+      // Daybreak aliases carry their own metadata and, deliberately, NO effort ladder.
+      // They fall outside the gpt-5.6 loop above because the alias id is the registered
+      // name — the snapshot id is never registered.
+      expect(apiRows.find(row => row.id === "daybreak-red-latest")).toMatchObject({
+        contextWindow: 400_000,
+        maxInputTokens: 272_000,
+        inputModalities: ["text", "image"],
+        reasoningEfforts: [],
+      });
+      expect(apiRows.find(row => row.id === "daybreak-blue-latest")).toMatchObject({
+        contextWindow: 1_050_000,
+        maxInputTokens: 922_000,
+        inputModalities: ["text", "image"],
+        reasoningEfforts: [],
+      });
       expect(warn).toHaveBeenCalledTimes(1);
     } finally {
       warn.mockRestore();

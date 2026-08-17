@@ -28,7 +28,7 @@ import { deriveProviderPresets } from "../providers/derive";
 import { providerCodexAccountMode } from "../providers/registry";
 import { routedSlug, slugEquals } from "../providers/slug-codec";
 import { clearProviderQuotaCache, fetchProviderQuotaReports } from "../providers/quota";
-import { isCanonicalOpenAiForwardProvider } from "../providers/openai-tiers";
+import { isCanonicalOpenAiForwardProvider, OPENAI_CODEX_PROVIDER_ID } from "../providers/openai-tiers";
 import { clearThreadAccountMap } from "../codex/routing";
 import { primeCodexPoolQuotas } from "../codex/auth-api";
 import { DEFAULT_PROVIDER_CONTEXT_CAP, globalContextCapValue, providerContextCap, providerContextCaps, setAllProviderContextCaps, setGlobalContextCapValue, setProviderContextCap } from "../providers/context-cap";
@@ -59,16 +59,15 @@ import { applySystemEnvToggle } from "./system-env";
 import type { ManagementApiDeps } from "./management/context";
 import { handleConfigRoutes } from "./management/config-routes";
 import { handleLogsUsageRoutes } from "./management/logs-usage-routes";
+import { handleStorageLogGuardRoutes } from "./management/storage-log-guard-routes";
 import { handleRequestHistoryRoutes } from "./management/request-history-routes";
 import { handleRoutingAnalyticsRoutes } from "./management/routing-analytics-routes";
-import { handleRoutingProfileRoutes } from "./management/routing-profile-routes";
 import { handleProviderRoutes } from "./management/provider-routes";
 import { handleModelRoutes } from "./management/model-routes";
 import { handleAgentSettingsRoutes } from "./management/agent-settings-routes";
 import { handleOauthAccountRoutes } from "./management/oauth-account-routes";
 import { handleComboRoutes } from "./management/combo-routes";
 import { handleSystemRoutes } from "./management/system-routes";
-import { handleLabRoutes } from "./management/lab-routes";
 import { handleSidebarRoutes } from "./management/sidebar-routes";
 import { handleIntegrationRoutes } from "./management/integration-routes";
 import { handleNativeIntegrationRoutes } from "./management/native-integration-routes";
@@ -94,6 +93,41 @@ const managementConvergenceBindings = new WeakMap<object, Readonly<{
   factory: (config: Readonly<OcxConfig>) => ConvergeCodex;
   converge: ConvergeCodex;
 }>>();
+
+/**
+ * Namespace match for management route prefixes: exact hit or a child path, never a
+ * prefix collision (`/api/labfoo` must not match `/api/lab`).
+ */
+function pathInManagementNamespace(pathname: string, prefix: string): boolean {
+  return pathname === prefix || pathname.startsWith(`${prefix}/`);
+}
+
+/**
+ * Routing-profile and Compatibility Lab handlers statically import the Lab module graph,
+ * so mounting them eagerly would pull ~70 `src/lab/` modules into every management
+ * request -- including installs that never opted into Lab. Loading them per namespace
+ * keeps `management-api.ts` on the same footing as the three protected core files.
+ *
+ * Cherry-picked from @Wibias's PR #1676, which solved this before the boundary work
+ * reached it. See devlog/_fin/260814_lab_core_decoupling/.
+ */
+async function handleRoutingProfileRoutesOnDemand(ctx: ManagementContext): Promise<Response | null> {
+  if (!pathInManagementNamespace(ctx.url.pathname, "/api/routing-profiles")) return null;
+  const { handleRoutingProfileRoutes } = await import("./management/routing-profile-routes");
+  return handleRoutingProfileRoutes(ctx);
+}
+
+async function handleLabRoutesOnDemand(ctx: ManagementContext): Promise<Response | null> {
+  if (!pathInManagementNamespace(ctx.url.pathname, "/api/lab")) return null;
+  // Automation is checked first so its narrower namespace keeps its own handler, matching
+  // the eager chain's ordering.
+  if (pathInManagementNamespace(ctx.url.pathname, "/api/lab/automation")) {
+    const { handleLabAutomationRoutes } = await import("./management/lab-automation-routes");
+    return handleLabAutomationRoutes(ctx);
+  }
+  const { handleLabRoutes } = await import("./management/lab-routes");
+  return handleLabRoutes(ctx);
+}
 
 export async function handleManagementAPI(
   req: Request,
@@ -140,13 +174,20 @@ export async function handleManagementAPI(
         throw new TypeError("Catalog convergence returned an invalid outcome.");
       }
       return catalogRefresh;
-    } catch {
+    } catch (error) {
+      // #1784: this used to manufacture `reason: "disk"` for every escaping error, so a
+      // programming fault and a full filesystem were indistinguishable and both reported
+      // non-retryable. Classify honestly and keep the cause allowlisted.
+      const invalidRequest = error instanceof TypeError
+        || error instanceof RangeError
+        || error instanceof SyntaxError;
       return {
         status: "failed",
-        reason: "disk",
+        reason: invalidRequest ? "request-invalid" : "internal",
         phase: convergenceInvoked ? "commit" : "gather",
         retryable: false,
         partialWrite: convergenceInvoked,
+        cause: { kind: invalidRequest ? "invalid-request" : "unknown" },
       };
     }
   }
@@ -164,7 +205,7 @@ export async function handleManagementAPI(
           import("../claude/context-windows"),
           import("../codex/catalog"),
         ]);
-        injectClaudeAgentDefs(config, buildClaudeContextWindows([...visibleNativeSlugs(config)], models));
+        injectClaudeAgentDefs(config, buildClaudeContextWindows([...visibleNativeSlugs(config)], models, providerContextCap(config, OPENAI_CODEX_PROVIDER_ID)));
       } catch {
         // Keep routes available through a provider-discovery blip. A later
         // launch-time sync restores any context markers missing from this pass.
@@ -176,10 +217,11 @@ export async function handleManagementAPI(
   let routed: Response | null;
   try {
     routed = (await handleConfigRoutes(ctx))
+    ??     (await handleStorageLogGuardRoutes(ctx))
     ??     (await handleLogsUsageRoutes(ctx))
     ??     (await handleRequestHistoryRoutes(ctx))
     ??     (await handleRoutingAnalyticsRoutes(ctx))
-    ??     (await handleRoutingProfileRoutes(ctx))
+    ??     (await handleRoutingProfileRoutesOnDemand(ctx))
     ??     (await handleProviderRoutes(ctx))
     ??     (await handleModelRoutes(ctx))
     ??     (await handleIntegrationRoutes(ctx))
@@ -188,7 +230,7 @@ export async function handleManagementAPI(
     ??     (await handleOauthAccountRoutes(ctx))
     ??     (await handleComboRoutes(ctx))
     ??     (await handleSystemRoutes(ctx))
-    ??     (await handleLabRoutes(ctx))
+    ??     (await handleLabRoutesOnDemand(ctx))
       ?? (await handleSidebarRoutes(ctx));
   } catch (error) {
     const tooLarge = managementBodyTooLargeResponse(error, req, config);

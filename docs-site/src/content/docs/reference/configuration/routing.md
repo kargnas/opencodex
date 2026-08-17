@@ -39,7 +39,13 @@ more than one provider, so use explicit namespaces when a bare model could be am
 `codexAccountNamespaces` maps a public selector such as `side` to one stored Codex account. A
 request for `side/gpt-5.6-sol` uses only that account, even when the canonical `openai` provider is
 in Direct mode, and sends the bare `gpt-5.6-sol` model id upstream. Only bare native OpenAI-family
-ids are valid after the selector.
+ids are valid after the selector. Account-scoped ids observed in Codex's current model catalog may
+also be preserved exactly when they are not yet part of opencodex's static set; the observation must
+carry the field shape of a real catalog row, stays qualified to its matching account selector, and
+is never promoted into the global bare model list. That shape check filters malformed and minimal
+rows — it is not a trust control, because the models cache is a user-owned file and a complete
+hand-written row is indistinguishable from an upstream observation. Nothing new becomes routable:
+a bare `gpt-*` id under an account selector is accepted by the router regardless of the catalog.
 
 Exact selection bypasses Pool assignment strategy and ordinary thread affinity. If the mapped
 account is missing, paused, cooling down, unusable, or requires reauthentication, the request fails
@@ -70,6 +76,7 @@ namespace, and cannot use reserved bare native families such as `gpt-*`, `o1-*`,
 | `strategy?` | `"failover" \| "round-robin"` | `"failover"` | Selection strategy. Target order is failover priority; weights shape smooth weighted round-robin. |
 | `stickyLimit?` | `number` | `1` | Successful requests retained in one round-robin batch. Range 1–100. |
 | `defaultEffort?` | `"low" \| "medium" \| "high" \| "xhigh" \| "max" \| "ultra" \| null` | unset | Applied only when the caller omits effort and the selected target advertises the requested rung. |
+| `imageInput?` | `"auto" \| "disabled"` | `"auto"` | `"auto"` publishes image only when every target supports images; `"disabled"` forces text-only (drops image from published modalities and rejects image-bearing requests before dispatch). |
 | `alias?` | `string` | — | Optional public model id in place of the canonical picker slug. |
 | `nativeAlias?` | `boolean` | `false` | Let a currently supported bare native id take precedence only for that unqualified id. Bare `gpt-5.6-*` ids use Codex Pool/Direct credentials. Account-qualified routes remain distinct. Provider-qualified routes such as `openai-apikey/gpt-5.6-*` use their configured API-key route and never fall through to the native alias. |
 | `displayName?` | `string` | — | Display-only catalog label, required and non-empty for a native alias. |

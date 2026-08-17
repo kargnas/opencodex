@@ -2,10 +2,12 @@ import { expect, test } from "bun:test";
 import { DICTS, type Locale } from "../src/i18n/catalogs";
 import { LAB_CATALOG_OVERRIDES, labSupplement } from "../src/i18n/lab-translations";
 
-const NON_ENGLISH: Locale[] = ["de", "ja", "ko", "ru", "tr", "zh"];
+const NON_ENGLISH: Locale[] = ["de", "fr", "ja", "ko", "ru", "tr", "zh"];
 
-test("Compatibility Lab catalog overrides cover the complete English lab namespace", () => {
-  const englishKeys = Object.keys(DICTS.en).filter(key => key.startsWith("lab.")).sort();
+test("Compatibility Lab catalog overrides cover the translated overlay namespace", () => {
+  const englishKeys = Object.keys(DICTS.en)
+    .filter(key => key.startsWith("lab.") && !key.startsWith("lab.production."))
+    .sort();
   for (const locale of Object.keys(LAB_CATALOG_OVERRIDES) as Locale[]) {
     expect(Object.keys(LAB_CATALOG_OVERRIDES[locale]).sort()).toEqual(englishKeys);
   }

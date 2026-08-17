@@ -194,7 +194,9 @@ class Fixture {
       server.process.exited,
       new Promise<never>((_, reject) => setTimeout(() => reject(new Error("server shutdown watchdog")), 10_000)),
     ]);
-    expect(exitCode).toBe(0);
+    // Bun reports a forced SIGTERM as 128 + 15 on Windows; POSIX children may
+    // run the CLI shutdown handler and exit cleanly instead.
+    expect(exitCode === 0 || (process.platform === "win32" && exitCode === 143)).toBe(true);
   }
 
   async request(runtime: RuntimeRecord, path: string, init: RequestInit = {}): Promise<{ status: number; body: Record<string, unknown> }> {
@@ -242,6 +244,41 @@ afterEach(async () => {
 });
 
 describe("WP13 composed toggle acceptance", () => {
+  /** RED: read the server's startup config snapshot in the /api/sync route; a hand edit made after start is lost. */
+  test("#1802: /api/sync applies the on-disk config, not the server's startup snapshot", async () => {
+    const fx = fixture();
+    fx.writeConfig({ clientIntegrations: { codex: false } });
+    const server = await fx.start();
+    try {
+      // The server is now holding a config object from startup. Edit the file out of band,
+      // exactly as a user editing config.json by hand would, so disk is strictly newer.
+      const configPath = join(fx.ocx, "config.json");
+      const onDisk = JSON.parse(readFileSync(configPath, "utf-8")) as Record<string, any>;
+      onDisk.providers["hand-edited"] = {
+        adapter: "openai-chat",
+        baseUrl: "http://127.0.0.1:2/v1",
+        apiKey: "hand-edited-key",
+        allowPrivateNetwork: true,
+        liveModels: false,
+        models: ["hand-edited-model"],
+      };
+      onDisk.modelCosts = { "fixture/fixture-model": { input: 7, output: 11 } };
+      writeFileSync(configPath, JSON.stringify(onDisk, null, 2));
+
+      const sync = await fx.request(server.runtime, "/api/sync", { method: "POST" });
+      expect(sync.status).toBe(200);
+
+      // Assert against DISK, not the response body: the failure this pins is the route
+      // persisting a stale snapshot back over the file.
+      const after = JSON.parse(readFileSync(configPath, "utf-8")) as Record<string, any>;
+      expect(after.providers["hand-edited"]).toMatchObject({ apiKey: "hand-edited-key" });
+      expect(after.modelCosts).toEqual({ "fixture/fixture-model": { input: 7, output: 11 } });
+      expect(Object.keys(after.providers)).toEqual(expect.arrayContaining(["fixture", "hand-edited"]));
+    } finally {
+      await fx.stop(server);
+    }
+  }, 45_000);
+
   /** RED: remove `shouldSyncCodexOnStart` or the under-lock desired-state read; an OFF row writes native bytes. */
   test("A-reduced: real CLI and HTTP entry points preserve an OFF Codex home", async () => {
     const fx = fixture();
@@ -350,7 +387,33 @@ describe("WP13 composed toggle acceptance", () => {
   /** RED: omit `admitCodexWrite` ownership refusal; start/ensure/P19 create a coordinator or native artifact. */
   test("D-reduced: foreign service-home evidence refuses real CLI and HTTP writers before artifacts", async () => {
     const fx = fixture();
-    fx.writeConfig();
+    fx.writeConfig({
+      defaultProvider: "openai",
+      providers: {
+        openai: {
+          adapter: "openai-responses",
+          baseUrl: "https://chatgpt.com/backend-api/codex",
+          authMode: "forward",
+          codexAccountMode: "pool",
+        },
+      },
+      codexAccounts: [],
+      activeCodexAccountId: "__main__",
+      autoSwitchThreshold: 0,
+    });
+    const expiredPayload = Buffer.from(JSON.stringify({
+      exp: Math.floor(Date.now() / 1000) - 60,
+    })).toString("base64url");
+    writeFileSync(join(fx.codex, "auth.json"), JSON.stringify({
+      tokens: {
+        access_token: `header.${expiredPayload}.signature`,
+        account_id: "foreign-main-account",
+      },
+    }));
+    writeFileSync(join(fx.codex, "opencodex-catalog.json"), JSON.stringify({
+      models: [{ slug: "foreign-sentinel" }],
+    }));
+    writeFileSync(join(fx.codex, "models_cache.json"), "foreign-cache-sentinel\n");
     writeFileSync(join(fx.ocx, "service-state.json"), JSON.stringify({
       version: 2,
       codexHome: join(fx.root, "foreign-codex"),
@@ -360,6 +423,11 @@ describe("WP13 composed toggle acceptance", () => {
     const before = manifest(fx.codex);
     const server = await fx.start();
     try {
+      const nativeRead = await fx.request(server.runtime, "/v1/responses", {
+        method: "POST",
+        body: JSON.stringify({ model: "openai/gpt-test", input: "foreign owner", stream: false }),
+      });
+      expect(nativeRead.status).toBe(503);
       const ensure = await fx.runCli(["ensure"]);
       expect(ensure.exitCode).toBe(0);
       const sync = await fx.request(server.runtime, "/api/sync", { method: "POST" });
@@ -367,6 +435,51 @@ describe("WP13 composed toggle acceptance", () => {
       expect(String(sync.body.message ?? sync.body.error)).toMatch(/Refusing|service|ownership/i);
       const restore = await fx.runCli(["restore"]);
       expect(restore.exitCode).toBe(1);
+      expect(manifest(fx.codex)).toEqual(before);
+      expect(fx.lockAllowlist.some(existsSync)).toBe(false);
+    } finally {
+      await fx.stop(server);
+    }
+  }, 45_000);
+
+  test("D-unknown: unprovable service-home ownership refuses native reads and cache writes", async () => {
+    const fx = fixture();
+    fx.writeConfig({
+      defaultProvider: "openai",
+      providers: {
+        openai: {
+          adapter: "openai-responses",
+          baseUrl: "https://chatgpt.com/backend-api/codex",
+          authMode: "forward",
+          codexAccountMode: "pool",
+        },
+      },
+      codexAccounts: [],
+      activeCodexAccountId: "__main__",
+      autoSwitchThreshold: 0,
+    });
+    writeFileSync(join(fx.codex, "auth.json"), JSON.stringify({
+      tokens: {
+        access_token: "opaque-main-token",
+        account_id: "unknown-main-account",
+      },
+    }));
+    writeFileSync(join(fx.codex, "opencodex-catalog.json"), JSON.stringify({
+      models: [{ slug: "unknown-sentinel" }],
+    }));
+    writeFileSync(join(fx.codex, "models_cache.json"), "unknown-cache-sentinel\n");
+    writeFileSync(join(fx.ocx, "service-state.json"), "{malformed-service-state\n");
+    const before = manifest(fx.codex);
+    const server = await fx.start();
+    try {
+      const nativeRead = await fx.request(server.runtime, "/v1/responses", {
+        method: "POST",
+        body: JSON.stringify({ model: "openai/gpt-test", input: "unknown owner", stream: false }),
+      });
+      expect(nativeRead.status).toBe(503);
+      const sync = await fx.request(server.runtime, "/api/sync", { method: "POST" });
+      expect(sync.status).toBe(409);
+      expect(String(sync.body.message ?? sync.body.error)).toMatch(/ownership|proven|read|malformed/i);
       expect(manifest(fx.codex)).toEqual(before);
       expect(fx.lockAllowlist.some(existsSync)).toBe(false);
     } finally {

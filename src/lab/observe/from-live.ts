@@ -5,7 +5,7 @@ import { LAB_EVENT_SCHEMA_VERSION, LAB_PRODUCER, LAB_PRODUCER_VERSION, OBSERVATI
 import { fixtureDigest, scenarioManifestDigest, subjectIdForSubject, suiteManifestDigest } from "../digest";
 import type { FailureRecordV1, ObservationEvent } from "../events/types";
 import { assignEventId } from "../events/validate";
-import { appendLabEvent } from "../ledger/store";
+import { withLedgerMutation } from "../ledger/store";
 import { ensureLabDirs } from "../paths";
 import type { CaseAuthority, CaseRecord } from "../conformance/types";
 import { trustedLiveResultRetryable } from "../live/executor";
@@ -20,7 +20,9 @@ function outcomeFromLiveResult(result: LiveScenarioRunResult): ObservationOutcom
   if (result.passed) return "pass";
   switch (result.classification) {
     case "timeout":
+    case "inactivity_timeout":
     case "budget_exhausted":
+    case "sandbox_violation":
     case "authentication_blocked":
     case "quota_blocked":
     case "region_blocked":
@@ -33,7 +35,13 @@ function outcomeFromLiveResult(result: LiveScenarioRunResult): ObservationOutcom
       return "fail";
     case "inconclusive":
     case "harness_failure":
+    case "malformed_producer_outcome":
+    case "layer_subject_mismatch":
       return "inconclusive";
+    default: {
+      const _never: never = result.classification;
+      throw new Error(`unmapped failure classification: ${String(_never)}`);
+    }
   }
 }
 
@@ -41,7 +49,7 @@ function failureFromLiveResult(result: LiveScenarioRunResult, retryable: boolean
   if (result.passed || result.classification === "inconclusive") return undefined;
   const attribution: FailureRecordV1["attribution"] = result.classification === "harness_failure"
     ? "harness"
-    : ["authentication_blocked", "quota_blocked", "region_blocked", "network_failure", "provider_transient", "timeout", "budget_exhausted"].includes(result.classification)
+    : ["authentication_blocked", "quota_blocked", "region_blocked", "network_failure", "provider_transient", "timeout", "inactivity_timeout", "budget_exhausted"].includes(result.classification)
       ? "environment"
       : "route";
   return {
@@ -98,6 +106,12 @@ export function observationFromLiveResult(result: LiveScenarioRunResult, caseRec
 
 export function persistLiveResult(result: LiveScenarioRunResult, caseRecord: CaseRecord, authority: CaseAuthority, opts: PersistLiveOptions = {}): PersistedLiveObservation {
   const paths = ensureLabDirs(opts.configDir); const ownsStore = !opts.artifactStore; const store = opts.artifactStore ?? createArtifactStore(paths.artifactsDir);
-  try { const { event } = observationFromLiveResult(result, caseRecord, authority, { ...opts, artifactStore: store }); appendLabEvent(paths.ledgerPath, event); return { event, ledgerPath: paths.ledgerPath }; }
+  try {
+    return withLedgerMutation(paths.ledgerPath, (ledger) => {
+      const { event } = observationFromLiveResult(result, caseRecord, authority, { ...opts, artifactStore: store });
+      ledger.append(event);
+      return { event, ledgerPath: paths.ledgerPath };
+    });
+  }
   finally { if (ownsStore) store.close(); }
 }

@@ -1,7 +1,8 @@
-import { describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { spawn } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
+import { setTrustedWindowsElevationExecutablesForTests } from "../src/lib/windows-elevation";
 import {
   afterCatalogWriteHandleAppServers,
   attachStaleAppServerHint,
@@ -365,15 +366,15 @@ describe("Codex app-server process matching (#476)", () => {
 });
 
 describe("CLI /api sync wiring for stale app-servers (#476)", () => {
-  const cliSource = readFileSync(join(import.meta.dir, "..", "src", "cli", "index.ts"), "utf8");
+  const dispatchSource = readFileSync(join(import.meta.dir, "..", "src", "cli", "dispatch.ts"), "utf8");
   const configRoutesSource = readFileSync(
     join(import.meta.dir, "..", "src", "server", "management", "config-routes.ts"),
     "utf8",
   );
 
   test("ocx sync only handles app-servers after a catalog/cache write and forwards --restart-codex", () => {
-    const syncCase = cliSource.slice(cliSource.indexOf('case "sync":'), cliSource.indexOf('case "v2":'));
-    expect(syncCase).toContain('args.slice(1).includes("--restart-codex")');
+    const syncCase = dispatchSource.slice(dispatchSource.indexOf("sync: async"), dispatchSource.indexOf("v2: async"));
+    expect(syncCase).toContain('deps.args.slice(1).includes("--restart-codex")');
     expect(syncCase).toContain("synced.catalogWritten || synced.cacheSynced");
     expect(syncCase).toContain("afterCatalogWriteHandleAppServers");
     expect(syncCase).toContain("restart: restartCodex");
@@ -386,9 +387,9 @@ describe("CLI /api sync wiring for stale app-servers (#476)", () => {
   });
 
   test("ocx sync-cache only handles app-servers after a successful models_cache write", () => {
-    const syncCacheCase = cliSource.slice(
-      cliSource.indexOf('case "sync-cache":'),
-      cliSource.indexOf('case "gui":'),
+    const syncCacheCase = dispatchSource.slice(
+      dispatchSource.indexOf('"sync-cache": async'),
+      dispatchSource.indexOf("gui: async"),
     );
     // The cache write now happens under the catalog serialization lock K, so the
     // gate reads the permitted writer's outcome instead of a bare boolean call.
@@ -461,7 +462,7 @@ describe("process utility invocation source guards", () => {
   );
 
   test("pins every Darwin ps invocation to the system binary", () => {
-    expect(processSource.match(/execFileSync\(\s*["']\/bin\/ps["']/g) ?? []).toHaveLength(4);
+    expect(processSource.match(/execFileSync\(\s*["']\/bin\/ps["']/g) ?? []).toHaveLength(6);
     expect(processSource).not.toMatch(/execFileSync\(\s*["']ps["']/);
   });
 });
@@ -492,7 +493,7 @@ describe("Windows Win32_Process owner enumeration (#476)", () => {
       const child = spawn(
         "powershell.exe",
         [
-          "-NoProfile", "-NoLogo", "-NonInteractive", "-WindowStyle", "Hidden",
+          "-NoProfile", "-NoLogo", "-NonInteractive",
           "-Command",
           "Start-Sleep -Seconds 45 # codex app-server integration-probe",
         ],
@@ -653,5 +654,91 @@ describe("warnIfStaleCodexAppServersAfterStartupWrite (#1046)", () => {
       io: { listSnapshots: () => { throw new Error("ps unavailable"); } },
     }).warned).toBe(false);
     expect(errors).toEqual([]);
+  });
+});
+
+describe("platform termination ladder", () => {
+  const target = { pid: 4242, commandLine: "/opt/codex app-server" };
+  const snapshots = () => [{ pid: 4242, commandLine: "/opt/codex app-server" }];
+
+  // The Windows branch is driven by an injected platform, so the resolver cannot
+  // assert a real System32 path on this host. Override it exactly as the
+  // elevation suite does rather than loosening the production resolver.
+  beforeEach(() => {
+    setTrustedWindowsElevationExecutablesForTests({
+      taskkill: "C:\\Windows\\System32\\taskkill.exe",
+    });
+  });
+  afterEach(() => setTrustedWindowsElevationExecutablesForTests(null));
+
+  test("Windows uses taskkill /T /F and never falls through to a signal", () => {
+    // process.kill(SIGTERM) on Windows is already an unconditional terminate of
+    // one process; /T adds the child cleanup it lacks.
+    const execCalls: Array<{ file: string; args: readonly string[] }> = [];
+    const signals: number[] = [];
+    restartCodexAppServers([target], {
+      platform: "win32",
+      listSnapshots: snapshots,
+      execFile: (file, args) => { execCalls.push({ file, args }); },
+      processKill: pid => { signals.push(pid); },
+      isAlive: () => false,
+      waitExit: () => true,
+    });
+
+    expect(execCalls).toHaveLength(1);
+    expect(execCalls[0]!.args).toEqual(["/PID", "4242", "/T", "/F"]);
+    expect(execCalls[0]!.file.toLowerCase()).toContain("taskkill");
+    expect(signals).toEqual([]);
+  });
+
+  test("a failing taskkill falls back to the previous behavior", () => {
+    // The branch that keeps a Windows regression from being worse than the code
+    // it replaced.
+    const signals: Array<{ pid: number; signal: string }> = [];
+    restartCodexAppServers([target], {
+      platform: "win32",
+      listSnapshots: snapshots,
+      execFile: () => { throw new Error("taskkill unavailable"); },
+      processKill: (pid, signal) => { signals.push({ pid, signal }); },
+      isAlive: () => false,
+      waitExit: () => true,
+    });
+
+    expect(signals).toEqual([{ pid: 4242, signal: "SIGTERM" }]);
+  });
+
+  test("Linux keeps SIGTERM only, with no exec and no SIGKILL", () => {
+    // procfs enumeration is the Linux path; termination must stay unchanged
+    // there, because a second harder signal asks a consent a click did not give.
+    const execCalls: string[] = [];
+    const signals: Array<{ pid: number; signal: string }> = [];
+    restartCodexAppServers([target], {
+      platform: "linux",
+      listSnapshots: snapshots,
+      execFile: file => { execCalls.push(file); },
+      processKill: (pid, signal) => { signals.push({ pid, signal }); },
+      isAlive: () => false,
+      waitExit: () => true,
+    });
+
+    expect(execCalls).toEqual([]);
+    expect(signals).toEqual([{ pid: 4242, signal: "SIGTERM" }]);
+    expect(signals.some(entry => entry.signal === "SIGKILL")).toBe(false);
+  });
+
+  test("macOS behaves like Linux", () => {
+    const execCalls: string[] = [];
+    const signals: Array<{ pid: number; signal: string }> = [];
+    restartCodexAppServers([target], {
+      platform: "darwin",
+      listSnapshots: snapshots,
+      execFile: file => { execCalls.push(file); },
+      processKill: (pid, signal) => { signals.push({ pid, signal }); },
+      isAlive: () => false,
+      waitExit: () => true,
+    });
+
+    expect(execCalls).toEqual([]);
+    expect(signals).toEqual([{ pid: 4242, signal: "SIGTERM" }]);
   });
 });

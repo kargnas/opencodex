@@ -33,11 +33,12 @@ const REVIEW_READINESS_ITEMS = [
 
 /**
  * Which checklist box each bot-verifiable claim maps to. The order must stay
- * in sync with REVIEW_READINESS_ITEMS: index 0 is the CI claim, index 1 is
- * the latest-dev claim, and index 2 is the Codex/CodeRabbit findings claim.
+ * in sync with REVIEW_READINESS_ITEMS: index 1 is the latest-dev claim and
+ * index 2 is the Codex/CodeRabbit findings claim. Index 0 (local CI) is an
+ * author attestation only — fork contributors cannot start repository CI — so
+ * the gate never disproves it; head-drift still resets every box.
  */
 const REVIEW_READINESS_CLAIM_INDEX = {
-  ci_green: 0,
   latest_dev: 1,
   review_findings: 2
 };
@@ -57,8 +58,8 @@ const PR_TEMPLATE_BOILERPLATE_LINES = new Set([
 
 /** Case-insensitive whole-word match for the GUI surface (repo convention: `gui/`). */
 const GUI_CUE_RE = /\bgui\b/i;
-/** HTML comments, which GitHub never renders. */
-const HTML_COMMENT_RE = /<!--[\s\S]*?-->/g;
+/** HTML comments, which GitHub never renders. An unclosed comment runs through EOF. */
+const HTML_COMMENT_RE = /<!--[\s\S]*?(?:-->|$)/g;
 /** Fenced code blocks (``` or ~~~) whose content GitHub does not render. */
 const FENCED_CODE_RE = /(?:^|\n)[ \t]*(`{3,}|~{3,})[^\n]*\n[\s\S]*?^[ \t]*\1[ \t]*(?=\n|$)/gm;
 /** Embedded markdown image (`![alt](url)`), as GitHub renders for dropped images. */
@@ -146,7 +147,7 @@ function assessPrDescription(body) {
   const withoutTemplate = stripPrTemplateBoilerplate(withoutReadiness);
   const cleaned = clean(withoutTemplate);
   if (!cleaned) {
-    const strippedComments = withoutTemplate.replace(/<!--[\s\S]*?-->/g, "").trim();
+    const strippedComments = withoutTemplate.replace(HTML_COMMENT_RE, "").trim();
     if (!strippedComments) return { ok: false, reason: "empty" };
     if (isPlaceholderOnlyValue(strippedComments)) {
       return { ok: false, reason: "placeholder" };
@@ -244,7 +245,13 @@ function hasGuiOverride({ comments = [] }) {
  * fenced code blocks. Image syntax there is literal text, not evidence.
  */
 function stripNonRenderedRegions(body) {
-  return body.replace(HTML_COMMENT_RE, "").replace(FENCED_CODE_RE, "");
+  // Fenced code MUST be removed first. GFM treats fence contents as literal
+  // text, so a `<!--` inside a fence never opens an HTML comment. Stripping
+  // comments first let an unclosed comment-like literal in a code sample run
+  // through EOF and swallow the real body after it, which rejected valid
+  // descriptions: a GUI PR whose screenshot followed such an example lost its
+  // evidence, and an issue lost the sections it was validated on.
+  return body.replace(FENCED_CODE_RE, "").replace(HTML_COMMENT_RE, "");
 }
 
 /**

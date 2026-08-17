@@ -20,11 +20,22 @@ upstream을 주기적으로 merge해서 버전을 따라간다. upstream이 고�
   워크스페이스 패널·모달 계정 행에 추가.
 - `fix(codex): keep Darwin ps timestamps locale-independent` — macOS의 `/bin/ps lstart`
   출력을 `LC_ALL=C`로 고정해서 비영어 locale에서도 Codex 프로세스 시작 시각을 읽는다.
+- `fix(proxy): model discovery flavor + auth conflict` — `/v1/models`에서
+  anthropic/codex/openai flavor 경계를 명시하고, Bearer와 x-api-key 값이 다르면
+  우선순위 적용 전에 400으로 거부한다. OpenAI-compatible 목록의 native 행은
+  `openai/<id>` namespace를 유지한다 (bare slug는 Codex client_version 경로만).
+
+## 삭제된 패치 (upstream 반영)
+
+- `perf: ChatGPT Codex upstream을 responses_websockets 전송으로 전환` 및 후속
+  리뷰 수정 — upstream `rebase/1487-ws-upstream` (#1558)으로 들어갔다.
 
 ## 동기화 이력
 
 - 2026-08-11 — upstream `v2.12.0`을 병합했다. OAuth GUI 패치는 새 계정 관리 UI와
   결합했고, macOS locale 패치는 그대로 유지했다.
+- 2026-08-17 — upstream `v2.24.1`을 병합했다. WS upstream 패치는 upstream 본문을
+  채택해 제거했다. OAuth GUI·Darwin locale·model discovery 패치는 유지했다.
 
 ## upstream 동기화 절차
 

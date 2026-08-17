@@ -17,7 +17,7 @@ surface modes, delegation, effort, and fallback behavior fit together.
 ocx agent subagents set ark/model-a,openai/gpt-5.5
 ```
 
-### `ocx v2 <status|on|off|mode <v1|default|v2>|threads <n>>`
+### `ocx v2 <status|on|off|mode <v1|default|v2>|keep-native-v1 <on|off>|threads <n>|mode-hint <text|--clear>>`
 
 Manage the Codex `multi_agent_v2` feature flag and the three-state multi-agent surface mode.
 
@@ -28,8 +28,11 @@ Manage the Codex `multi_agent_v2` feature flag and the three-state multi-agent s
 | `off` | Disable the `multi_agent_v2` feature and resync the catalog. |
 | `mode v1` | Force all models to v1, disable native v2, and preserve the active thread limit. |
 | `mode default` | Respect upstream model surface pins. |
-| `mode v2` | Force all models to v2, enable native v2, and preserve the active thread limit. |
+| `mode v2` | Force models to v2, enable native v2, and preserve the active thread limit. ChatGPT-native models are exempt while `keep-native-v1` is on. |
+| `keep-native-v1 on\|off` | Under `mode v2`, keep ChatGPT-native models on v1 instead of stamping them v2. |
 | `threads <n>` | Set the active v1/v2 thread limit to an integer of at least 1. |
+| `mode-hint <text>` | Set the Proactive delegation hint (Ultra mode) for every model and effort. |
+| `mode-hint --clear` | Remove the hint so the effort-derived policy (ultra = proactive) resumes. |
 
 ```bash
 ocx v2 status
@@ -37,12 +40,25 @@ ocx v2 mode v1
 ocx v2 mode default
 ocx v2 on
 ocx v2 threads 16
+ocx v2 mode-hint "Proactive multi-agent delegation is active."
+ocx v2 mode-hint --clear
 ```
 
 The `mode` subcommand writes `multiAgentMode` to the opencodex config and resyncs the Codex catalog.
 Mode and flag transitions move the current numeric thread limit between the valid v1/v2 Codex keys;
 a failed transition restores the original `config.toml`. Changes apply to new Codex sessions, while
 running sessions keep their pinned surface.
+
+`mode-hint` writes `features.multi_agent_v2.multi_agent_mode_hint_text` in Codex's
+`$CODEX_HOME/config.toml` even when `multi_agent_v2` is currently disabled. The
+command only persists the override; it does not enable or disable the feature, so
+the hint takes effect when a matching Codex surface is active. The hint overrides
+codex-rs's effort-derived multi-agent policy, so any model and any reasoning effort
+receives the Proactive delegation prompt. It does **not** change reasoning effort
+itself. A missing argument or a whitespace-only value is rejected; only `--clear`
+removes the hint. The Subagents dashboard's Ultra mode **on** toggle has a stricter
+gate: it requires the native feature to be enabled with an explicit v2 surface
+(`ocx v2 mode v2`); `ocx v2 on` alone does not satisfy that dashboard gate.
 
 ## Combo routing
 
@@ -153,7 +169,7 @@ Manage and apply the Grok Build model fence.
 
 ## Client config export
 
-### `ocx export --client <opencode|pi|omp|hermes|openclaw|kimi|gajae>`
+### `ocx export --client <opencode|pi|omp|hermes|openclaw|kimi|gajae|dsh>`
 
 Print a client config wired to the running proxy. The command serializes the
 `opencodex` provider block — base URL, model list, and the client's credential
@@ -164,7 +180,7 @@ models Codex can currently see.
 
 | Flag | Action |
 | --- | --- |
-| `--client <opencode\|pi\|omp\|hermes\|openclaw\|kimi\|gajae>` | Required. Selects the client config dialect. |
+| `--client <opencode\|pi\|omp\|hermes\|openclaw\|kimi\|gajae\|dsh>` | Required. Selects the client config dialect. |
 | `--json` | Print the generated document as JSON on stdout for scripts. This is JSON even when the selected client's native format is YAML, TOML, or JSON5. |
 | `--out <path>` | Write the client's native config format to `<path>`. Refuses to replace an existing file. |
 | `--force` | Allow `--out` to replace an existing file. |
@@ -189,6 +205,11 @@ client applies its own defaults for those).
 | `openclaw` | `~/.openclaw/openclaw.json` | `openclaw.json5` | `OPENCODEX_OPENCLAW_API_KEY` |
 | `kimi` | `~/.kimi-code/config.toml` | `kimi-config.toml` | none — loopback placeholder |
 | `gajae` | `~/.gjc/agent/models.yml` | `gajae-models.yaml` | `OPENCODEX_GAJAE_API_KEY` |
+| `dsh` | `$DSH_HOME/settings.yaml` (default `~/.dsh/settings.yaml`) | `settings.yaml` | none — non-secret loopback bearer placeholder |
+
+The managed DSH export requires DSH 0.1.0-rc.6 or newer and owns only
+`llm-pi-ai.providers.opencodex`. DSH hot reloads that provider; the user's default model and
+`deepseek-official` remain untouched. This export is loopback-only and carries no real credential.
 
 opencode interpolates `{env:OPENCODEX_OPENCODE_API_KEY}`. The generated Pi and OMP exports do
 not require an environment variable: each carries the literal `opencodex-loopback` placeholder.
@@ -210,6 +231,9 @@ the proxy binds beyond loopback; see
 [Remote access](/reference/configuration/#remote-access) for how admission keys are issued. Keys for
 the upstream providers themselves are a separate thing entirely, configured per
 [Providers](/guides/providers/).
+Gajae is the exception: `OPENCODEX_GAJAE_API_KEY` fills its provider credential from the
+environment, but its schema cannot send the remote admission header, so the generated Gajae
+integration remains loopback-only.
 
 The same payload is served by `GET /api/client-config` and rendered on the dashboard's API tab, so
 the CLI, the API, and the GUI use the same bytes.

@@ -7,6 +7,8 @@ import { PROXY_MARKER, defaultAuthDetectDeps, detectClaudeAuth, ownAdmissionToke
 import { resolveClaudeAuthMode } from "../claude/auth-mode";
 import type { OcxConfig } from "../types";
 import { recordOwnedConfigPath } from "../lib/config-ownership";
+import { providerContextCap } from "../providers/context-cap";
+import { OPENAI_CODEX_PROVIDER_ID } from "../providers/openai-tiers";
 
 /**
  * Does the opencodex dummy marker belong in the system environment?
@@ -237,10 +239,10 @@ async function computeEffectiveModelEnv(config: OcxConfig, auto?: AutoContextMod
   const windows = await boundedContextWindows(async () => {
     const { gatherRoutedModels, visibleNativeSlugs } = await import("../codex/catalog");
     try {
-      return buildClaudeContextWindows([...visibleNativeSlugs(config)], await gatherRoutedModels(config));
+      return buildClaudeContextWindows([...visibleNativeSlugs(config)], await gatherRoutedModels(config), providerContextCap(config, OPENAI_CODEX_PROVIDER_ID));
     } catch (error) {
       if (error && typeof error === "object" && (error as { code?: unknown }).code === "catalog_busy") {
-        return buildClaudeContextWindows([...visibleNativeSlugs(config)], []);
+        return buildClaudeContextWindows([...visibleNativeSlugs(config)], [], providerContextCap(config, OPENAI_CODEX_PROVIDER_ID));
       }
       throw error;
     }
@@ -335,7 +337,7 @@ export async function injectSystemEnv(port: number, config: OcxConfig): Promise<
     // without a token — keep it in sync with this proxy's /v1/models. Best-effort.
     try {
       const { refreshGatewayModelCacheFromProxy } = await import("../claude/gateway-cache");
-      await refreshGatewayModelCacheFromProxy(port);
+      await refreshGatewayModelCacheFromProxy(port, { admissionConfig: config });
     } catch { /* best-effort */ }
 
     // Roster agent definitions (devlog 070): same launch-time sync for plain `claude`.

@@ -6,7 +6,16 @@ import {
   type OcxProviderConfig,
 } from "../types";
 
-const NEIGHBOR_AGENT_TOOL_NAMES = ["Read", "Grep", "Glob", "Bash", "LS", "apply_patch"] as const;
+// Tool names that exist only in OTHER agent harnesses (Claude Code and friends). Naming one
+// here tells a routed model not to call it unless this turn's catalog really lists it.
+//
+// `apply_patch` is deliberately absent: it is Codex's own first-class edit tool, not a
+// neighbor's. Under Codex code mode it is reachable as a nested `tools.apply_patch(...)`
+// helper declared inside the `exec` tool description rather than as a top-level wire tool,
+// so a flat catalog check cannot see it and forbidding it pushed routed models into
+// `python3` heredoc edits. The sibling list in `./cursor/tool-definitions.ts` never
+// included it either.
+const NEIGHBOR_AGENT_TOOL_NAMES = ["Read", "Grep", "Glob", "Bash", "LS"] as const;
 
 function quoteNames(names: readonly string[]): string {
   return names.map(name => `\`${name}\``).join(", ");
@@ -31,17 +40,29 @@ export function shouldInjectNonOpenAIToolCatalogNudge(provider: Pick<OcxProvider
   }
 }
 
-export function buildNonOpenAIToolCatalogNudgeFromNames(wireNames: readonly string[] | undefined): string | undefined {
+export function buildNonOpenAIToolCatalogNudgeFromNames(
+  wireNames: readonly string[] | undefined,
+  toWireName: (name: string) => string = name => name,
+): string | undefined {
   const names = uniqueNames(wireNames ?? []);
   if (names.length === 0) return undefined;
 
   const advertised = new Set(names);
-  const unavailableNeighborNames = NEIGHBOR_AGENT_TOOL_NAMES.filter(name => !advertised.has(name));
+  // Compare in the catalog's own coordinate system. `advertised` holds WIRE names, so a
+  // provider that rewrites them (Claude OAuth `custom_`, Anthropic compat `cx_`) would never
+  // match a bare neighbor name and would forbid tools the turn actually advertises — the
+  // catalog would list `custom_apply_patch` while the same sentence banned `apply_patch`.
+  const unavailableNeighborNames = NEIGHBOR_AGENT_TOOL_NAMES.filter(
+    name => !advertised.has(name) && !advertised.has(toWireName(name)),
+  );
 
   return [
     "Tool contract: use the current tool catalog as ground truth.",
     `Valid tool names for this turn are exactly ${quoteNames(names)}.`,
+    "These listed names are the complete top-level tool-call surface for this turn.",
     "Call only listed names with their listed argument keys; do not invent, translate, or rename tools.",
+    "Names mentioned only in instructions, tool descriptions, argument descriptions, or nested helper APIs are not additional top-level tools.",
+    "If a listed tool exposes nested helpers such as a tools.* API, call the listed parent tool and use those helpers only inside that tool's input.",
     unavailableNeighborNames.length > 0
       ? `Do not use neighboring-agent tool names ${quoteNames(unavailableNeighborNames)} unless this turn's catalog lists those exact names.`
       : undefined,
@@ -58,5 +79,9 @@ export function buildNonOpenAIToolCatalogNudgeForTools(
   const visibleNames = tools
     ?.filter(toolChoiceToolPredicate(toolChoice))
     .map(toWireName);
-  return buildNonOpenAIToolCatalogNudgeFromNames(visibleNames);
+  // Neighbor names are bare and un-namespaced, so probe the same transform with a bare tool.
+  return buildNonOpenAIToolCatalogNudgeFromNames(
+    visibleNames,
+    name => toWireName({ name }),
+  );
 }

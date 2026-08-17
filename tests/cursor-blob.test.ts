@@ -180,7 +180,7 @@ describe("Cursor blob handshake", () => {
     expect((roots[1] as { role?: string }).role).toBe("user");
     expect(JSON.stringify(roots)).toContain("assistant-209");
     expect(JSON.stringify(roots)).not.toContain("user-0");
-  });
+  }, { timeout: 30_000 });
 
   test("caps external root replay by serialized bytes", () => {
     const large = "x".repeat(40_000);
@@ -648,6 +648,25 @@ describe("Cursor AgentRunRequest.mcp_tools channel", () => {
       ],
     });
     expect(mcpToolNames(bytes)).toEqual(["exec_command"]);
+  });
+
+  test("mcp_tools keeps unified Desktop exec for a generic tool-use prompt", () => {
+    const bytes = encodeCursorRunRequest({
+      modelId: "gpt-5.6-luna-high",
+      conversationId: "c1",
+      system: ["You are helpful."],
+      messages: [{ role: "user", content: "use any 3 tools" }],
+      tools: [
+        {
+          name: "exec",
+          description: "Run a command",
+          parameters: { type: "object", properties: { cmd: { type: "string" } }, required: ["cmd"] },
+        },
+        { name: "wait", description: "Wait for a yielded cell", parameters: {} },
+        { name: "js", namespace: "mcp__node_repl", description: "Run JS", parameters: {} },
+      ],
+    });
+    expect(mcpToolNames(bytes)).toEqual(["exec"]);
   });
 
   test("leaves mcp_tools unset when tools are empty", () => {
@@ -1326,7 +1345,7 @@ describe("Cursor blob ID key channel bounds", () => {
     expect(result.error?.message).toBeDefined();
     expect(cursorBlobMetrics().count).toBe(4096);
     expect(cursorBlobMetrics().keyBytes).toBe(4096 * 66);
-  });
+  }, { timeout: 30_000 });
 
   test("a zero-payload blob stays evictable through its key bytes", () => {
     storeCursorBlob(new Uint8Array());

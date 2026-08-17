@@ -147,12 +147,56 @@ describe("GitHub Actions hardening", () => {
     expect([...(gate?.needs ?? [])].sort())
       .toEqual(Object.keys(ci.jobs ?? {}).filter(name => name !== "ci").sort());
 
+    // The focused doctor contract config is ADDITIVE evidence. It must never
+    // replace the repository-wide strict typecheck: doing so made the aggregate
+    // CI check green while most of src/ was no longer typechecked by Actions.
+    const gatesSteps = (ci.jobs?.gates as { steps?: { name?: string; run?: string }[] })?.steps ?? [];
+    const gatesTypecheck = gatesSteps.find(step => step.name === "Typecheck")?.run ?? "";
+    const rootTypecheck = "bun x tsc --noEmit";
+    const doctorContractTypecheck =
+      "bun x tsc --noEmit -p tests/tsconfig.doctor-service-memory-contract.json";
+    expect(hasExactShellCommand(gatesTypecheck, rootTypecheck)).toBe(true);
+    expect(hasExactShellCommand(gatesTypecheck, doctorContractTypecheck)).toBe(true);
+    expect(gatesTypecheck.indexOf(rootTypecheck)).toBeLessThan(
+      gatesTypecheck.indexOf(doctorContractTypecheck),
+    );
+
+    // GUI tests mutate process globals (fetch, DOM, timers and React work).
+    // Hosted runners exposed order-dependent cross-file leaks when the 138
+    // files shared one realm. Pin isolation to the GATES job specifically — a
+    // broad workflow search would pass because macOS already uses --isolate.
+    const gatesGuiRun = gatesSteps.find(step => step.name === "GUI tests")?.run ?? "";
+    expect(hasExactShellCommand(gatesGuiRun, "cd gui && bun test --isolate tests")).toBe(true);
+    expect(hasExactShellCommand(gatesGuiRun, "cd gui && bun test tests")).toBe(false);
+
     // macOS is the unsharded control for every CI-relevant change. It may skip
     // only when the shared path filter says the entire expensive suite is out of
     // scope (for example a docs-site-only PR).
     const macosSteps = (ci.jobs?.["platform-macos"] as { steps?: { run?: string }[] })?.steps ?? [];
-    expect(macosSteps.some(step => step.run?.includes("bun test --isolate tests"))).toBe(true);
+    // The 60s per-test ceiling is part of the pinned shape: dropping it silently
+    // restores the timing-flake class this lane kept surfacing.
+    expect(macosSteps.some(step => step.run?.includes("bun test --isolate --timeout 60000 tests"))).toBe(true);
     expect(macosSteps.some(step => step.run?.includes("--shard"))).toBe(false);
+
+    // The macOS leg retries ONLY a Bun runtime crash, and only once. Bun 1.3.14
+    // segfaults reclaiming a Worker at an `--isolate` file boundary with
+    // balanced worker counts, which is a runtime defect rather than a test
+    // result; the Linux shards already absorb that class in
+    // `scripts/ci/run-bun-test-batches.sh`. Two ways to break this silently:
+    // drop the crash-signature guard so an assertion failure gets retried into
+    // green, or let the retry loop swallow a repeated crash. Pin both.
+    const macosTestRun = macosSteps.find(step => step.run?.includes("bun test --isolate --timeout 60000 tests"))?.run ?? "";
+    // Actions invokes multiline `run:` blocks with `bash -e`. The retry loop
+    // must disable errexit before the crash-prone command or exit 133 aborts
+    // the step before PIPESTATUS can be inspected and the retry can run.
+    expect(hasExactShellCommand(macosTestRun, "set +e")).toBe(true);
+    expect(macosTestRun).toContain("Segmentation fault at address");
+    expect(macosTestRun).toContain("oh no: Bun has crashed");
+    expect(macosTestRun).toContain("assertion failures are not retried");
+    expect(macosTestRun).toContain("failing after one retry");
+    // `for attempt in 1 2` — one retry, never an unbounded loop.
+    expect(macosTestRun).toContain("for attempt in 1 2");
+    expect(macosTestRun).not.toContain("while true");
     expect((ci.jobs?.["platform-macos"] as { needs?: string; if?: string })?.needs).toBe("changes");
     expect((ci.jobs?.["platform-macos"] as { if?: string })?.if)
       .toBe("github.event_name != 'pull_request' || needs.changes.outputs.ci == 'true'");
@@ -515,17 +559,36 @@ describe("GitHub Actions hardening", () => {
     const workflow = await readText(".github/workflows/release.yml");
     const release = Bun.YAML.parse(workflow) as {
       permissions?: Record<string, string>;
-      jobs?: { publish?: { "runs-on"?: string } };
+      jobs?: {
+        "validate-dispatch"?: {
+          "runs-on"?: string;
+          permissions?: Record<string, string>;
+        };
+        publish?: {
+          "runs-on"?: string;
+          needs?: string;
+          permissions?: Record<string, string>;
+        };
+      };
     };
-
-    // Least privilege + never cancel a publish mid-flight.
-    expect(release.permissions).toEqual({
+    
+    // Keep the workflow unprivileged by default. Dispatch validation gets only
+    // read access; write + OIDC permissions exist only on the gated publish job.
+    expect(release.permissions).toEqual({});
+    
+    expect(release.jobs?.["validate-dispatch"]?.["runs-on"]).toBe("ubuntu-latest");
+    expect(release.jobs?.["validate-dispatch"]?.permissions).toEqual({
+      contents: "read",
+    });
+    
+    expect(release.jobs?.publish?.needs).toBe("validate-dispatch");
+    expect(release.jobs?.publish?.["runs-on"]).toBe("ubuntu-latest");
+    expect(release.jobs?.publish?.permissions).toEqual({
       contents: "write",
       actions: "read",
       "pull-requests": "read",
       "id-token": "write",
     });
-    expect(release.jobs?.publish?.["runs-on"]).toBe("ubuntu-latest");
     expect(workflow).toContain("actions: read");
     expect(workflow).toContain("pull-requests: read");
     expect(workflow).toContain("id-token: write");
@@ -556,11 +619,23 @@ describe("GitHub Actions hardening", () => {
     expect(ciLookup).toContain('--branch "${GITHUB_REF#refs/heads/}"');
     expect(ciLookup).toContain('--commit "$GITHUB_SHA"');
     expect(ciLookup).toContain("--event push");
-    expect(ciLookup).toContain("--status success");
-    expect(ciLookup).toContain("--json url");
-    expect(ciLookup).toContain("--jq '.[0].url // \"\"'");
+    expect(ciLookup).not.toContain("--status success");
+    expect(ciLookup).toContain("--json conclusion,url");
+    expect(ciLookup).toContain("select(.conclusion == \"success\")");
+    expect(ciLookup).toContain("[0].url // \"\"");
     expect(ciLookup).not.toContain("--arg");
     expect(ciLookup).not.toContain("$branch");
+
+    const serviceLookup = workflow
+      .split('service_url="$(')[1]?.split('\n            )"')[0];
+    expect(serviceLookup).toBeDefined();
+    expect(serviceLookup).toContain("--workflow service-lifecycle.yml");
+    expect(serviceLookup).toContain('--commit "$GITHUB_SHA"');
+    expect(serviceLookup).not.toContain("--status success");
+    expect(serviceLookup).toContain("--json conclusion,headSha,url,workflowName");
+    expect(serviceLookup).toContain("select(.conclusion == \"success\")");
+    expect(serviceLookup).toContain("[0].url // \"\"");
+    expect(serviceLookup).not.toContain("--arg");
 
     // Dry-run first by default; tokenless trusted publishing only.
     expect(workflow).toMatch(/dry-run:[\s\S]*?default: true/);
@@ -624,89 +699,56 @@ describe("GitHub Actions hardening", () => {
     expect(workflow).toContain("main releases must use a stable semver version");
     expect(workflow).toContain("preview releases must use a preview prerelease version");
 
-    // Release notes must be OpenAI-Codex-style: PR categories with grouped summary
-    // bullets plus a full PR changelog (no raw commit dump). Preflight forbids an
-    // existing release, so only create (not edit) is wired. Stable releases also
-    // carry matching preview notes.
-    expect(workflow).toContain("releases/generate-notes");
-    expect(workflow).not.toContain("git log --pretty=format");
-    expect(workflow).toContain('previous_tag_name=${notes_range_start}');
-    expect(workflow).toContain("skipping generate-notes (minimal notes)");
-    expect(workflow).toContain("bun scripts/release-notes.ts strip-carried");
-    expect(workflow).toContain("bun scripts/release-notes.ts render");
-    expect(workflow).not.toContain("bun scripts/release-notes.ts assemble");
-    expect(workflow).not.toContain("--commits");
-    expect(workflow).not.toContain("commits_file");
-    expect(workflow).toContain("bun scripts/release-notes.ts matching-preview-tags");
-    expect(workflow).toContain("bun scripts/release-notes.ts previous-release-tag");
-    expect(workflow).toContain("bun scripts/release-notes.ts has-meaningful");
-    expect(workflow).toContain("bun scripts/release-notes.ts join-carried");
-    expect(workflow).toContain("bun scripts/release-notes.ts credit-takeovers");
-    expect(workflow).toContain('if [ -s "$carried_file" ]; then');
-    expect(workflow).toContain('if [ -s "$delta_file" ]; then');
-    // Preview notes must baseline any prior release (stable or preview), not preview-only.
-    expect(workflow).toContain('bun scripts/release-notes.ts previous-release-tag "$RELEASE_VERSION"');
-    expect(workflow).not.toMatch(
-      /RELEASE_VERSION" == \*-preview\.\*[\s\S]{0,200}grep -- '-preview\\.'/,
-    );
-    expect(workflow).toContain("releases/tags/");
-    expect(workflow).toContain('gh api "repos/${GITHUB_REPOSITORY}" --jq \'.full_name\'');
-    expect(workflow).toContain("git merge-base --is-ancestor");
-    expect(workflow).toContain("operational error, not a missing release");
-    expect(workflow).toContain("not an ancestor");
-    expect(workflow).toContain("newest_carried_preview_tag");
-    expect(workflow).not.toMatch(/newest_preview_tag="\$preview_carry_tag"/);
-    expect(workflow).toContain('--carried "$carried_file"');
-    expect(workflow).toContain('--delta "$delta_file"');
-    expect(workflow).toContain('git tag --list "v${RELEASE_VERSION}-preview.*"');
-    expect(workflow).toContain("Carrying preview release notes from");
-    // Every subcommand the workflow invokes must be dispatched by the CLI.
-    const releaseNotesHelper = await readText("scripts/release-notes.ts");
-    const invoked = [...workflow.matchAll(/bun scripts\/release-notes\.ts ([a-z-]+)/g)]
-      .map(m => m[1]!);
-    expect(invoked.length).toBeGreaterThan(0);
-    for (const cmd of new Set(invoked)) {
-      expect(releaseNotesHelper).toContain(`"${cmd}"`);
-    }
+    // Release notes are built and coverage-validated before npm publish. The
+    // builder owns Git-history/PR coverage; the workflow only wires the validated
+    // artifact into the release. Stable/preview range semantics are unit-tested in
+    // build-release-changelog.test.ts rather than duplicated as YAML string pins.
+    const notesBuildIndex = workflow.indexOf("- name: Build and validate release changelog");
+    const publishIndex = workflow.indexOf("- name: Publish (or dry-run)");
+    expect(notesBuildIndex).toBeGreaterThan(-1);
+    expect(publishIndex).toBeGreaterThan(notesBuildIndex);
+    expect(workflow).toContain("bun scripts/build-release-changelog.ts");
+    expect(workflow).toContain('--version "$RELEASE_VERSION"');
+    expect(workflow).toContain('--dist-tag "$NPM_DIST_TAG"');
+    expect(workflow).toContain('--repository "$GITHUB_REPOSITORY"');
+    expect(workflow).toContain('--target "$GITHUB_SHA"');
+    expect(workflow).toContain('--out "$notes_file"');
+    expect(workflow).toContain('test -s "$notes_file"');
+    expect(workflow).not.toContain("bun scripts/release-notes.ts matching-preview-tags");
+    expect(workflow).not.toContain("newest_carried_preview_tag");
+    expect(workflow).not.toContain("carried_file");
+    expect(workflow).not.toContain("delta_file");
+    expect(workflow).not.toContain("notes_range_start");
+
+    const releaseNotesBuilder = await readText("scripts/build-release-changelog.ts");
+    expect(releaseNotesBuilder).toContain("releases/generate-notes");
+    expect(releaseNotesBuilder).toContain('"git",');
+    expect(releaseNotesBuilder).toContain('"log",');
+    expect(releaseNotesBuilder).toContain("selectReleaseBaseline");
+    expect(releaseNotesBuilder).toContain("skip-changelog");
+    expect(releaseNotesBuilder).toContain("release changelog failed coverage validation");
+
     expect(workflow).toMatch(/gh release create[\s\S]*?--notes-file "\$notes_file"/);
     expect(workflow).not.toContain("gh release edit");
     expect(workflow).not.toContain("--generate-notes");
-    // Notes must be assembled before tagging so a notes API failure does not leave
-    // a remote tag that blocks release retries at preflight.
-    const createStep = workflow.split("- name: Create GitHub release")[1]!.split(/\n {6}- name:/)[0]!;
-    // Preview carry lookup must use tag-specific API status, not `gh release view` stderr prose.
-    expect(createStep).toContain("releases/tags/");
-    expect(createStep).not.toContain("gh release view");
-    // Fail closed: no soft-skip in any spelling around gh api calls in this step.
-    for (const line of createStep.split("\n").filter(l => l.includes("gh api"))) {
-      expect(line).not.toMatch(/\|\|\s*(true|echo|:)/);
-    }
-    expect(createStep).not.toContain("set +e\n            pr_notes");
-    expect(createStep.indexOf("gh api")).toBeGreaterThan(-1);
-    expect(createStep.indexOf('git tag "$release_tag"')).toBeGreaterThan(-1);
-    expect(createStep.indexOf("gh api")).toBeLessThan(createStep.indexOf('git tag "$release_tag"'));
-    // The notes baseline must read the FULL tag set, not `--merged HEAD`: stable
-    // tags live on main's lineage, which the preview branch does not carry, and a
-    // trailing same-core preview must not hide the stable from the range
-    // (v2.9.1-preview → v2.10.0-preview is wrong; the range must start at v2.9.1).
-    expect(createStep).toContain("git tag --list 'v[0-9]*' |");
-    expect(createStep).not.toContain("--merged HEAD");
+
+    const createStep = workflow
+      .split("- name: Create GitHub release")[1]!
+      .split(/\n {6}- name:/)[0]!;
+    expect(createStep).toContain('notes_file="$GITHUB_WORKSPACE/.release-notes.md"');
+    expect(createStep).toContain('test -s "$notes_file"');
+    expect(createStep).not.toContain("generate-notes");
+    expect(createStep).not.toContain("gh api");
+    expect(createStep.indexOf('test -s "$notes_file"')).toBeLessThan(
+      createStep.indexOf('git tag "$release_tag"'),
+    );
+
     // The merged-only restriction remains on the service gate, whose
     // changed-files comparison is deliberately lineage-relative.
     const ciGateStep = workflow
       .split("- name: Require successful Cross-platform CI for this commit")[1]!
       .split(/\n {6}- name:/)[0]!;
     expect(ciGateStep).toContain("--merged HEAD");
-    // First-channel releases must not call generate-notes without an explicit baseline
-    // (GitHub would otherwise pick the newest repo tag, possibly from the other channel).
-    // Scope to the single if-block that owns generate-notes; createStep has two
-    // `[ -n "$notes_range_start" ]` blocks, so an unanchored [\s\S]* can straddle them.
-    const notesBlock = createStep
-      .split(/if \[ -n "\$notes_range_start" \]; then/)[1]!
-      .split(/\n {10}if \[/)[0]!;
-    expect(notesBlock).toContain("previous_tag_name=${notes_range_start}");
-    expect(notesBlock).toContain("skipping generate-notes");
-    expect(notesBlock).toMatch(/\n {10}else\n/);
   });
 
   /**
@@ -933,8 +975,7 @@ describe("GitHub Actions hardening", () => {
     expect(Object.keys(workflow.on?.pull_request_target ?? {})).toEqual(["types"]);
     expect(Object.prototype.hasOwnProperty.call(workflow.on ?? {}, "status")).toBe(true);
 
-    // Exactly the scopes this gate needs. `checks: read` covers the live
-    // current-head CI evidence lookup. `pull-requests: write` covers title and
+    // Exactly the scopes this gate needs. `pull-requests: write` covers title and
     // comment updates. `contents: write` is required for the draft GraphQL
     // mutations with GITHUB_TOKEN (#626: "Resource not accessible by integration"
     // when contents was unset). Asserting the whole object pins both presence
@@ -994,7 +1035,6 @@ describe("GitHub Actions hardening", () => {
     ]);
     expect(job?.["runs-on"]).toBe("ubuntu-latest");
     expect(job?.permissions).toEqual({
-      checks: "read",
       contents: "write",
       "pull-requests": "write",
     });
@@ -1220,8 +1260,6 @@ describe("GitHub Actions hardening", () => {
           name !== "github.rest.repos.compareCommitsWithBasehead" &&
           name !== "github.rest.repos.listPullRequestsAssociatedWithCommit" &&
           name !== "github.rest.issues.listEvents" &&
-          // The claim check reads check-runs; it must never count as a write.
-          name !== "github.rest.checks.listForRef" &&
           // Hygiene reassessment reads the changed-file list; not a write.
           name !== "github.rest.pulls.listFiles",
       );
@@ -1258,6 +1296,29 @@ describe("GitHub Actions hardening", () => {
     async function run(options: Parameters<typeof runEnforcePrTarget>[1]) {
       const { script } = await readEnforcePrTarget();
       return runEnforcePrTarget(script, options);
+    }
+
+    /**
+     * Run the read-only `resolve-pr` job's SHA-to-PR resolver in the same
+     * harness scope the write gate gets. The resolver is a separate inline
+     * script from `enforce-target`; compiling it on its own lets a test pin
+     * what `pull-number` it publishes for a given associated-PR / open-PR
+     * state. This is the exact surface where the stale-commit-index bug
+     * (PR #1441) lived, so the head-SHA fallback is asserted here.
+     */
+    async function runResolver(options: Parameters<typeof runEnforcePrTarget>[1]) {
+      const text = await readText(".github/workflows/enforce-pr-target.yml");
+      const workflow = Bun.YAML.parse(text) as {
+        jobs?: Record<string, { steps?: Array<{ name?: string; with?: { script?: string } }> }>;
+      };
+      const step = workflow.jobs?.["resolve-pr"]?.steps?.find(
+        s => s.name === "Resolve trusted gate event to PR",
+      );
+      const resolverScript = step?.with?.script;
+      if (typeof resolverScript !== "string") {
+        throw new Error("resolve-pr step has no inline script");
+      }
+      return runEnforcePrTarget(stripComments(resolverScript), options);
     }
 
     /**
@@ -1465,7 +1526,6 @@ describe("GitHub Actions hardening", () => {
       // No prior enforcer history: the checklist completion alone lifts the
       // draft and notifies the maintainers from MAINTAINERS.md.
       expect(methodsOf(result)).toEqual(readsAllowedBase([
-        "checks.listForRef",
         "graphql",
         "pulls.listReviews",
         "issues.addLabels",
@@ -1567,7 +1627,6 @@ describe("GitHub Actions hardening", () => {
       });
 
       expect(methodsOf(result)).toEqual(readsAllowedBase([
-        "checks.listForRef",
         "graphql",
         "pulls.listReviews",
         "issues.addLabels",
@@ -1660,7 +1719,6 @@ describe("GitHub Actions hardening", () => {
       });
 
       expect(methodsOf(result)).toEqual(readsAllowedBase([
-        "checks.listForRef",
         "graphql",
         "pulls.listReviews",
         "issues.addLabels",
@@ -1797,14 +1855,14 @@ describe("GitHub Actions hardening", () => {
       expect(result.warnings.some(w => w.startsWith("setFailed:"))).toBe(false);
     });
 
-    test("a complete checklist with red CI unchecks the CI box and re-drafts", async () => {
-      // The author ticked every box, but the head's `ci` check is red. The
-      // gate checks the CI claim itself and unticked the CI box instead of
-      // letting a false attestation lift the draft.
+    test("red GitHub CI does not untick the local-CI attestation", async () => {
+      // Fork contributors attest local green; repository CI is
+      // maintainer-started. A red or missing GitHub `ci` check must not
+      // disprove the local box or block ready-for-review.
       const result = await run({
         pr: {
           base: { ref: "dev" },
-          draft: false,
+          draft: true,
           body: readinessChecklistBody(4),
         },
         maintainersFile: MAINTAINERS_FIXTURE,
@@ -1812,40 +1870,28 @@ describe("GitHub Actions hardening", () => {
       });
 
       expect(methodsOf(result)).toEqual(readsAllowedBase([
-        "checks.listForRef",
         "graphql",
         "pulls.listReviews",
-        "pulls.get",
-        "pulls.update",
-        "issues.createComment",
+        "issues.addLabels",
         "graphql",
+        "issues.createComment",
       ]));
-      const [bodyUpdate] = callsTo(result, "pulls.update") as [{ body: string }];
-      // Only the CI box is unticked; the other three stay checked.
-      expect(bodyUpdate.body).toContain("- [ ] All CI tests are green on my local testing.");
-      expect(bodyUpdate.body).toContain("- [x] I pushed my PR to the latest dev commit.");
-      expect(bodyUpdate.body).toContain("- [x] My PR is ready for review.");
-      const drafts = callsTo(result, "graphql") as [{ query: string }];
-      expect(drafts).toHaveLength(2);
+      expect(callsTo(result, "checks.listForRef")).toEqual([]);
+      expect(callsTo(result, "pulls.update")).toEqual([]);
+      const drafts = callsTo(result, "graphql") as [{ query: string }, { query: string }];
       expect(drafts[0]!.query).toContain("reviewThreads");
-      expect(drafts[1]!.query).toContain("convertPullRequestToDraft");
-      expect(drafts[1]!.query).not.toContain("markPullRequestReadyForReview");
-      const readinessBody = lastReadinessCommentBody(result);
-      expect(readinessBody).toContain(
-        "GitHub CI is not green on the current head `3f1c0de`; the **CI green** box has been unticked.",
-      );
-      expect(readinessBody).toContain("**3/4** boxes ticked");
-      expect(readinessBody).toContain('"completedAtHeadSha":null');
-      expect(readinessBody).toContain('"maintainersPinged":false');
+      expect(drafts[1]!.query).toContain("markPullRequestReadyForReview");
+      expect(lastReadinessCommentBody(result)).toContain("**4/4** boxes ticked");
       expect(result.warnings.some(w => w.startsWith("setFailed:"))).toBe(false);
     });
 
     test("a revalidation reset preserves bot ownership of the title prefix", async () => {
       // A wrong-base PR that the bot prefixed and later had retargeted to dev
-      // with a complete checklist hits a revalidation failure (red CI unchecks
-      // a box). The reset must preserve `titlePrefixedByBot` long enough for
-      // the mustDraft strip to fire — otherwise the stale `[WRONG BRANCH] `
-      // prefix stays on the title forever because ownership was forgotten.
+      // with a complete checklist hits a revalidation failure (stale vs `dev`
+      // unchecks a box). The reset must preserve `titlePrefixedByBot` long
+      // enough for the mustDraft strip to fire — otherwise the stale
+      // `[WRONG BRANCH] ` prefix stays on the title forever because ownership
+      // was forgotten.
       const result = await run({
         pr: {
           base: { ref: "dev" },
@@ -1854,7 +1900,9 @@ describe("GitHub Actions hardening", () => {
           body: readinessChecklistBody(4),
         },
         maintainersFile: MAINTAINERS_FIXTURE,
-        checkRuns: [{ name: "ci", status: "completed", conclusion: "failure" }],
+        compareByBasehead: {
+          "dev...3f1c0de0a6a4d0a3f9a1b2c3d4e5f60718293a4b": { ahead_by: 0, behind_by: 11 },
+        },
         comments: [botComment({
           version: 1,
           active: true,
@@ -1870,7 +1918,7 @@ describe("GitHub Actions hardening", () => {
       const readinessBody = lastReadinessCommentBody(result);
       expect(readinessBody).toContain('"titlePrefixedByBot":false');
       expect(readinessBody).toContain('"autoDraftedByBot":true');
-      expect(readinessBody).toContain("GitHub CI is not green");
+      expect(readinessBody).toContain("more than 10 commits behind `dev`");
     });
 
     test("a complete checklist more than 10 commits behind dev unchecks the latest-dev box and re-drafts", async () => {
@@ -1887,7 +1935,6 @@ describe("GitHub Actions hardening", () => {
       });
 
       expect(methodsOf(result)).toEqual(readsAllowedBase([
-        "checks.listForRef",
         "graphql",
         "pulls.listReviews",
         "pulls.get",
@@ -1896,7 +1943,7 @@ describe("GitHub Actions hardening", () => {
         "graphql",
       ]));
       const [bodyUpdate] = callsTo(result, "pulls.update") as [{ body: string }];
-      // Only the latest-dev box is unticked; CI stays checked.
+      // Only the latest-dev box is unticked; local CI stays checked.
       expect(bodyUpdate.body).toContain("- [x] All CI tests are green on my local testing.");
       expect(bodyUpdate.body).toContain("- [ ] I pushed my PR to the latest dev commit.");
       expect(bodyUpdate.body).toContain("- [x] My PR is ready for review.");
@@ -1909,71 +1956,6 @@ describe("GitHub Actions hardening", () => {
         "The PR is more than 10 commits behind `dev`; the **latest dev** box has been unticked.",
       );
       expect(readinessBody).toContain("**3/4** boxes ticked");
-      expect(result.warnings.some(w => w.startsWith("setFailed:"))).toBe(false);
-    });
-
-    test("a complete checklist with red CI and a stale dev base unchecks both boxes", async () => {
-      const result = await run({
-        pr: {
-          base: { ref: "dev" },
-          draft: false,
-          body: readinessChecklistBody(4),
-        },
-        maintainersFile: MAINTAINERS_FIXTURE,
-        checkRuns: [{ name: "ci", status: "completed", conclusion: "failure" }],
-        compareByBasehead: {
-          "dev...3f1c0de0a6a4d0a3f9a1b2c3d4e5f60718293a4b": { ahead_by: 0, behind_by: 42 },
-        },
-      });
-
-      expect(methodsOf(result)).toEqual(readsAllowedBase([
-        "checks.listForRef",
-        "graphql",
-        "pulls.listReviews",
-        "pulls.get",
-        "pulls.update",
-        "issues.createComment",
-        "graphql",
-      ]));
-      const [bodyUpdate] = callsTo(result, "pulls.update") as [{ body: string }];
-      expect(bodyUpdate.body).toContain("- [ ] All CI tests are green on my local testing.");
-      expect(bodyUpdate.body).toContain("- [ ] I pushed my PR to the latest dev commit.");
-      expect(bodyUpdate.body).toContain("- [x] My PR is ready for review.");
-      const readinessBody = lastReadinessCommentBody(result);
-      expect(readinessBody).toContain("GitHub CI is not green on the current head");
-      expect(readinessBody).toContain("more than 10 commits behind `dev`");
-      expect(readinessBody).toContain("**2/4** boxes ticked");
-      expect(result.warnings.some(w => w.startsWith("setFailed:"))).toBe(false);
-    });
-
-    test("a checks lookup failure fails closed for the CI claim", async () => {
-      // Cannot verify CI: the claim is unverifiable, so the box is unticked
-      // and the PR stays a draft rather than riding on missing evidence.
-      const result = await run({
-        pr: {
-          base: { ref: "dev" },
-          draft: false,
-          body: readinessChecklistBody(4),
-        },
-        maintainersFile: MAINTAINERS_FIXTURE,
-        failOn: ["checks.listForRef"],
-      });
-
-      expect(methodsOf(result)).toEqual(readsAllowedBase([
-        "checks.listForRef",
-        "graphql",
-        "pulls.listReviews",
-        "pulls.get",
-        "pulls.update",
-        "issues.createComment",
-        "graphql",
-      ]));
-      const [bodyUpdate] = callsTo(result, "pulls.update") as [{ body: string }];
-      expect(bodyUpdate.body).toContain("- [ ] All CI tests are green on my local testing.");
-      expect(bodyUpdate.body).toContain("- [x] I pushed my PR to the latest dev commit.");
-      const readinessBody = lastReadinessCommentBody(result);
-      expect(readinessBody).toContain("GitHub CI is not green on the current head");
-      expect(result.warnings.some(w => w.includes("Could not list checks for the readiness claim check"))).toBe(true);
       expect(result.warnings.some(w => w.startsWith("setFailed:"))).toBe(false);
     });
 
@@ -1991,7 +1973,6 @@ describe("GitHub Actions hardening", () => {
       });
 
       expect(methodsOf(result)).toEqual(readsAllowedBase([
-        "checks.listForRef",
         "graphql",
         "pulls.listReviews",
         "issues.addLabels",
@@ -2005,178 +1986,33 @@ describe("GitHub Actions hardening", () => {
       expect(drafts[1]!.query).toContain("markPullRequestReadyForReview");
     });
 
-    test("a head with no ci check fails closed for the CI claim", async () => {
-      // No CI run means the claim has no positive evidence, so the box is
-      // unticked and the PR stays in draft.
-      const result = await run({
-        pr: {
-          base: { ref: "dev" },
-          draft: true,
-          body: readinessChecklistBody(4),
-        },
-        maintainersFile: MAINTAINERS_FIXTURE,
-        checkRuns: [],
-      });
-
-      expect(methodsOf(result)).toEqual(readsAllowedBase([
-        "checks.listForRef",
-        "graphql",
-        "pulls.listReviews",
-        "pulls.get",
-        "pulls.update",
-        "issues.createComment",
-      ]));
-      const [bodyUpdate] = callsTo(result, "pulls.update") as [{ body: string }];
-      expect(bodyUpdate.body).toContain("- [ ] All CI tests are green on my local testing.");
-      const drafts = callsTo(result, "graphql") as [{ query: string }];
-      expect(drafts).toHaveLength(1);
-      expect(drafts[0]!.query).toContain("reviewThreads");
-      expect(lastReadinessCommentBody(result)).toContain(
-        "GitHub CI is not green on the current head",
-      );
-    });
-
-    test("a pending ci check cannot attest green", async () => {
-      const result = await run({
-        pr: {
-          base: { ref: "dev" },
-          draft: false,
-          body: readinessChecklistBody(4),
-        },
-        maintainersFile: MAINTAINERS_FIXTURE,
-        checkRuns: [{ name: "ci", status: "in_progress", conclusion: null }],
-      });
-
-      expect(methodsOf(result)).toEqual(readsAllowedBase([
-        "checks.listForRef",
-        "graphql",
-        "pulls.listReviews",
-        "pulls.get",
-        "pulls.update",
-        "issues.createComment",
-        "graphql",
-      ]));
-      const [bodyUpdate] = callsTo(result, "pulls.update") as [{ body: string }];
-      expect(bodyUpdate.body).toContain("- [ ] All CI tests are green on my local testing.");
-      const readinessBody = lastReadinessCommentBody(result);
-      expect(readinessBody).toContain("GitHub CI is not green on the current head");
-    });
-
-    test("a complete filtered trusted ci response attests green", async () => {
-      const result = await run({
-        pr: {
-          base: { ref: "dev" },
-          draft: true,
-          body: readinessChecklistBody(4),
-        },
-        maintainersFile: MAINTAINERS_FIXTURE,
-        checkRuns: [{ name: "ci", status: "completed", conclusion: "success" }],
-        checkRunTotalCount: 1,
-      });
-
-      expect(methodsOf(result)).toEqual(readsAllowedBase([
-        "checks.listForRef",
-        "graphql",
-        "pulls.listReviews",
-        "issues.addLabels",
-        "graphql",
-        "issues.createComment",
-      ]));
-      const checkCalls = callsTo(result, "checks.listForRef") as Array<{
-        app_id?: number;
-        check_name?: string;
-        filter?: string;
-      }>;
-      for (const call of checkCalls) {
-        expect(call.app_id).toBe(15368);
-        expect(call.check_name).toBe("ci");
-        expect(call.filter).toBe("latest");
-      }
-      expect(callsTo(result, "pulls.update")).toEqual([]);
-      const drafts = callsTo(result, "graphql") as [{ query: string }, { query: string }];
-      expect(drafts[1]!.query).toContain("markPullRequestReadyForReview");
-      expect(lastReadinessCommentBody(result)).toContain("**4/4** boxes ticked");
-    });
-
-    test("a truncated filtered ci response cannot attest green", async () => {
-      const result = await run({
-        pr: {
-          base: { ref: "dev" },
-          draft: false,
-          body: readinessChecklistBody(4),
-        },
-        maintainersFile: MAINTAINERS_FIXTURE,
-        checkRuns: [{ name: "ci", status: "completed", conclusion: "success" }],
-        checkRunTotalCount: 2,
-      });
-
-      const [bodyUpdate] = callsTo(result, "pulls.update") as [{ body: string }];
-      expect(bodyUpdate.body).toContain("- [ ] All CI tests are green on my local testing.");
-      expect(lastReadinessCommentBody(result)).toContain(
-        "GitHub CI is not green on the current head",
-      );
-    });
-
-    test("a foreign app check named ci cannot attest green", async () => {
-      const result = await run({
-        pr: {
-          base: { ref: "dev" },
-          draft: false,
-          body: readinessChecklistBody(4),
-        },
-        maintainersFile: MAINTAINERS_FIXTURE,
-        checkRuns: [{
+    test("missing or pending GitHub CI does not block a complete local attestation", async () => {
+      for (const checkRuns of [
+        [],
+        [{ name: "ci", status: "in_progress", conclusion: null }],
+        [{
           name: "ci",
           status: "completed",
           conclusion: "success",
           app: { id: 999999 },
         }],
-      });
-
-      const [bodyUpdate] = callsTo(result, "pulls.update") as [{ body: string }];
-      expect(bodyUpdate.body).toContain("- [ ] All CI tests are green on my local testing.");
-      expect(lastReadinessCommentBody(result)).toContain("GitHub CI is not green on the current head");
-    });
-
-    test("conflicting trusted ci checks fail closed regardless of ordering", async () => {
-      const green = { name: "ci", status: "completed", conclusion: "success" };
-      const pending = { name: "ci", status: "in_progress", conclusion: null };
-      const failed = { name: "ci", status: "completed", conclusion: "failure" };
-
-      for (const checkRuns of [[green, pending], [pending, green], [green, failed], [failed, green]]) {
+      ]) {
         const result = await run({
           pr: {
             base: { ref: "dev" },
-            draft: false,
+            draft: true,
             body: readinessChecklistBody(4),
           },
           maintainersFile: MAINTAINERS_FIXTURE,
           checkRuns,
         });
 
-        const [bodyUpdate] = callsTo(result, "pulls.update") as [{ body: string }];
-        expect(bodyUpdate.body).toContain("- [ ] All CI tests are green on my local testing.");
-        expect(lastReadinessCommentBody(result)).toContain("GitHub CI is not green on the current head");
+        expect(callsTo(result, "checks.listForRef")).toEqual([]);
+        expect(callsTo(result, "pulls.update")).toEqual([]);
+        const drafts = callsTo(result, "graphql") as [{ query: string }, { query: string }];
+        expect(drafts[1]!.query).toContain("markPullRequestReadyForReview");
+        expect(lastReadinessCommentBody(result)).toContain("**4/4** boxes ticked");
       }
-    });
-
-    test("multiple latest trusted green ci checks are consistent evidence", async () => {
-      const result = await run({
-        pr: {
-          base: { ref: "dev" },
-          draft: true,
-          body: readinessChecklistBody(4),
-        },
-        maintainersFile: MAINTAINERS_FIXTURE,
-        checkRuns: [
-          { name: "ci", status: "completed", conclusion: "success" },
-          { name: "ci", status: "completed", conclusion: "success" },
-        ],
-      });
-
-      expect(callsTo(result, "pulls.update")).toEqual([]);
-      const drafts = callsTo(result, "graphql") as [{ query: string }, { query: string }];
-      expect(drafts[1]!.query).toContain("markPullRequestReadyForReview");
     });
 
     test("an unresolved Codex thread unchecks the findings box and re-drafts", async () => {
@@ -2193,7 +2029,6 @@ describe("GitHub Actions hardening", () => {
       });
 
       expect(methodsOf(result)).toEqual(readsAllowedBase([
-        "checks.listForRef",
         "graphql",
         "pulls.listReviews",
         "pulls.get",
@@ -2257,7 +2092,6 @@ describe("GitHub Actions hardening", () => {
       });
 
       expect(methodsOf(result)).toEqual(readsAllowedBase([
-        "checks.listForRef",
         "graphql",
         "pulls.listReviews",
         "issues.addLabels",
@@ -2299,7 +2133,6 @@ describe("GitHub Actions hardening", () => {
       });
 
       expect(methodsOf(result)).toEqual(readsAllowedBase([
-        "checks.listForRef",
         "graphql",
         "pulls.listReviews",
         "issues.addLabels",
@@ -2363,7 +2196,6 @@ describe("GitHub Actions hardening", () => {
       });
 
       expect(methodsOf(result)).toEqual(readsAllowedBase([
-        "checks.listForRef",
         "graphql",
         "pulls.listReviews",
         "issues.addLabels",
@@ -2392,7 +2224,6 @@ describe("GitHub Actions hardening", () => {
       });
 
       expect(methodsOf(result)).toEqual(readsAllowedBase([
-        "checks.listForRef",
         "graphql",
         "pulls.listReviews",
         "issues.addLabels",
@@ -2748,7 +2579,6 @@ describe("GitHub Actions hardening", () => {
       });
 
       expect(methodsOf(result)).toEqual(readsAllowedBase([
-        "checks.listForRef",
         "graphql",
         "pulls.listReviews",
         "issues.addLabels",
@@ -3125,6 +2955,127 @@ describe("GitHub Actions hardening", () => {
       expect(methodsOf(result)).toContain("issues.listComments");
     });
 
+    test("the resolver falls back to the head SHA when the commit-PR index is empty", async () => {
+      const headSha = "6c42d17f213a632fc2def56053f0cd574b13d459";
+      const result = await runResolver({
+        pr: { base: { ref: "dev" }, number: 4242, head: { sha: headSha } },
+        eventName: "status",
+        statusSha: headSha,
+        // GitHub's commit-to-PR index can lag a fresh push (seen on #1441):
+        // the association endpoint returns no PR for a genuine current head.
+        associatedPullRequests: [],
+        openPulls: [
+          { number: 4242, state: "open", head: { sha: headSha } },
+          { number: 9999, state: "open", head: { sha: "other" } },
+          { number: 100, state: "closed", head: { sha: headSha } },
+        ],
+      });
+
+      expect(result.outputs).toEqual([{ name: "pull-number", value: "4242" }]);
+      // The fallback must consult the live open-PR list exactly once.
+      expect(callsTo(result, "repos.listPullRequestsAssociatedWithCommit")).toHaveLength(1);
+      expect(callsTo(result, "pulls.list")).toHaveLength(1);
+      expect(result.logs.join(" ")).toContain("Associated-index fallback");
+      // A closed PR with the same head must not count as a candidate.
+      expect(result.logs.join(" ")).toContain("1 open PR(s) match head");
+    });
+
+    test("the resolver skips when the fallback finds no unique open head match", async () => {
+      const headSha = "6c42d17f213a632fc2def56053f0cd574b13d459";
+      const result = await runResolver({
+        pr: { base: { ref: "dev" }, number: 4242, head: { sha: headSha } },
+        eventName: "status",
+        statusSha: headSha,
+        associatedPullRequests: [],
+        // No open PR carries this head; the stale index is not a match.
+        openPulls: [
+          { number: 9999, state: "open", head: { sha: "other" } },
+        ],
+      });
+
+      expect(result.outputs).toEqual([]);
+      // The fallback must actually have run: the resolver consults the live
+      // open-PR list exactly once. Without this assertion the test would still
+      // pass if the fallback were removed (the empty association index by
+      // itself already skips), silently losing coverage of the head-SHA
+      // reconciliation path.
+      expect(callsTo(result, "pulls.list")).toHaveLength(1);
+      expect(callsTo(result, "pulls.list")[0]).toMatchObject({
+        owner: "lidge-jun",
+        repo: "opencodex",
+        state: "open",
+      });
+      expect(result.logs.join(" ")).toContain("skipping ambiguous/stale revalidation");
+    });
+
+    test("the resolver fails closed when two open PRs share the head SHA", async () => {
+      const headSha = "6c42d17f213a632fc2def56053f0cd574b13d459";
+      const result = await runResolver({
+        pr: { base: { ref: "dev" }, number: 4242, head: { sha: headSha } },
+        eventName: "status",
+        statusSha: headSha,
+        associatedPullRequests: [],
+        // Two open PRs on the same head: the live lookup is ambiguous, so the
+        // resolver must fail closed rather than guess which PR to revalidate.
+        openPulls: [
+          { number: 4242, state: "open", head: { sha: headSha } },
+          { number: 7777, state: "open", head: { sha: headSha } },
+        ],
+      });
+
+      expect(result.outputs).toEqual([]);
+      // The live fallback must actually have run before the ambiguity is
+      // detected: the resolver consults the open-PR list exactly once and
+      // weighs both same-head candidates before failing closed. Without this
+      // assertion the test would still pass if the fallback were removed (the
+      // empty association index by itself already skips), silently losing
+      // coverage of the head-SHA reconciliation path.
+      expect(callsTo(result, "pulls.list")).toHaveLength(1);
+      expect(callsTo(result, "pulls.list")[0]).toMatchObject({
+        owner: "lidge-jun",
+        repo: "opencodex",
+        state: "open",
+      });
+      expect(result.logs.join(" ")).toContain("skipping ambiguous/stale revalidation");
+    });
+
+    test("the resolver resolves via the association index when it is already fresh", async () => {
+      const headSha = "3f1c0de0a6a4d0a3f9a1b2c3d4e5f60718293a4b";
+      const result = await runResolver({
+        pr: { base: { ref: "dev" }, number: 42, head: { sha: headSha } },
+        eventName: "status",
+        statusSha: headSha,
+        associatedPullRequests: [
+          { number: 42, state: "open", head: { sha: headSha } },
+        ],
+      });
+
+      expect(result.outputs).toEqual([{ name: "pull-number", value: "42" }]);
+      // A unique index hit must not need the open-PR fallback.
+      expect(callsTo(result, "pulls.list")).toEqual([]);
+    });
+
+    test("the resolver fails closed when both resolution paths error", async () => {
+      const headSha = "6c42d17f213a632fc2def56053f0cd574b13d459";
+      const result = await runResolver({
+        pr: { base: { ref: "dev" }, number: 4242, head: { sha: headSha } },
+        eventName: "status",
+        statusSha: headSha,
+        associatedPullRequests: [],
+        failOn: [
+          "repos.listPullRequestsAssociatedWithCommit",
+          "pulls.list",
+        ],
+      });
+
+      expect(result.outputs).toEqual([]);
+      expect(result.logs.join(" ")).toContain("skipping ambiguous/stale revalidation");
+      expect(result.warnings.join(" ")).toContain(
+        "Could not list PRs associated with commit",
+      );
+      expect(result.warnings.join(" ")).toContain("Could not list open PRs");
+    });
+
     test("a non-maintainer issue_comment does not re-run the gate", async () => {
       // The `issue_comment` trigger must only re-run for maintainer comments
       // (OWNER / COLLABORATOR / MEMBER). A random comment from a contributor
@@ -3422,7 +3373,6 @@ describe("GitHub Actions hardening", () => {
       });
 
       expect(methodsOf(result)).toEqual(readsAllowedBase([
-        "checks.listForRef",
         "graphql",
         "pulls.listReviews",
         "issues.addLabels",
@@ -3480,7 +3430,6 @@ describe("GitHub Actions hardening", () => {
       });
 
       expect(methodsOf(result)).toEqual(readsAllowedBase([
-        "checks.listForRef",
         "graphql",
         "pulls.listReviews",
         "issues.addLabels",
@@ -3781,7 +3730,6 @@ describe("GitHub Actions hardening", () => {
       });
 
       expect(methodsOf(result)).toEqual(readsAllowedBase([
-        "checks.listForRef",
         "graphql",
         "pulls.listReviews",
         "issues.addLabels",
@@ -3931,7 +3879,6 @@ describe("GitHub Actions hardening", () => {
       // created comment is the readiness checklist message, which did not
       // exist on the busy PR yet.
       expect(methodsOf(result)).toEqual(readsAllowedBasePaged([
-        "checks.listForRef",
         "graphql",
         "pulls.listReviews",
         "pulls.listReviews",
@@ -4054,7 +4001,6 @@ describe("GitHub Actions hardening", () => {
 
       expect(callsTo(result, "pulls.update")).toEqual([]);
       expect(methodsOf(result)).toEqual(readsAllowedBase([
-        "checks.listForRef",
         "graphql",
         "pulls.listReviews",
         "issues.addLabels",
@@ -4147,7 +4093,6 @@ describe("GitHub Actions hardening", () => {
           comments: [botComment(active)],
         });
         expect(methodsOf(restored)).toEqual(readsAllowedBase([
-        "checks.listForRef",
         "graphql",
         "pulls.listReviews",
         "issues.addLabels",
@@ -4206,7 +4151,6 @@ describe("GitHub Actions hardening", () => {
         comments: [botComment({ version: 1, active: "true", autoDraftedByBot: 1, titlePrefixedByBot: "yes" })],
       });
       expect(methodsOf(loose)).toEqual(readsAllowedBase([
-        "checks.listForRef",
         "graphql",
         "pulls.listReviews",
         "issues.addLabels",
@@ -4231,7 +4175,6 @@ describe("GitHub Actions hardening", () => {
         comments: [botComment({ version: 1, active: true, autoDraftedByBot: null, titlePrefixedByBot: 0 })],
       });
       expect(methodsOf(falsy)).toEqual(readsAllowedBase([
-        "checks.listForRef",
         "graphql",
         "pulls.listReviews",
         "issues.addLabels",
@@ -4404,7 +4347,6 @@ describe("GitHub Actions hardening", () => {
       // The first comment's state is the one honoured: it says the bot
       // prefixed and drafted, so both are undone.
       expect(methodsOf(result)).toEqual(readsAllowedBase([
-        "checks.listForRef",
         "graphql",
         "pulls.listReviews",
         "issues.addLabels",

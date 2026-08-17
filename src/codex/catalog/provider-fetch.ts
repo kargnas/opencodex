@@ -32,6 +32,11 @@ import { modelInList } from "../../types";
 import { CODEX_REASONING_LEVELS, codexEffortRank, configuredReasoningEfforts, modelRecordValue, sanitizeCodexReasoningEfforts } from "../../reasoning-effort";
 import { getModelMetadata, getModelMetadataCaseInsensitive, listModelMetadata, resolveMetadataProvider } from "../../generated/model-metadata";
 import { enrichProviderFromRegistry, shouldCaseFoldMetadataModelId } from "../../providers/derive";
+import {
+  captureServiceTierAdapterAuthority,
+  serviceTierSupportForModel,
+  type CapturedServiceTierAdapterAuthority,
+} from "../../providers/service-tier";
 import { effectiveGoogleMode, getProviderRegistryEntry, providerMatchesRegistryTransport } from "../../providers/registry";
 import { parseAntigravityAvailableModels } from "../../providers/antigravity-models";
 import { applyProviderContextCap, providerContextCap } from "../../providers/context-cap";
@@ -69,7 +74,7 @@ import { createAdmissionGate, ResourceAdmissionError, type AdmissionMetrics } fr
 
 import { CODEX_CUSTOM_MODEL_CATALOG_KIND, JAWCODE_CATALOG_AUGMENT_PROVIDERS, catalogModelSlug, shouldExposeRoutedModel } from "./parsing";
 import type { CatalogModel } from "./parsing";
-import { disabledNativeSlugs, hasComboTargets, nativeDefaultReasoningEffort, nativeInputModalities, nativeOpenAiContextWindow, nativeOpenAiSlugs, nativeParallelToolCalls, nativeReasoningEfforts } from "./metadata";
+import { disabledNativeSlugs, hasComboTargets, isNativeOpenAiCapabilityAliasModel, nativeDefaultReasoningEffort, nativeInputModalities, nativeOpenAiContextWindow, nativeOpenAiMaxInputTokens, nativeOpenAiSlugs, nativeParallelToolCalls, nativeReasoningEfforts } from "./metadata";
 import { deriveComboCatalogModel, normalizedOpenAiApiSignature, openAiApiCollisionWarnings, replaceLastComboCatalogOmissions, warnUncataloguedComboOnce } from "./aggregation";
 import type { ComboCatalogOmission } from "./aggregation";
 import type { CatalogGatherProviderAuthEvidence } from "./filesystem-evidence";
@@ -150,6 +155,7 @@ interface CapturedProviderGather {
   readonly discovery: ResolvedProviderModelDiscovery;
   readonly policy: CatalogProviderDiscoveryPolicySnapshot;
   readonly request: CapturedModelsRequest;
+  readonly serviceTierAdapterAuthority: CapturedServiceTierAdapterAuthority;
   readonly observedAuth?: ModelsAuthResolution;
   /**
    * Configured model ids this provider must keep even when live discovery omits
@@ -207,6 +213,15 @@ interface GatherInflightEntry {
    */
   readonly providerGraphIdentity: string;
   readonly promise: Promise<GatherFlightResult>;
+}
+
+function withCanonicalOpenAiForwardAuthDefault(
+  name: string,
+  provider: OcxProviderConfig,
+): OcxProviderConfig {
+  if (name !== OPENAI_CODEX_PROVIDER_ID || provider.authMode !== undefined) return provider;
+  const candidate = { ...provider, authMode: "forward" as const };
+  return isCanonicalOpenAiForwardProvider(candidate) ? candidate : provider;
 }
 
 const gatherInflight = new Map<string, GatherInflightEntry[]>();
@@ -390,8 +405,14 @@ function captureProviderGather(
   authResolver: ModelsAuthResolver,
   retainConfiguredModelIds?: ReadonlySet<string>,
 ): CapturedProviderGather {
-  const enriched = detachedClone(configured);
+  const enriched = detachedClone(withCanonicalOpenAiForwardAuthDefault(name, configured));
   enrichProviderFromRegistry(name, enriched);
+  const registryTransportMatch = providerMatchesRegistryTransport(name, enriched);
+  const serviceTierAdapterAuthority = captureServiceTierAdapterAuthority(
+    name,
+    enriched,
+    registryTransportMatch,
+  );
   const provider = recursivelyFreeze(enriched);
   const observedAuth = authResolver.kind === "observed"
     && provider.authMode !== "forward"
@@ -405,7 +426,6 @@ function captureProviderGather(
     maxResponseBytes: resolved.maxResponseBytes,
     maxModels: resolved.maxModels,
   });
-  const registryTransportMatch = providerMatchesRegistryTransport(name, provider);
   const trustedOpenAiApi = captureTrustedOpenAiApiPolicy(name, registryTransportMatch);
   const policy = detachedFrozen({
     provider: name,
@@ -429,6 +449,7 @@ function captureProviderGather(
     discovery,
     policy,
     request,
+    serviceTierAdapterAuthority,
     ...(observedAuth ? { observedAuth: Object.freeze({ ...observedAuth }) } : {}),
     ...(retainConfiguredModelIds && retainConfiguredModelIds.size > 0
       ? { retainConfiguredModelIds }
@@ -497,6 +518,7 @@ function captureGatherFlight(
         // It is the one member of a provider row that is legitimately a function,
         // so it is dropped here rather than allowed to break every encode.
         provider: omitProviderTransportExecutor(provider.provider),
+        serviceTierAdapterAuthority: provider.serviceTierAdapterAuthority,
         // Combo retention is capture-time state, not a provider-row field. Two
         // gathers that share providers but differ in combo targets must not join.
         retainConfiguredModelIds: [...(provider.retainConfiguredModelIds ?? [])].sort(),
@@ -552,6 +574,7 @@ function providerCatalogFingerprint(name: string, prov: OcxProviderConfig): Reco
     defRe: prov.modelDefaultReasoningEfforts ?? null,
     rsSum: prov.modelSupportsReasoningSummaries ?? null,
     rsDel: prov.modelReasoningSummaryDelivery ?? null,
+    serviceTier: prov.modelSupportsServiceTier ?? null,
     noVis: [...(prov.noVisionModels ?? [])].sort(),
     ptc: prov.parallelToolCalls ?? null,
     gMode: prov.googleMode ?? null,
@@ -623,8 +646,10 @@ export function applyProviderConfigHints(name: string, prov: OcxProviderConfig, 
   const reasoningEfforts = configuredReasoningEfforts(prov, model.id);
   const defaultReasoningEffort = modelRecordValue(prov.modelDefaultReasoningEfforts, model.id) ?? model.defaultReasoningEffort;
   const supportsReasoningSummaries = configuredReasoningSummarySupport(prov, model.id);
+  const supportsServiceTier = serviceTierSupportForModel(prov, model.id, name);
+  const { supportsServiceTier: _staleServiceTier, ...modelWithoutServiceTier } = model;
   const hinted = {
-    ...model,
+    ...modelWithoutServiceTier,
     ...(configuredCap !== undefined
       ? {
         contextWindow: typeof model.contextWindow === "number" && model.contextWindow > 0
@@ -643,6 +668,7 @@ export function applyProviderConfigHints(name: string, prov: OcxProviderConfig, 
       : {}),
     ...(defaultReasoningEffort ? { defaultReasoningEffort } : {}),
     ...(typeof supportsReasoningSummaries === "boolean" ? { supportsReasoningSummaries } : {}),
+    ...(typeof supportsServiceTier === "boolean" ? { supportsServiceTier } : {}),
     ...(prov.adapter === "kiro" ? { supportsVerbosity: false } : {}),
     // Default-on for openai-chat providers (explicit false opts out); other adapters
     // advertise only on explicit opt-in.
@@ -677,6 +703,8 @@ const COMBO_MEMBER_CONTEXT_FALLBACK = 128_000;
 
 interface ComboCatalogMemberFallback {
   readonly contextWindow?: number;
+  /** Input ceiling when it is lower than the window (native GPT-5.6: 922k under 1.05M). */
+  readonly maxInputTokens?: number;
   readonly inputModalities?: readonly string[];
   readonly reasoningEfforts?: readonly string[];
 }
@@ -718,7 +746,11 @@ export function resolveComboCatalogMember(
     if (!addMaxInput && !addModalities && !addReasoning) return member;
     return {
       ...member,
-      ...(addMaxInput ? { maxInputTokens: contextWindow } : {}),
+      // Never claim a larger input budget than the window, and prefer the model's own
+      // measured ceiling when the fallback carries one.
+      ...(addMaxInput
+        ? { maxInputTokens: Math.min(fallback.maxInputTokens ?? contextWindow!, contextWindow!) }
+        : {}),
       ...(addModalities ? { inputModalities: [...fallback.inputModalities!] } : {}),
       ...(addReasoning ? { reasoningEfforts: [...fallback.reasoningEfforts!] } : {}),
     };
@@ -739,7 +771,7 @@ export function resolveComboCatalogMember(
     }
     const maxInput = typeof existing.maxInputTokens === "number" && existing.maxInputTokens > 0
       ? Math.min(existing.maxInputTokens, capped)
-      : capped;
+      : Math.min(fallback?.maxInputTokens ?? capped, capped);
     return withFallbackMetadata({
       ...existing,
       contextWindow: capped,
@@ -764,6 +796,10 @@ export function resolveComboCatalogMember(
     : (typeof base.maxInputTokens === "number" && base.maxInputTokens > 0
       ? base.maxInputTokens
       : undefined);
+  // Kept OUT of knownMaxInput on purpose: that value doubles as a context-window fallback
+  // below, and a native alias whose input ceiling (922k) is lower than its window (1.05M)
+  // would otherwise shrink the advertised window to the input limit.
+  const fallbackMaxInput = existing || prov ? fallback?.maxInputTokens : undefined;
   // Real discovery/config values win. A native alias is the next fallback tier.
   // The generic 128k/text synthesis from #1305 remains the final fallback.
   const fallbackContext = existing || prov ? fallback?.contextWindow : undefined;
@@ -788,8 +824,11 @@ export function resolveComboCatalogMember(
     ?? (prov ? configuredReasoningEfforts(prov, target.model) : undefined)
     ?? base.reasoningEfforts
     ?? (fallback?.reasoningEfforts ? [...fallback.reasoningEfforts] : undefined);
-  const maxInputTokens = knownMaxInput !== undefined
-    ? Math.min(knownMaxInput, contextWindow)
+  // The model's own measured input ceiling still applies when discovery gave us nothing:
+  // GPT-5.6 advertises a 1.05M window but refuses input past 922k.
+  const effectiveMaxInput = knownMaxInput ?? fallbackMaxInput;
+  const maxInputTokens = effectiveMaxInput !== undefined
+    ? Math.min(effectiveMaxInput, contextWindow)
     : contextWindow;
 
   return {
@@ -846,9 +885,24 @@ export function warnDroppedConfiguredIdsOnce(name: string, droppedConfiguredIds:
   );
 }
 
+/**
+ * Z.AI and Neuralwatt advertise GLM reasoning as a bare boolean, which would otherwise
+ * collapse to the four-tier default ladder that omits `max`. These two helpers name the
+ * ladder each GLM generation actually honours on the wire.
+ */
+/** GLM-5.2 and its 1M alias: the full five-tier ladder including `max`. */
 export function isGlm52ModelId(id: string): boolean {
-  const normalized = id.toLowerCase();
+  const normalized = id.trim().toLowerCase();
   return normalized === "glm-5.2" || normalized === "glm-5.2[1m]";
+}
+/**
+ * GLM-5.3 and its 1M alias. 260814: docs.z.ai/devpack/latest-model folds every incoming
+ * effort into three effective tiers (low/minimal/light -> low, medium/high -> high,
+ * xhigh/max/ultra -> max), so a boolean capability must not be expanded to five rows.
+ */
+export function isGlm53ModelId(id: string): boolean {
+  const normalized = id.trim().toLowerCase();
+  return normalized === "glm-5.3" || normalized === "glm-5.3[1m]";
 }
 
 function plainRecord(value: unknown): Record<string, unknown> | undefined {
@@ -949,6 +1003,11 @@ function modelInputModalities(
   if (capabilityRecord?.vision === false) return ["text"];
   if (capabilityRecord?.vision === true || capabilities?.some(value => (
     value === "vision" || value === "image-input" || value === "image_input"
+    // llama.cpp and Ollama-compatible servers report vision as "multimodal" —
+    // it is the only image signal those servers emit (#1797). Mapped to the
+    // closed `text|image` enum rather than passed through: an out-of-enum
+    // modality makes Codex reject the entire catalog file.
+    || value === "multimodal"
   ))) {
     return ["text", "image"];
   }
@@ -967,6 +1026,13 @@ export function catalogHintsFromModelsApiItem(providerName: string, item: Provid
       item.context_size,
       item.max_model_len,
       item.max_context_length,
+      // llama.cpp reports the served context under `meta`: `n_ctx` is what the
+      // server was actually started with, `n_ctx_train` the model's trained
+      // maximum. Prefer the served value — routing must not promise a window the
+      // running server will refuse. Both come LAST so no provider already
+      // supplying a recognized field changes behavior (#1797).
+      plainRecord(item.meta)?.n_ctx,
+      plainRecord(item.meta)?.n_ctx_train,
     );
   const maxInputTokens = positiveSafeInteger(limits?.max_input_tokens, item.max_input_tokens);
   // Some OpenAI-compatible catalogs expose the selectable ladder under
@@ -984,9 +1050,11 @@ export function catalogHintsFromModelsApiItem(providerName: string, item: Provid
     ? sanitizeCodexReasoningEfforts(listedReasoningEfforts)
     : typeof rawReasoningEfforts === "boolean"
       ? (rawReasoningEfforts
-        ? ((providerName === "neuralwatt" || providerName === "zai") && isGlm52ModelId(item.id)
-          ? ["low", "medium", "high", "xhigh", "max"]
-          : ["low", "medium", "high", "xhigh"])
+        ? ((providerName === "neuralwatt" || providerName === "zai") && isGlm53ModelId(item.id)
+          ? ["low", "high", "max"]
+          : (providerName === "neuralwatt" || providerName === "zai") && isGlm52ModelId(item.id)
+            ? ["low", "medium", "high", "xhigh", "max"]
+            : ["low", "medium", "high", "xhigh"])
         : [])
       : undefined;
   const capabilities = modelCapabilities(item);
@@ -1639,6 +1707,7 @@ async function gatherRoutedModelsUncached(
     // configs that will never need it.
   } else {
     const disabled = disabledNativeSlugs(config);
+    const openaiContextCap = providerContextCap(config, OPENAI_CODEX_PROVIDER_ID);
     const requiredNativeComboTargets = new Set(listComboIds(config).flatMap(id => {
       const combo = getCombo(config, id);
       return combo?.targets.flatMap(target => (
@@ -1649,14 +1718,18 @@ async function gatherRoutedModelsUncached(
       // A bare native disable key hides the native row, not a combo that targets it.
       // Keep synthetic native metadata available to those combos.
       if (disabled.has(slug) && !requiredNativeComboTargets.has(slug)) continue;
-      const contextWindow = nativeOpenAiContextWindow(slug);
+      const contextWindow = nativeOpenAiContextWindow(slug, openaiContextCap);
       if (contextWindow === undefined) continue;
       const synthetic: CatalogModel = {
         provider: "openai",
         id: slug,
         owned_by: "openai",
         contextWindow,
-        maxInputTokens: contextWindow,
+        // Input limit, not the total window. These coincide for native GPT-5.6 today (the
+        // advertised 922,000 window is already capped at its measured ceiling), but the two
+        // stay separate fields because routed/API rows of the same family run a wider window.
+        // Falls back to the window for slugs with no separate ceiling.
+        maxInputTokens: Math.min(nativeOpenAiMaxInputTokens(slug, openaiContextCap) ?? contextWindow, contextWindow),
         inputModalities: nativeInputModalities(slug),
         reasoningEfforts: nativeReasoningEfforts(slug),
         ...(nativeParallelToolCalls(slug) ? { parallelToolCalls: true } : {}),
@@ -1674,11 +1747,15 @@ async function gatherRoutedModelsUncached(
     const combo = getCombo(config, id);
     if (!combo) continue;
     const nativeContextWindow = combo.nativeAlias && combo.alias
-      ? nativeOpenAiContextWindow(combo.alias)
+      ? nativeOpenAiContextWindow(combo.alias, providerContextCap(config, OPENAI_CODEX_PROVIDER_ID))
+      : undefined;
+    const nativeAliasMaxInput = combo.nativeAlias && combo.alias
+      ? nativeOpenAiMaxInputTokens(combo.alias, providerContextCap(config, OPENAI_CODEX_PROVIDER_ID))
       : undefined;
     const nativeAliasFallback = combo.nativeAlias && combo.alias && nativeContextWindow !== undefined
       ? {
         contextWindow: nativeContextWindow,
+        ...(nativeAliasMaxInput !== undefined ? { maxInputTokens: Math.min(nativeAliasMaxInput, nativeContextWindow) } : {}),
         inputModalities: nativeInputModalities(combo.alias),
         reasoningEfforts: nativeReasoningEfforts(combo.alias),
       }
@@ -1713,16 +1790,75 @@ async function gatherRoutedModelsUncached(
   const replacedByRoutedSlug = new Map(all.map(model => [routedSlug(model.provider, model.id), model]));
   const customModels = (config.customModels ?? []).map(cm => {
     const rawProvider = config.providers[cm.provider];
+    const effectiveProvider = enrichedByName.get(cm.provider) ?? rawProvider;
+    // Registry routing backfills an omitted authMode on the built-in OpenAI provider to
+    // forward. Keep the catalog projection on the same contract while still failing closed
+    // for every explicit non-forward mode and every non-canonical endpoint.
+    const providerForCanonicalCheck = rawProvider
+      ? withCanonicalOpenAiForwardAuthDefault(cm.provider, rawProvider)
+      : undefined;
+    const codexForwardNativeCapabilityAlias = cm.provider === OPENAI_CODEX_PROVIDER_ID
+      && providerForCanonicalCheck !== undefined
+      && isCanonicalOpenAiForwardProvider(providerForCanonicalCheck)
+      && isNativeOpenAiCapabilityAliasModel(cm.modelId);
+    const nativeAliasContextWindow = codexForwardNativeCapabilityAlias
+      ? nativeOpenAiContextWindow(cm.modelId, providerContextCap(config, OPENAI_CODEX_PROVIDER_ID))
+      : undefined;
+    const customContextWindow = cm.contextWindow
+      ? nativeAliasContextWindow !== undefined
+        ? Math.min(cm.contextWindow, nativeAliasContextWindow)
+        : cm.contextWindow
+      : nativeAliasContextWindow;
+    // Input ceiling for a native capability alias, clamped to whatever window we settled on
+    // above. A custom row that lowered the window must not keep the full native input budget.
+    const nativeAliasMaxInputTokens = codexForwardNativeCapabilityAlias
+      ? nativeOpenAiMaxInputTokens(cm.modelId, providerContextCap(config, OPENAI_CODEX_PROVIDER_ID))
+      : undefined;
+    const customMaxInputTokens = nativeAliasMaxInputTokens !== undefined && customContextWindow !== undefined
+      ? Math.min(nativeAliasMaxInputTokens, customContextWindow)
+      : nativeAliasMaxInputTokens;
+    const nativeAliasDefaultEffort = codexForwardNativeCapabilityAlias
+      ? nativeDefaultReasoningEffort(cm.modelId)
+      : undefined;
     const supportsReasoningSummaries = configuredReasoningSummarySupport(rawProvider, cm.modelId);
+    const supportsServiceTier = effectiveProvider
+      ? serviceTierSupportForModel(effectiveProvider, cm.modelId, cm.provider)
+      : undefined;
     const base: CatalogModel = {
       id: cm.modelId,
       provider: cm.provider,
       catalogKind: CODEX_CUSTOM_MODEL_CATALOG_KIND,
       // Display-only label: never feeds routing (customModels are keyed by routedSlug below).
-      ...(cm.displayName ? { displayName: cm.displayName } : {}),
-      ...(cm.contextWindow ? { contextWindow: cm.contextWindow } : {}),
-      ...(cm.inputModalities ? { inputModalities: cm.inputModalities } : {}),
+      ...(cm.displayName
+        ? { displayName: cm.displayName }
+        : codexForwardNativeCapabilityAlias ? { displayName: "Daybreak Blue" } : {}),
+      ...(customContextWindow !== undefined ? { contextWindow: customContextWindow } : {}),
+      ...(customMaxInputTokens !== undefined ? { maxInputTokens: customMaxInputTokens } : {}),
+      ...(cm.inputModalities
+        ? { inputModalities: cm.inputModalities }
+        : codexForwardNativeCapabilityAlias ? { inputModalities: nativeInputModalities(cm.modelId) } : {}),
       ...(typeof supportsReasoningSummaries === "boolean" ? { supportsReasoningSummaries } : {}),
+      // Native-alias defaults apply only where the custom row declares nothing: the explicit
+      // spreads below must win (later in object order), so a stored `[]` stays empty and a
+      // declared ladder is never replaced by the alias's native ladder.
+      ...(codexForwardNativeCapabilityAlias
+        ? {
+          codexForwardNativeCapabilityAlias: true,
+          parallelToolCalls: nativeParallelToolCalls(cm.modelId),
+          ...(Array.isArray(cm.reasoningEfforts)
+            ? {}
+            : {
+              reasoningEfforts: nativeReasoningEfforts(cm.modelId),
+              ...(nativeAliasDefaultEffort ? { defaultReasoningEffort: nativeAliasDefaultEffort } : {}),
+            }),
+        }
+        : {}),
+      // Explicit custom-row ladder wins over the inherited provider row below: the merge only
+      // gap-fills, so a stored `[]` (explicit "no reasoning") or a declared ladder is kept
+      // verbatim instead of being replaced by the replaced row's metadata.
+      ...(Array.isArray(cm.reasoningEfforts) ? { reasoningEfforts: [...cm.reasoningEfforts] } : {}),
+      ...(cm.defaultReasoningEffort ? { defaultReasoningEffort: cm.defaultReasoningEffort } : {}),
+      ...(typeof supportsServiceTier === "boolean" ? { supportsServiceTier } : {}),
     };
     // #962: the dedupe below drops the provider-derived row this custom row replaces. Inherit that
     // row's provider capability metadata (reasoning ladder, default effort, parallel tool calls,
@@ -1731,13 +1867,19 @@ async function gatherRoutedModelsUncached(
     // noReasoningModels model loses its empty ladder and the catalog synthesizes the generic one,
     // which Codex then rejects for spawn_agent with effort "none".
     const replaced = replacedByRoutedSlug.get(routedSlug(cm.provider, cm.modelId));
+    // The final ladder is what the catalog will advertise; the inherited default only rides
+    // along when it is actually a member — otherwise a provider default like "xhigh" would
+    // re-apply onto a narrower custom ladder and override the fallback in applyReasoningLevels.
+    const effectiveLadder = base.reasoningEfforts ?? replaced?.reasoningEfforts;
     const merged: CatalogModel = replaced ? {
       ...base,
       ...(base.contextWindow === undefined && replaced.contextWindow !== undefined ? { contextWindow: replaced.contextWindow } : {}),
       ...(base.maxInputTokens === undefined && replaced.maxInputTokens !== undefined ? { maxInputTokens: replaced.maxInputTokens } : {}),
       ...(base.inputModalities === undefined && replaced.inputModalities !== undefined ? { inputModalities: replaced.inputModalities } : {}),
       ...(base.reasoningEfforts === undefined && replaced.reasoningEfforts !== undefined ? { reasoningEfforts: replaced.reasoningEfforts } : {}),
-      ...(base.defaultReasoningEffort === undefined && replaced.defaultReasoningEffort !== undefined ? { defaultReasoningEffort: replaced.defaultReasoningEffort } : {}),
+      ...(base.defaultReasoningEffort === undefined && replaced.defaultReasoningEffort !== undefined
+        && Array.isArray(effectiveLadder) && effectiveLadder.includes(replaced.defaultReasoningEffort)
+        ? { defaultReasoningEffort: replaced.defaultReasoningEffort } : {}),
       ...(base.parallelToolCalls === undefined && replaced.parallelToolCalls !== undefined ? { parallelToolCalls: replaced.parallelToolCalls } : {}),
       ...(base.supportsVerbosity === undefined && replaced.supportsVerbosity !== undefined ? { supportsVerbosity: replaced.supportsVerbosity } : {}),
       ...(base.supportsReasoningSummaries === undefined && replaced.supportsReasoningSummaries !== undefined ? { supportsReasoningSummaries: replaced.supportsReasoningSummaries } : {}),

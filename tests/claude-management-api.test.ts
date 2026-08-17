@@ -78,6 +78,57 @@ test("GET /api/claude-code returns defaults + available + aliases", async () => 
   }
 });
 
+
+test("PUT round-trips classifier routing settings and clears them with null (#1697)", async () => {
+  const server = startServer(0);
+  try {
+    const put = await fetch(new URL("/api/claude-code", server.url), {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        classifierModel: " mock/test-model ",
+        classifierFallbacks: [" mock/test-model ", "mock/other"],
+      }),
+    });
+    expect(put.status).toBe(200);
+
+    const get = await fetch(new URL("/api/claude-code", server.url));
+    const d = await get.json() as Record<string, any>;
+    expect(d.classifierModel).toBe("mock/test-model");
+    expect(d.classifierFallbacks).toEqual(["mock/test-model", "mock/other"]);
+
+    // null clears both, which is how the operator turns classifier routing back off.
+    const cleared = await fetch(new URL("/api/claude-code", server.url), {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ classifierModel: "", classifierFallbacks: null }),
+    });
+    expect(cleared.status).toBe(200);
+    const after = await (await fetch(new URL("/api/claude-code", server.url))).json() as Record<string, any>;
+    expect(after.classifierModel).toBe("");
+    expect(after.classifierFallbacks).toEqual([]);
+  } finally {
+    await server.stop(true);
+  }
+});
+
+test("PUT rejects a malformed classifierFallbacks instead of persisting it (#1697)", async () => {
+  const server = startServer(0);
+  try {
+    for (const body of [{ classifierFallbacks: "mock/test-model" }, { classifierFallbacks: [1] }, { classifierFallbacks: [""] }]) {
+      const res = await fetch(new URL("/api/claude-code", server.url), {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      expect(res.status).toBe(400);
+      const err = await res.json() as Record<string, unknown>;
+      expect(String(err.error)).toContain("classifierFallbacks");
+    }
+  } finally {
+    await server.stop(true);
+  }
+});
 test("PUT round-trips settings and persists to config", async () => {
   const server = startServer(0);
   try {
@@ -460,7 +511,7 @@ test("PUT/GET round-trips the context/effort levers (devlog 136 B6)", async () =
 test("PUT/GET round-trips auto-context (devlog 260712 020)", async () => {
   const server = startServer(0);
   try {
-    // Defaults: on, window null (GUI shows the 350000 placeholder).
+    // Defaults: on, window null — the GUI renders the runtime default as the empty choice.
     let get = await fetch(new URL("/api/claude-code", server.url)).then(r => r.json()) as Record<string, unknown>;
     expect(get.autoContext).toBe(true);
     expect(get.autoCompactWindow).toBeNull();

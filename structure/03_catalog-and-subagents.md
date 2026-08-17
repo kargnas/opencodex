@@ -7,6 +7,10 @@
 - preserves native OpenAI entries from the live catalog or static fallback, and emits
   gpt-5.6 natives from the pinned upstream models.json snapshot
   (`src/codex/data/upstream-models.json` — exact per-slug ladders: luna has no ultra);
+- upgrades either an observed selector-qualified `*/gpt-daybreak-blue-latest` account row or an
+  explicitly configured canonical `openai/gpt-daybreak-blue-latest` Codex-forward row from the
+  pinned Sol capability metadata while preserving its selector and Daybreak wire identity;
+  this never expands the bare/API-key model lists or rewrites the wire model to `gpt-5.6-sol`;
 - clones a native template for routed `provider/model` entries;
 - forces strict Codex catalog fields required by the current parser;
 - hides `disabledModels` without blocking direct routing (routed provider ids are excluded;
@@ -14,7 +18,8 @@
   and all account-selector clones and drop that model family from raw `/v1/models`);
 - applies exact provider/model compatibility exclusions after live discovery and metadata
   augmentation, so upstream-advertised but uncallable rows never enter dashboard or Codex pickers;
-- strips native-only service tier and WebSocket metadata unless explicitly enabled;
+- strips native-only service tier and WebSocket metadata unless the final routed provider/model
+  explicitly enables the verified OpenAI-compatible service tier;
 - backs up the pristine catalog once per catalog: the copy is keyed by a hash of the catalog path
   (`catalog-backup-<id>.json`), and the legacy unsuffixed `catalog-backup.json` is retained in
   addition for the default catalog, so a restore resolves the backup for the catalog it is restoring
@@ -31,6 +36,13 @@ backup rather than from a catalog whose priorities may already have been rewritt
 custom catalog remains the native metadata/template authority even when a bundled-catalog memo is
 warm. Both paths may use an admitted matching bundled memo only as installed-runtime capability
 evidence to remove unsupported reasoning efforts; convergence never probes Codex itself.
+
+When account selectors are enabled, the sync path may also observe exact, visible, API-supported
+OpenAI-family ids from Codex's user-owned catalog/cache. Only rows with native catalog provenance
+are trusted; unknown ids are carried through startup cache invalidation as hidden observations and
+are emitted only as selector-qualified rows whose account provenance matches. They never expand
+the bare native or API-key model list. This keeps account-scoped upstream ids such as
+`gpt-daybreak-blue-latest` callable without treating them as a static release allowlist.
 
 The app-server's model list comes from this shared catalog, not from patching the App. Codex Desktop
 may still apply its remote native-only allowlist after `model/list`; an explicitly configured combo
@@ -140,6 +152,84 @@ The `multi_agent_v2` feature flag and the logical maximum thread count are separ
 `multiAgentMode` (`src/codex/features.ts`): the mode decides which surface Codex advertises, while
 the flag and thread count decide what the native runtime allows.
 
+### What the five-model `spawn_agent` window is, and how V1 differs from V2
+
+`MAX_SPAWN_AGENT_MODEL_OVERRIDES = 5` (mirrored in `src/codex/catalog/sync.ts`) is **not** a
+subagent concurrency limit and **not** an eligibility limit. Upstream uses it in exactly two
+places: the model list rendered into the `spawn_agent` tool description
+(`multi_agents_spec.rs:789`) and the "Available models:" suggestions in an unknown-model error
+(`multi_agents_common.rs:448`, inside the `ok_or_else` closure that runs only *after* the lookup
+already failed). The success path `find_spawn_agent_model_name` (`:431-442`) scans the whole
+catalog with neither the cap nor a `show_in_picker` filter, so a model outside the advertised
+five is still accepted when named exactly.
+
+Three different numbers, often conflated:
+
+| Quantity | Value | Source |
+| --- | --- | --- |
+| Models **advertised** as overrides | `min(5, picker-visible eligible rows)` | `multi_agents_spec.rs:785-790` |
+| Models **eligible** as targets | no numeric cap (only `"disabled"` is excluded, and only on V2) | `multi_agents_common.rs:36-42` |
+| **Concurrent** subagents | V1 6 children (root excluded); V2 total 4 including root → 3 children | `config/mod.rs:211-212`, `:1497-1506` |
+
+**The cap is the same 5 on both surfaces, but the window's contents are not.** The eligibility
+filter runs *before* `.take(5)`, and it behaves differently per surface: on a V1 call
+`model_supports_multi_agent_backend` short-circuits true for every row (including `disabled`
+ones), while a V2 call drops `Some(Disabled)` first — which lets a later row move into the five.
+Same catalog, different advertised list:
+
+| # | Model | pin | V1 advertises | V2 advertises |
+| ---: | --- | --- | :---: | :---: |
+| 1 | `v2-a` | `v2` | ✅ | ✅ |
+| 2 | `disabled-a` | `disabled` | ✅ | — |
+| 3 | `v1-a` | `v1` | ✅ | ✅ |
+| 4 | `null-a` | absent | ✅ | ✅ |
+| 5 | `v2-b` | `v2` | ✅ | ✅ |
+| 6 | `disabled-b` | `disabled` | — | — |
+| 7 | `null-b` | absent | — | ✅ |
+
+opencodex already matches this: `effectiveSubagentRoster` filters with
+`surface !== "v2" || isEligibleV2SubagentEntry(entry)`, so the V1 path skips the eligibility
+filter exactly as upstream does. opencodex also injects no roster on V1
+(`src/server/responses/collaboration.ts` emits only proactive text at the top effort tier), so
+the upstream tool description remains the authority there.
+
+Two further V1/V2 differences worth knowing: the list gate is
+`hide_agent_type_model_reasoning` on V1 (hard-coded `false` at registration, so V1 always
+advertises) but `expose_spawn_agent_model_overrides` on V2 (default `true`; when false the list
+is omitted *and* the `model`/`reasoning_effort` schema fields are removed). And V2's
+`hide_spawn_agent_metadata` defaults true, which removes `service_tier`.
+
+`modelPickerOrder` (#1649) deliberately does **not** feed this window: it rewrites only the
+Codex-visible `priority` while `SPAWN_PRIORITY_FIELD` preserves the natural priority the roster
+sorts by, so a display reorder can never change candidate membership. That divergence from
+upstream's own ordering is the feature's purpose, not a defect —
+`tests/codex-catalog-model-picker-order.test.ts` pins it.
+
+Full derivation with per-line citations: `devlog/_plan/260816_codexrs_multiagent_v2_and_history_perf/013_five_cap_v1_vs_v2.md`.
+
+## Routed tool discovery and hosted search
+
+All routed catalog rows advertise `supports_search_tool: true` together with
+`tool_mode: "code_mode_only"` — the pair is load-bearing. The field selects Codex's deferred
+tool-discovery surface; it does not describe the hosted web-search sidecar. Under code mode,
+deferred MCP tools remain callable through exec's `tools` global / `ALL_TOOLS` without a
+`tool_search` round-trip (upstream codex-rs code_mode suite; live canary 2026-08-13: routed
+kimi/k3 executed `tools.mcp__node_repl__js`, devlog `260813_tool_catalog_deferral/010+020`).
+Stamping `false` instead forces every MCP declaration into `exec.description` — a measured 2.7x
+turn-1 payload regression (96,699 → 258,929 chars). For Cursor this can also make the unified
+`exec` exceed the 120,000-byte serialized `McpTools` ceiling; the budget then drops `exec` and
+its companion `wait` (#1830). Hosted search remains independent: non-Cursor routes keep
+`web_search_tool_type: "text_and_image"`, while Cursor omits it because runTurn bypasses the
+search sidecar.
+
+[Decision Log]
+- 목적과 의도: keep routed plugin/MCP tools reachable without paying the full-catalog turn-1 payload tax or starving Cursor's unified execution bridge.
+- 기존 구현 및 제약 조건: #1596 restored deferred discovery only for non-Cursor rows because Cursor bypasses the hosted-search sidecar; codex-rs treats deferred exposure and hosted search as separate capabilities, and Cursor independently enforces a 120,000-byte serialized tool-catalog limit.
+- 검토한 주요 대안: keep Cursor opted out, raise/disable Cursor's transport ceiling, synthesize another execution bridge, or enable Cursor-native local exec only when the bridge disappears.
+- 선택한 방식: enable Codex deferred exposure for Cursor code-mode rows too, while continuing to omit Cursor's hosted `web_search_tool_type`.
+- 다른 대안 대신 이 방식을 선택한 이유: it removes the known exec-description inflation before Cursor budgeting without weakening the measured transport limit, inventing caller tools, or turning bridge absence into local-execution authority.
+- 장점, 단점 및 영향: Cursor keeps a compact Responses-owned `exec` path under rich tool catalogs and hosted-search behavior remains unchanged; the existing Cursor budget and native-local-exec fail-closed policy remain authoritative.
+
 ## Ultra reasoning level
 
 Ultra is always advertised in the catalog regardless of the `multi_agent_v2` toggle. The v2 toggle
@@ -149,6 +239,21 @@ wire-clamps ultra/max to each model's real top rung (e.g. gpt-5.5 ultra → xhig
 `effortCap` and `subagentEffortCap` are hard ceilings applied on the V2 path
 (`src/server/effort-policy.ts`): they lower or preserve the requested effort rather than rejecting
 the request, and they never raise it.
+
+[Decision Log]
+- 목적과 의도: Xiaomi MiMo의 공식 OpenAI Chat endpoint가 실제로 받지 않는 `max`/
+  `ultra` reasoning tier를 catalog에 노출하지 않도록 한다.
+- 기존 구현 및 제약 조건: `xiaomi`는 Anthropic endpoint, `mimo`는 token-plan endpoint를
+  소유하며, 공식 `https://api.xiaomimimo.com/v1`은 generic custom provider로 처리됐다.
+- 검토한 주요 대안: 기존 `xiaomi`/`mimo` contract를 확장하기, 모든 custom provider의 ladder를
+  일괄 축소하기, 공식 public endpoint만을 별도 registry row로 소유하기.
+- 선택한 방식: `xiaomi-mimo`를 고정 목적지의 `openai-chat` preset으로 등록하고
+  `low`/`medium`/`high`만 노출하며 높은 direct request는 `high`로 clamp한다.
+- 다른 대안 대신 이 방식을 선택한 이유: 서로 다른 auth/wire/host를 하나의 preset으로
+  합치지 않으면서 upstream error로 확인된 계약만 적용할 수 있다.
+- 장점, 단점 및 영향: 공식 endpoint에서 안전한 picker/wire 계약을 제공하고,
+  `preserveCustomDestination`으로 같은 이름의 다른 host/key를 보호한다. 대신 새 preset 표면을
+  문서와 registry parity에서 함께 유지해야 한다.
 
 [Decision Log]
 - 목적과 의도: bare `defaultModel` selectors that route into third-party providers must keep their

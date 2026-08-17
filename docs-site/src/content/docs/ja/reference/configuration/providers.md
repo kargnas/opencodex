@@ -46,7 +46,7 @@ account を削除しても mapping は保持され、同じ id を再追加す�
 
 ## 予約済み OpenAI プロバイダー
 
-`openai` および `openai-apikey` は固定予約 ID です。 `openai.codexAccountMode` はデフォルトでは `"pool"` で、メインアカウントと追加アカウント全体を選択します。 `"direct"` は、現在の呼び出し元/メイン ログインのみを使用します。 API は、設定された API キーまたはキー プールのみを使用します。ベア モデルまたは `openai-apikey/<model>` を使用します。クロスルート認証情報のフォールバックはありません。 API GPT-5.6 行は 1,050,000 コンテキスト / 最大 922,000 入力メタデータを伝送し、Pro 仮想 ID は `reasoning.mode: "pro"` を使用してベース ワイヤー モデルに書き換えられます。
+`openai` および `openai-apikey` は固定予約 ID です。 `openai.codexAccountMode` はデフォルトでは `"pool"` で、メインアカウントと追加アカウント全体を選択します。 `"direct"` は、現在の呼び出し元/メイン ログインのみを使用します。 API は、設定された API キーまたはキー プールのみを使用します。ベア モデルまたは `openai-apikey/<model>` を使用します。クロスルート認証情報のフォールバックはありません。 API GPT-5.6 行は 922,000 コンテキスト / 最大 922,000 入力メタデータを伝送し、Pro 仮想 ID は `reasoning.mode: "pro"` を使用してベース ワイヤー モデルに書き換えられます。
 
 `openaiProviderTierVersion: 2` は、現在の単一プロバイダーの投影をマークします。出荷された v1 設定を移行する前に、opencodex は別のバックアップを置き換えずに `config.json.pre-openai-tiers-v2.bak` を作成し、既知の名前空間で選択された既知のレガシー ID を裸の ID に書き換えます。
 
@@ -56,6 +56,7 @@ account を削除しても mapping は保持され、同じ id を再追加す�
 | --- | --- | --- |
 | `adapter` | `string` | `openai-chat`、`openai-responses`、`anthropic`、`google`、`kiro`、`cursor`、`azure-openai` (または別名 `azure`) のいずれか。 |
 | `baseUrl` | `string` |アップストリーム API のベース URL。ほとんどの組み込み固定エンドポイントは不一致を無視します。衝突安全キー プリセットは、古い同じ名前のカスタム宛先を保持します。 |
+| `requestPacing?` | `{ enabled, requestsPerMinute?, minIntervalMs?, models? }` | 上流の使用量、請求、レート制限表示とは別の、クライアント側の送信開始間隔調整です。プロバイダー制限は全モデルに適用され、`models` は上流の正確なモデル ID に一致し、遅延を増やす場合のみ有効です。キュー待機は応答ヘッダーのタイムアウトを消費しません。HTTP、Responses WebSocket、明示的なアダプターの `fetchResponse`/`runTurn` 送信を対象にします。 |
 | `responsesPath?` | `string` |キー認証 `openai-responses` リクエストの相対リソース パス。 `/` で始まり、スキーム、クエリ、またはフラグメントが含まれていない必要があります。 |
 | `supportsServiceTier?` | `boolean` | `service_tier` ケイパビリティの 3 状態です。`true`: fast モードが注入でき、呼び出し元の値も保持されます。`false`: フィールドは削除され、注入もされません (非対応と文書化されたアップストリームには送りません)。未設定: 未分類 — 呼び出し元の値はそのまま保持され、fast モードは注入しません。レジストリは正規 OpenAI (`true`)、DeepSeek、Volcengine Ark (`false`) を分類します。実際にティアをサポートするカスタム ゲートウェイにのみ明示的に設定してください。 |
 | `preserveResponsesReasoningContent?` | `boolean` | リプレイされる Responses reasoning アイテムの平文 reasoning コンテンツを消去せずに保持します (消去は ChatGPT バックエンドのルールです)。DeepSeek のように reasoning リプレイを受け入れるアップストリームで有効にしてください。プロキシ生成の `ocxr1` エンベロープは常に削除されます。 |
@@ -93,6 +94,7 @@ account を削除しても mapping は保持され、同じ id を再追加す�
 | `noTemperatureModels?` | `string[]` |発信者指定の`temperature`を拒否するモデル。 |
 | `noTopPModels?` | `string[]` |発信者指定の`top_p`を拒否するモデル。 |
 | `noPenaltyModels?` | `string[]` |存在/周波数ペナルティを拒否するモデル。 |
+| `noStructuredOutputModels?` | `string[]` | `openai-chat` エンドポイントが `response_format` を拒否する正確なモデル ID。要求モデルが項目と完全一致する場合だけフィールドを省略し、その他の `openai-chat` モデルでは structured-output 変換を維持します。 |
 | `parallelToolCalls?` | `boolean` |並列ツール呼び出しを切り替えます。 OpenAI Chat はデフォルトでオンになっています。非チャット アダプターは明示的な `true` でのみアドバタイズします。 |
 | `responsesItemIdRepair?` | `{ message?: string[]; reasoning?: string[]; repairMissingTerminalIds?: boolean; repairInvalidIds?: boolean }` |正確なプレースホルダー ID、欠落している端末 ID、および（`repairInvalidIds` で）正規の `msg_`/`rs_` 接頭辞を欠く message/reasoning ID に対するダウンストリーム SSE 修復はデフォルトで無効になっています。関数呼び出し ID は決して書き換えられません。組み込み DeepSeek は最後の 2 つをデフォルトで有効にします。 |
 | `responsesSnapshotRepair?` | `boolean` | デフォルトで無効のクライアント向け修復です。SSE と JSON の Responses ライフサイクルで欠落した status、output、ツールメタデータを補完し、raw 検査と永続化は変更しません。 |
@@ -298,7 +300,7 @@ OpenRouter は、複数の推論プロバイダーを通じて 1 つのモデル
 
 検出を実行する必要があるが、選択した ID のみが Codex および `/v1/models` に表示される必要がある場合は、`selectedModels` を使用します。ダッシュボードには、後で許可リストを変更できるように、検出された完全なリストが保持されます。
 
-プレビュー GPT-5.6 フォールバック エントリは同じメカニズムを使用します。 OpenAI API キー プリセットは、ベース ID と Pro ID にコンテキスト `1050000` と最大入力 `922000` をシードします。 OpenRouter は、コンテキスト `1050000` を持つ `openai/gpt-5.6-sol`、`openai/gpt-5.6-terra`、および `openai/gpt-5.6-luna` をシードします。プール/ダイレクトは `372000` をアドバタイズします。同期されたカタログは、`xhigh` を区別しつつ、`max` をアドバタイズします。
+プレビュー GPT-5.6 フォールバック エントリは同じメカニズムを使用します。 OpenAI API キー プリセットは、ベース ID と Pro ID にコンテキスト `922000` と最大入力 `922000` をシードします。 OpenRouter は、コンテキスト `922000` を持つ `openai/gpt-5.6-sol`、`openai/gpt-5.6-terra`、および `openai/gpt-5.6-luna` をシードします。プール/ダイレクトは `922000` をアドバタイズします。同期されたカタログは、`xhigh` を区別しつつ、`max` をアドバタイズします。
 
 ```json
 {

@@ -1,4 +1,5 @@
 import type { IncomingMeta, ProviderAdapter } from "./base";
+import { createToolCallIdAllocator, type ToolCallIdAllocator } from "./tool-call-id";
 import { debugDroppedFrame } from "../lib/debug";
 import type {
   AdapterEvent,
@@ -18,6 +19,8 @@ import { ANTHROPIC_OAUTH_BETA, CLAUDE_CODE_SYSTEM_INSTRUCTION, applyClaudeToolPr
 import { parseDataUrl } from "./image";
 import { enforceAnthropicImageLimits } from "./anthropic-image-guard";
 import { normalizeAnthropicImages } from "./anthropic-image-normalize";
+import { normalizeAnthropicOutputSchema } from "./anthropic-output-schema";
+import { stripResponsesOnlyEncryptedMarker } from "./responses-tool-schema";
 import { identifyRoutedModel } from "./identity";
 import { redactSecretString } from "../lib/redact";
 import { CLAUDE_CODE_HEADERS, claudeCodeSessionId } from "./client-fingerprint";
@@ -557,7 +560,7 @@ function buildToolNameTransforms(provider: OcxProviderConfig): { toWire: (name: 
   return { toWire: (name) => name, fromWire: (name) => name };
 }
 
-function toAnthropicToolResult(msg: OcxToolResultMessage): Record<string, unknown> {
+function toAnthropicToolResult(msg: OcxToolResultMessage, wireCallId: string): Record<string, unknown> {
   // Anthropic tool_result accepts a string OR content blocks — render images natively
   // (e.g. Codex view_image output) instead of dropping them.
   let content: string | unknown[];
@@ -572,10 +575,15 @@ function toAnthropicToolResult(msg: OcxToolResultMessage): Record<string, unknow
   }
   return {
     type: "tool_result",
-    tool_use_id: msg.toolCallId,
+    tool_use_id: wireCallId,
     content,
     ...(msg.isError ? { is_error: true } : {}),
   };
+}
+
+function unrepresentableToolCallText(tc: OcxToolCall, wireName: string): string {
+  const args = typeof tc.arguments === "string" ? tc.arguments : JSON.stringify(tc.arguments);
+  return `[tool_use without a usable id: ${wireName}]\n${args}`;
 }
 
 function orphanToolResultText(msg: OcxToolResultMessage): string {
@@ -590,6 +598,19 @@ function messagesToAnthropicFormat(
   parsed: OcxParsedRequest,
   toolNames: { toWire: (name: string) => string },
 ): { system: string | undefined; messages: unknown[] } {
+  // One allocator for the whole request: a tool_result must resolve to the SAME wire id its
+  // call got, and two distinct raw ids must never collapse into one. Conforming ids are claimed
+  // first so a rewritten id can never squat on an id another call legitimately owns.
+  const callIds = createToolCallIdAllocator();
+  for (const message of parsed.context.messages) {
+    if (message.role === "assistant") {
+      for (const part of (message as OcxAssistantMessage).content) {
+        if (part.type === "toolCall") callIds.reserve((part as OcxToolCall).id);
+      }
+    } else if (message.role === "toolResult") {
+      callIds.reserve((message as OcxToolResultMessage).toolCallId);
+    }
+  }
   const toolCatalogNudge = buildNonOpenAIToolCatalogNudgeForTools(
     parsed.context.tools,
     parsed.options.toolChoice,
@@ -641,8 +662,17 @@ function messagesToAnthropicFormat(
           } else if (part.type === "toolCall") {
             const tc = part as OcxToolCall;
             const flatName = namespacedToolName(tc.namespace, tc.name);
-            toolUseIds.push(tc.id);
-            toolUses.push({ type: "tool_use", id: tc.id, name: toolNames.toWire(flatName), input: tc.arguments });
+            // Normalized here, and identically for the matching tool_result above, so a history
+            // replayed from another provider path keeps its call/result pairing (#1767).
+            // No raw fallback: restoring an empty/unusable id puts a value on the wire Anthropic
+            // rejects. An unrepresentable call becomes text instead, and its result follows it there.
+            const wireCallId = callIds.allocate(tc.id);
+            if (wireCallId === undefined) {
+              preface.push({ type: "text", text: unrepresentableToolCallText(tc, toolNames.toWire(flatName)) });
+              continue;
+            }
+            toolUseIds.push(wireCallId);
+            toolUses.push({ type: "tool_use", id: wireCallId, name: toolNames.toWire(flatName), input: tc.arguments });
           }
         }
         // Anthropic treats text/thinking after tool_use as ending the tool turn, which makes
@@ -658,9 +688,13 @@ function messagesToAnthropicFormat(
           let j = i + 1;
           while (j < parsed.context.messages.length && parsed.context.messages[j].role === "toolResult") {
             const tr = parsed.context.messages[j] as OcxToolResultMessage;
-            if (requiredIds.has(tr.toolCallId) && !seen.has(tr.toolCallId)) {
-              resultBlocks.push(toAnthropicToolResult(tr));
-              seen.add(tr.toolCallId);
+            // Match on the WIRE id. requiredIds holds normalized ids, so comparing the raw result id
+            // made every rewritten pair lose its result to orphan text and gain a synthetic
+            // missing-result block. lookup() never mints an id: a result with no call stays orphan.
+            const wireResultId = callIds.lookup(tr.toolCallId);
+            if (wireResultId !== undefined && requiredIds.has(wireResultId) && !seen.has(wireResultId)) {
+              resultBlocks.push(toAnthropicToolResult(tr, wireResultId));
+              seen.add(wireResultId);
             } else {
               orphanBlocks.push({ type: "text", text: orphanToolResultText(tr) });
             }
@@ -720,35 +754,8 @@ function toolsToAnthropicFormat(parsed: OcxParsedRequest, toolNames: { toWire: (
   return converted;
 }
 
-// Codex multi-agent v2 stamps a Responses-only `encrypted: true` marker on
-// collaboration tool schemas (openai/codex 5f4d06ef; issue #85). It is an
-// annotation for the ChatGPT backend only. Anthropic input_schema is strict
-// JSON Schema; strip the marker defensively everywhere it can appear as a
-// schema keyword, while preserving properties literally named "encrypted".
-const ENCRYPTED_MARKER_NAME_BAG_KEYS = new Set(["properties", "patternProperties", "$defs", "definitions"]);
-const ENCRYPTED_MARKER_LITERAL_VALUE_KEYS = new Set(["const", "default", "enum", "examples"]);
-
-function stripEncryptedMarker(node: unknown, inNameBag = false): unknown {
-  if (Array.isArray(node)) return node.map(item => stripEncryptedMarker(item));
-  if (!node || typeof node !== "object") return node;
-
-  const out: Record<string, unknown> = {};
-
-  for (const [key, value] of Object.entries(node as Record<string, unknown>)) {
-    if (inNameBag) {
-      out[key] = stripEncryptedMarker(value);
-    } else if (key !== "encrypted") {
-      out[key] = ENCRYPTED_MARKER_LITERAL_VALUE_KEYS.has(key)
-        ? value
-        : stripEncryptedMarker(value, ENCRYPTED_MARKER_NAME_BAG_KEYS.has(key));
-    }
-  }
-
-  return out;
-}
-
 function normalizeAnthropicInputSchema(schema: unknown): Record<string, unknown> {
-  const stripped = stripEncryptedMarker(schema);
+  const stripped = stripResponsesOnlyEncryptedMarker(schema);
   const obj = stripped && typeof stripped === "object" && !Array.isArray(stripped)
     ? stripped as Record<string, unknown>
     : {};
@@ -896,6 +903,20 @@ export function createAnthropicAdapter(provider: OcxProviderConfig, cacheRetenti
         // Extended thinking disallows temperature != 1 and top_p — drop both or the API 400s.
         delete body.temperature;
         delete body.top_p;
+      }
+
+      const textFormat = parsed.options.textFormat;
+      if (textFormat?.type === "json_schema" && textFormat.schema) {
+        const outputConfig = body.output_config;
+        body.output_config = {
+          ...(outputConfig && typeof outputConfig === "object" && !Array.isArray(outputConfig)
+            ? outputConfig
+            : {}),
+          format: {
+            type: "json_schema",
+            schema: normalizeAnthropicOutputSchema(textFormat.schema),
+          },
+        };
       }
 
       if (parsed.options.toolChoice && (tools || parsed.options.toolChoice === "none")) {

@@ -46,7 +46,7 @@ selector，而不是分配一个新名称。
 
 ## 保留的 OpenAI 提供者
 
-`openai` 和 `openai-apikey` 是固定的保留 id。`openai.codexAccountMode` 默认是 `"pool"`，会在主账户和新增账户之间选择；`"direct"` 只使用当前调用者/主登录态。API 只使用其配置的 API key 或 key 池。请使用裸模型名或 `openai-apikey/<model>`；不存在跨路由凭据回退。API 的 GPT-5.6 行携带 1,050,000 上下文 / 922,000 最大输入元数据，而 Pro 虚拟 id 会重写为基础线协议模型并带上 `reasoning.mode: "pro"`。
+`openai` 和 `openai-apikey` 是固定的保留 id。`openai.codexAccountMode` 默认是 `"pool"`，会在主账户和新增账户之间选择；`"direct"` 只使用当前调用者/主登录态。API 只使用其配置的 API key 或 key 池。请使用裸模型名或 `openai-apikey/<model>`；不存在跨路由凭据回退。API 的 GPT-5.6 行携带 922,000 上下文 / 922,000 最大输入元数据，而 Pro 虚拟 id 会重写为基础线协议模型并带上 `reasoning.mode: "pro"`。
 
 `openaiProviderTierVersion: 2` 标记当前的单提供者投影。对已发布的 v1 配置进行迁移之前，opencodex 会创建 `config.json.pre-openai-tiers-v2.bak`，且不会覆盖不同的备份文件，并会把已知的旧式命名空间选择 id 重写为裸 id。
 
@@ -56,6 +56,7 @@ selector，而不是分配一个新名称。
 | --- | --- | --- |
 | `adapter` | `string` | `openai-chat`、`openai-responses`、`anthropic`、`google`、`kiro`、`cursor`、`azure-openai`（或别名 `azure`）之一。 |
 | `baseUrl` | `string` | 上游 API 基础 URL。大多数内置固定端点会忽略不匹配的值；具备冲突安全键的预设会保留一个更早、同名的自定义目标。 |
+| `requestPacing?` | `{ enabled, requestsPerMinute?, minIntervalMs?, models? }` | 可选的客户端出站请求启动节流，与上游用量、计费和限流指标相互独立。提供商限制适用于所有模型，`models` 按上游模型精确 ID 匹配且只能增加延迟。排队等待不计入响应头超时。覆盖 HTTP、Responses WebSocket 以及显式适配器 `fetchResponse`/`runTurn` 调用。 |
 | `responsesPath?` | `string` | 用于 key-auth `openai-responses` 请求的相对资源路径。必须以 `/` 开头，且不能包含 scheme、query 或 fragment。 |
 | `supportsServiceTier?` | `boolean` | `service_tier` 能力的三态。`true`：fast 模式可以注入，调用方提供的值也会被保留。`false`：剥离该字段且绝不注入（已明确不支持的上游不会收到它）。未设置：未分类——调用方提供的值原样保留，fast 模式绝不注入。注册表已对官方 OpenAI（`true`）、DeepSeek 和 Volcengine Ark（`false`）分类；仅对真正支持分层的自定义网关显式设置。 |
 | `preserveResponsesReasoningContent?` | `boolean` | 在重放的 Responses reasoning 项中保留明文 reasoning 内容，而不是清空（清空是 ChatGPT 后端的规则）。对接受 reasoning 重放的上游（如 DeepSeek）启用。代理生成的 `ocxr1` 信封始终会被剥离。 |
@@ -93,6 +94,7 @@ selector，而不是分配一个新名称。
 | `noTemperatureModels?` | `string[]` | 会拒绝调用方指定 `temperature` 的模型。 |
 | `noTopPModels?` | `string[]` | 会拒绝调用方指定 `top_p` 的模型。 |
 | `noPenaltyModels?` | `string[]` | 会拒绝 presence/frequency penalty 的模型。 |
+| `noStructuredOutputModels?` | `string[]` | `openai-chat` 端点拒绝 `response_format` 的精确模型 ID。仅当请求模型与条目完全匹配时才省略该字段；其他 `openai-chat` 模型仍启用 structured-output 转换。 |
 | `parallelToolCalls?` | `boolean` | 切换并行工具调用。OpenAI Chat 默认开启；非 chat 适配器只有显式 `true` 时才会声明支持。 |
 | `responsesItemIdRepair?` | `{ message?: string[]; reasoning?: string[]; repairMissingTerminalIds?: boolean; repairInvalidIds?: boolean }` | 默认关闭的下游 SSE 修复，用于精确占位 id、缺失的终止 id，以及（`repairInvalidIds`）缺少规范 `msg_`/`rs_` 前缀的 message/reasoning id。function-call id 永远不会被重写。内置 DeepSeek 默认启用后两项。 |
 | `responsesSnapshotRepair?` | `boolean` | 默认关闭的客户端修复，用于补全 SSE 与 JSON 中稀疏 Responses 生命周期快照缺失的 status、output 和工具元数据；原始检查与持久化保持不变。 |
@@ -293,7 +295,7 @@ OpenRouter 可以通过多个推理提供者来提供同一个模型。`openRout
 
 当需要继续运行发现，但只有选定 id 应该出现在 Codex 和 `/v1/models` 中时，请使用 `selectedModels`。仪表板会保留完整的已发现列表，以便之后调整允许列表。
 
-预览版 GPT-5.6 回退条目使用相同机制。OpenAI API key 预设会为基础和 Pro id 设定 `1050000` 上下文和 `922000` 最大输入；OpenRouter 会为 `openai/gpt-5.6-sol`、`openai/gpt-5.6-terra` 和 `openai/gpt-5.6-luna` 设定 `1050000` 上下文。Pool/Direct 会声明 `372000`；同步后的目录会声明 `max`，同时保留 `xhigh` 的独立性。
+预览版 GPT-5.6 回退条目使用相同机制。OpenAI API key 预设会为基础和 Pro id 设定 `922000` 上下文和 `922000` 最大输入；OpenRouter 会为 `openai/gpt-5.6-sol`、`openai/gpt-5.6-terra` 和 `openai/gpt-5.6-luna` 设定 `922000` 上下文。Pool/Direct 会声明 `922000`；同步后的目录会声明 `max`，同时保留 `xhigh` 的独立性。
 
 ```json
 {

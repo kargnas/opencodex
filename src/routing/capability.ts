@@ -11,7 +11,9 @@
  */
 
 import type { OcxConfig } from "../types";
-import { isCanonicalOpenAiForwardProvider } from "../providers/openai-tiers";
+import { isCanonicalOpenAiForwardProvider, OPENAI_CODEX_PROVIDER_ID } from "../providers/openai-tiers";
+import { serviceTierSupportForModel } from "../providers/service-tier";
+import { applyProviderContextCap, providerContextCap } from "../providers/context-cap";
 import { PROVIDER_REGISTRY } from "../providers/registry";
 import {
   nativeInputModalities,
@@ -24,11 +26,12 @@ import { statSync } from "node:fs";
 import type { RouteCapabilityEvidence } from "./trace";
 
 type CatalogModelRow = {
+  /** Exact provider/native-id identity, from the provenance block. */
   provider: string;
   id: string;
+  /** Only values a real source asserted; never a strict-parser default. */
   contextWindow?: number;
   inputModalities?: string[];
-  reasoningEfforts?: string[];
   capabilities?: string[];
 };
 
@@ -50,23 +53,33 @@ function cachedCatalogModels(): CatalogModelRow[] {
     const catalog = readCatalog(path);
     const models = catalog?.models;
     if (!Array.isArray(models)) return [];
-    const rows = models
-      .filter((model): model is Record<string, unknown> & { id: string; provider: string } =>
-        typeof model === "object" && model !== null && typeof model.id === "string" && typeof model.provider === "string")
-      .map(model => ({
-        provider: model.provider,
-        id: model.id,
-        ...(typeof model.contextWindow === "number" ? { contextWindow: model.contextWindow } : {}),
-        ...(Array.isArray(model.inputModalities)
-          ? { inputModalities: model.inputModalities.filter((value): value is string => typeof value === "string") }
+    // Read ONLY `opencodex_capability_provenance` (written by
+    // applyCatalogModelMetadata). The row's own `context_window` and
+    // `input_modalities` always exist because ensureStrictCatalogFields fills them
+    // with compatibility defaults for Codex's strict parser, so reading them would
+    // turn "nobody asserted anything" into a confident `image: false` and a
+    // fabricated 128000 — the opposite of this module's contract. A row without
+    // provenance contributes nothing.
+    const rows = models.flatMap((model): CatalogModelRow[] => {
+      if (typeof model !== "object" || model === null) return [];
+      const provenance = (model as Record<string, unknown>).opencodex_capability_provenance;
+      if (typeof provenance !== "object" || provenance === null) return [];
+      const source = provenance as Record<string, unknown>;
+      if (typeof source.provider !== "string" || typeof source.model_id !== "string") return [];
+      return [{
+        provider: source.provider,
+        id: source.model_id,
+        ...(typeof source.context_window === "number" && source.context_window > 0
+          ? { contextWindow: source.context_window }
           : {}),
-        ...(Array.isArray(model.reasoningEfforts)
-          ? { reasoningEfforts: model.reasoningEfforts.filter((value): value is string => typeof value === "string") }
+        ...(Array.isArray(source.input_modalities)
+          ? { inputModalities: source.input_modalities.filter((value): value is string => typeof value === "string") }
           : {}),
-        ...(Array.isArray(model.capabilities)
-          ? { capabilities: model.capabilities.filter((value): value is string => typeof value === "string") }
+        ...(Array.isArray(source.capabilities)
+          ? { capabilities: source.capabilities.filter((value): value is string => typeof value === "string") }
           : {}),
-      }));
+      }];
+    });
     catalogCache = { path, mtimeMs, rows };
     return rows;
   } catch {
@@ -145,13 +158,18 @@ export function candidateCapabilityEvidence(
   const provider = config.providers[providerName];
   const registryEntry = PROVIDER_REGISTRY.find(entry => entry.id === providerName);
   const catalogRow = cachedCatalogModels().find(model => model.provider === providerName && model.id === modelId);
-  const isNative = providerName === "openai" && !modelId.includes("/");
+  const isNative = providerName === OPENAI_CODEX_PROVIDER_ID && !modelId.includes("/");
 
-  const contextWindow = provider?.modelContextWindows?.[modelId]
+  const rawContextWindow = provider?.modelContextWindows?.[modelId]
     ?? provider?.contextWindow
     ?? registryEntry?.modelContextWindows?.[modelId]
     ?? catalogRow?.contextWindow
     ?? (isNative ? nativeOpenAiContextWindow(modelId) : undefined);
+  // providerContextCaps.openai also ceilings native OpenAI rows (#1430), so routing
+  // evidence never contradicts a capped catalog entry.
+  const contextWindow = isNative
+    ? applyProviderContextCap(rawContextWindow, providerContextCap(config, OPENAI_CODEX_PROVIDER_ID)) ?? rawContextWindow
+    : rawContextWindow;
 
   const modalities = provider?.modelInputModalities?.[modelId]
     ?? registryEntry?.modelInputModalities?.[modelId]
@@ -170,17 +188,22 @@ export function candidateCapabilityEvidence(
   // override.
   const tools = capabilities.includes("tools")
     || isNative
-    || (catalogRow === undefined && provider !== undefined && TOOL_CAPABLE_ADAPTERS.has(provider.adapter))
+    // The adapter protocol is positive evidence on its own. This was once gated
+    // on `catalogRow === undefined`, which was only safe while the catalog lookup
+    // never matched anything: once it matches, a row that simply does not
+    // enumerate "tools" would silently revoke tool support for every openai-chat
+    // and anthropic candidate.
+    || (provider !== undefined && TOOL_CAPABLE_ADAPTERS.has(provider.adapter))
     || provider?.parallelToolCalls === true
     || undefined;
 
   const reasoningEfforts = provider?.modelReasoningEfforts?.[modelId]
     ?? registryEntry?.modelReasoningEfforts?.[modelId]
-    ?? catalogRow?.reasoningEfforts
     ?? (isNative ? nativeReasoningEfforts(modelId) : undefined);
 
-  const tierSupport = provider?.supportsServiceTier
-    ?? registryEntry?.supportsServiceTier;
+  const tierSupport = provider
+    ? serviceTierSupportForModel(provider, modelId, providerName)
+    : registryEntry ? serviceTierSupportForModel(registryEntry, modelId, providerName) : undefined;
   const serviceTier = tierSupport === true
     ? "supported"
     : tierSupport === false ? "unsupported" : "unknown";

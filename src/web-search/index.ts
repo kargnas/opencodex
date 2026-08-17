@@ -1,5 +1,6 @@
 import type { OcxConfig, OcxParsedRequest, OcxProviderConfig } from "../types";
 import { modelInList, toolChoiceToolPredicate } from "../types";
+import { isModelTextOnly } from "../vision";
 import type { SidecarSettings } from "./executor";
 import type { ResolvedOpenAiForwardSidecar } from "../providers/openai-sidecar";
 import { getAccountSet } from "../oauth/store";
@@ -120,6 +121,8 @@ export interface SidecarPlan {
   routedModelStallTimeoutMs: number;
   /** Effective bridge stall deadline for the sidecar turn (see webSearchStallTimeoutSec). */
   stallTimeoutSec: number;
+  /** Stream leading routed-model output live until the first tool-call boundary (opt-in). */
+  streamRoutedModelOutput: boolean;
 }
 
 export function shouldResolveOpenAiWebSearchSidecar(
@@ -164,8 +167,9 @@ export function planWebSearch(
     timeoutMs,
   );
   // The routed model being text-only means the search model must verbalize image results (either backend).
-  const describeImages = modelInList(provider.noVisionModels, modelId);
+  const describeImages = isModelTextOnly(provider, modelId);
   const reasoning = cfg.reasoning ?? DEFAULT_SIDECAR_REASONING;
+  const streamRoutedModelOutput = cfg.streamRoutedModelOutput === true;
 
   // Anthropic backend authenticates with the STORED credential — no forward provider or ChatGPT login gate.
   // resolveSidecarBackend only returns "anthropic" when it was explicitly configured OR a usable credential
@@ -181,6 +185,7 @@ export function planWebSearch(
       maxSearches,
       routedModelStallTimeoutMs,
       stallTimeoutSec,
+      streamRoutedModelOutput,
     };
   }
 
@@ -194,5 +199,6 @@ export function planWebSearch(
     maxSearches,
     routedModelStallTimeoutMs,
     stallTimeoutSec,
+    streamRoutedModelOutput,
   };
 }

@@ -1,8 +1,20 @@
-import type { AdapterEvent, OcxMessagePhase, OcxProviderContinuationState, OcxUsage } from "./types";
+import type {
+  AdapterEvent,
+  OcxMessagePhase,
+  OcxProviderContinuationState,
+  OcxProviderOpaqueToolCallMetadata,
+  OcxReasoningReplayScopeRef,
+  OcxUsage,
+} from "./types";
+import { coerceIntegerToolArguments } from "./lib/tool-argument-integers";
 import { adapterFailureFromMessage, classifyError, CYBER_POLICY_ERROR_CODE, isCyberPolicyCode, type OcxErrorPayload } from "./lib/errors";
 import { encodeCompactionSummary } from "./responses/compaction";
 import { encodeReasoningEnvelope, type ReasoningEnvelope } from "./responses/reasoning-envelope";
 import { rememberReasoningForCall } from "./responses/reasoning-replay-cache";
+import {
+  rememberAndSerializeExtraContent,
+  rememberExtraContentForReplay,
+} from "./responses/thought-signature-replay";
 import { resolveStallTimeoutSec } from "./stall-timeout";
 import { usageDisplayTotalTokens } from "./usage/totals";
 import {
@@ -85,10 +97,11 @@ function responseError(status: number, type: string, message: string): OcxErrorP
  * non-stream adapters degrade a bad payload to `{}`.
  */
 function toolCallArgumentsUsable(args: string): boolean {
+  if (args.length === 0) return true;
   const trimmed = args.trim();
-  if (!trimmed) return true;
+  if (!trimmed) return false;
   try {
-    JSON.parse(trimmed);
+    JSON.parse(args);
     return true;
   } catch {
     return false;
@@ -180,13 +193,17 @@ export function bridgeToResponsesSSE(
      * from this callback instead of re-parsing the bridged SSE.
      */
     onUsage?: (usage: OcxUsage | undefined) => void;
+    /** Request-visible tool names. When present, an upstream call outside this set fails closed. */
+    declaredToolNames?: ReadonlySet<string>;
+    /** Declared parameter schema per tool name; repairs integral-float integer args (#1611). */
+    toolParameterSchemas?: ReadonlyMap<string, Record<string, unknown>>;
     translatorBudget?: TranslatorBudget;
     /**
      * Conversation identity for the reasoning replay cache (issue #950).
      * Provider call ids are not globally unique; scoping by thread keeps one
      * conversation's reasoning out of another's continuations.
      */
-    replayCacheScope?: string;
+    replayCacheScope?: OcxReasoningReplayScopeRef;
     /**
      * Test seam for the wire/stall beat loop. Production omits this and uses the
      * global timers; injecting here must not change scheduling semantics.
@@ -197,7 +214,7 @@ export function bridgeToResponsesSSE(
     };
   },
 ): ReadableStream<Uint8Array> {
-  const replayCacheScope = options?.replayCacheScope ?? "global";
+  const replayCacheScope = options?.replayCacheScope;
   const setBeatInterval = options?.timers?.setInterval ?? ((handler: () => void, ms: number) => setInterval(handler, ms));
   const clearBeatInterval = options?.timers?.clearInterval ?? ((id: unknown) => clearInterval(id as ReturnType<typeof setInterval>));
   // Freeform/custom tools (apply_patch) carry their body in `input`; the model is given a
@@ -484,7 +501,7 @@ export function bridgeToResponsesSSE(
       // synthetic compaction item's payload on done.
       let compactionText = "";
       let compactionTextBytes = 0;
-      let currentToolCall: { itemId: string; outputIndex: number; callId: string; name: string; args: string; argsBytes: number; namespace?: string; freeform?: boolean; toolSearch?: boolean; inputEmitted?: string } | null = null;
+      let currentToolCall: { itemId: string; outputIndex: number; callId: string; name: string; args: string; argsBytes: number; namespace?: string; freeform?: boolean; toolSearch?: boolean; inputEmitted?: string; providerMetadata?: OcxProviderOpaqueToolCallMetadata } | null = null;
       // Open native web-search cell (between begin and end). Holds the output index allocated on
       // begin so the matching done reuses it; closed as `failed` if the stream terminates early.
       let currentWebSearch: { itemId: string; eventId: string; outputIndex: number } | null = null;
@@ -573,7 +590,13 @@ export function bridgeToResponsesSSE(
         // Empty input (no-arg tools like computer_use get_app_state / list_apps) must serialize as
         // "{}", never "" — Codex echoes the call back as a function_call next turn, and JSON.parse("")
         // would 400 the whole session ("invalid JSON arguments"), poisoning all later turns.
-        const argsStr = currentToolCall.args || "{}";
+        // #1611: Grok serializes integer arguments through a float, so `120000.0`
+        // reaches Codex and is REJECTED before the tool runs. Repair integral floats
+        // against the declared schema; a non-integral value stays an error.
+        const argsStr = coerceIntegerToolArguments(
+          currentToolCall.args || "{}",
+          options?.toolParameterSchemas?.get(currentToolCall.name),
+        );
         // Finalize streamed function-call arguments so Codex commits the call (incl. MCP / computer_use).
         if (!currentToolCall.freeform && !currentToolCall.toolSearch) {
           emit("response.function_call_arguments.done", {
@@ -586,6 +609,9 @@ export function bridgeToResponsesSSE(
             input: freeformInput(currentToolCall.args),
           });
         }
+        // Freeform tools serialize as custom_tool_call without extra_content; remember the
+        // signature server-side regardless so the replayed call can be re-signed (#1735).
+        void rememberExtraContentForReplay(currentToolCall.callId, currentToolCall.providerMetadata, replayCacheScope);
         const item = currentToolCall.toolSearch
           ? {
               type: "tool_search_call", id: currentToolCall.itemId,
@@ -603,6 +629,10 @@ export function bridgeToResponsesSSE(
               call_id: currentToolCall.callId, name: currentToolCall.name,
               arguments: argsStr, status: "completed",
               ...(currentToolCall.namespace ? { namespace: currentToolCall.namespace } : {}),
+              // Provider-opaque metadata (issue #1735) rides the item so a client that replays
+              // this history can hand the signature back on the part it belongs to. The proxy
+              // also remembers it server-side for clients that never echo extra_content.
+              ...(rememberAndSerializeExtraContent(currentToolCall.callId, currentToolCall.providerMetadata, replayCacheScope).extra ?? {}),
             };
         emit("response.output_item.done", { output_index: currentToolCall.outputIndex, item });
         retainFinishedItem(item as OutputItem);
@@ -620,6 +650,7 @@ export function bridgeToResponsesSSE(
       const failCurrentToolCall = () => {
         if (!currentToolCall) return;
         const argsStr = currentToolCall.args || "{}";
+        void rememberExtraContentForReplay(currentToolCall.callId, currentToolCall.providerMetadata, replayCacheScope);
         const item = currentToolCall.toolSearch
           ? {
               type: "tool_search_call", id: currentToolCall.itemId,
@@ -637,6 +668,10 @@ export function bridgeToResponsesSSE(
               call_id: currentToolCall.callId, name: currentToolCall.name,
               arguments: argsStr, status: "incomplete",
               ...(currentToolCall.namespace ? { namespace: currentToolCall.namespace } : {}),
+              // An incomplete call can still be persisted and replayed (max_output_tokens), so it
+              // carries the same metadata as the completed item — otherwise SSE and buffered JSON
+              // would disagree about whether the signature survives.
+              ...(rememberAndSerializeExtraContent(currentToolCall.callId, currentToolCall.providerMetadata, replayCacheScope).extra ?? {}),
             };
         emit("response.output_item.done", { output_index: currentToolCall.outputIndex, item });
         retainFinishedItem(item as OutputItem);
@@ -968,6 +1003,23 @@ export function bridgeToResponsesSSE(
               if (currentToolCall) closeCurrentToolCall();
               const mapped = toolNsMap?.get(event.name);
               const realName = mapped?.name ?? event.name;
+              if (options?.declaredToolNames && !options.declaredToolNames.has(event.name)) {
+                const failure = responseError(
+                  502,
+                  "upstream_error",
+                  `routed provider emitted undeclared client tool "${event.name}"; only request-declared tools may be called`,
+                );
+                emit("response.failed", {
+                  response: {
+                    ...responseSnapshot("failed", finishedItems),
+                    error: failure,
+                    last_error: failure,
+                  },
+                });
+                reportTerminal("failed");
+                terminalEvent = true;
+                break;
+              }
               const ns = mapped?.namespace;
               const toolSearch = toolSearchToolNames?.has(realName) ?? false;
               const freeform = !toolSearch && (freeformToolNames?.has(realName) ?? false);
@@ -978,7 +1030,7 @@ export function bridgeToResponsesSSE(
                 ? { type: "custom_tool_call", id: itemId, call_id: event.id, name: realName, input: "", status: "in_progress" }
                 : { type: "function_call", id: itemId, call_id: event.id, name: realName, arguments: "", status: "in_progress", ...(ns ? { namespace: ns } : {}) };
               emit("response.output_item.added", { output_index: outputIndex, item });
-              currentToolCall = { itemId, outputIndex, callId: event.id, name: realName, args: "", argsBytes: 0, namespace: ns, freeform, toolSearch };
+              currentToolCall = { itemId, outputIndex, callId: event.id, name: realName, args: "", argsBytes: 0, namespace: ns, freeform, toolSearch, providerMetadata: event.providerMetadata };
               budget?.openCall(event.id);
               break;
             }
@@ -1353,6 +1405,10 @@ function buildResponseJSONWithBudget(
   options?: {
     hideThinkingSummary?: boolean;
     toolNsMap?: Map<string, { namespace: string; name: string }>;
+    /** Request-visible tool names. When present, an upstream call outside this set fails closed. */
+    declaredToolNames?: ReadonlySet<string>;
+    /** Declared parameter schema per tool name; repairs integral-float integer args (#1611). */
+    toolParameterSchemas?: ReadonlyMap<string, Record<string, unknown>>;
     freeformToolNames?: Set<string>;
     toolSearchToolNames?: Set<string>;
     /** Remote compaction v2 turn — append one synthetic compaction output item (see bridgeToResponsesSSE). */
@@ -1362,11 +1418,11 @@ function buildResponseJSONWithBudget(
     onUsage?: (usage: OcxUsage | undefined) => void;
     translatorBudget?: TranslatorBudget;
     /** Conversation identity for the reasoning replay cache (issue #950). */
-    replayCacheScope?: string;
+    replayCacheScope?: OcxReasoningReplayScopeRef;
   },
 ): Record<string, unknown> {
   const responseId = `resp_${uuid()}`;
-  const replayCacheScope = options?.replayCacheScope ?? "global";
+  const replayCacheScope = options?.replayCacheScope;
   const output: OutputItem[] = [];
   const budget = options?.translatorBudget;
   const encoder = new TextEncoder();
@@ -1437,6 +1493,7 @@ function buildResponseJSONWithBudget(
   let currentToolCallId = "";
   let currentToolCallName = "";
   let currentToolCallArgs = "";
+  let currentToolCallProviderMetadata: OcxProviderOpaqueToolCallMetadata | undefined;
   let currentToolCallArgsBytes = 0;
   // Web-search citations awaiting the next assistant message (attached as url_citation annotations).
   let pendingWebSources: { url: string; title?: string }[] = [];
@@ -1521,11 +1578,20 @@ function buildResponseJSONWithBudget(
     const ns = mapped?.namespace;
     const toolSearch = options?.toolSearchToolNames?.has(realName) ?? false;
     const freeform = !toolSearch && (options?.freeformToolNames?.has(realName) ?? false);
+    // #1611: same integral-float repair as the streaming path. Keyed by the wire name
+    // the request declared, which is the pre-namespace-mapping `currentToolCallName`.
+    const coercedArgs = coerceIntegerToolArguments(
+      currentToolCallArgs,
+      options?.toolParameterSchemas?.get(currentToolCallName),
+    );
+    // Freeform tools serialize as custom_tool_call without extra_content; remember the
+    // signature server-side regardless so the replayed call can be re-signed (#1735).
+    void rememberExtraContentForReplay(currentToolCallId, currentToolCallProviderMetadata, replayCacheScope);
     if (toolSearch) {
       pushOutput({
         type: "tool_search_call", id: `tsc_${uuid()}`,
         call_id: currentToolCallId, execution: "client",
-        arguments: parseArgsObj(currentToolCallArgs), status,
+        arguments: parseArgsObj(coercedArgs), status,
       });
     } else if (freeform) {
       pushOutput({
@@ -1537,18 +1603,29 @@ function buildResponseJSONWithBudget(
       pushOutput({
         type: "function_call", id: `fc_${uuid()}`,
         call_id: currentToolCallId, name: realName,
-        arguments: currentToolCallArgs || "{}", status,
+        arguments: coercedArgs || "{}", status,
         ...(ns ? { namespace: ns } : {}),
+        ...(rememberAndSerializeExtraContent(currentToolCallId, currentToolCallProviderMetadata, replayCacheScope).extra ?? {}),
       });
     }
     budget?.closeCall(currentToolCallId);
     currentToolCallId = "";
     currentToolCallName = "";
+    currentToolCallProviderMetadata = undefined;
     currentToolCallArgs = "";
     currentToolCallArgsBytes = 0;
   };
 
   for (const e of events) {
+    if (errorEvent) {
+      // Match streaming: once the turn fails, later parallel calls must not become executable
+      // completed output. Still release every retained event in order and preserve terminal usage.
+      if (e.type === "error" || e.type === "incomplete" || e.type === "done") {
+        usage = e.usage ?? usage;
+      }
+      if (budget) releaseTranslatedEvent(e, budget);
+      continue;
+    }
     switch (e.type) {
       case "assistant_boundary":
         flushText("commentary");
@@ -1635,11 +1712,21 @@ function buildResponseJSONWithBudget(
           rememberReasoningForCall(e.id, rawReasoningForNextToolCall, replayCacheScope);
         }
         flushToolCall();
+        if (options?.declaredToolNames && !options.declaredToolNames.has(e.name)) {
+          errorEvent = {
+            type: "error",
+            message: `routed provider emitted undeclared client tool "${e.name}"; only request-declared tools may be called`,
+            status: 502,
+            errorType: "upstream_error",
+          };
+          break;
+        }
         currentToolCallId = e.id;
         budget?.openCall(e.id);
         currentToolCallName = e.name;
         currentToolCallArgs = "";
         currentToolCallArgsBytes = 0;
+        currentToolCallProviderMetadata = e.providerMetadata;
         break;
       case "tool_call_delta":
         {
