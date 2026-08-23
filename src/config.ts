@@ -1,10 +1,11 @@
 import { execFileSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { chmodSync, constants as fsConstants, copyFileSync, existsSync, linkSync, lstatSync, mkdirSync, readFileSync, realpathSync, renameSync, truncateSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, constants as fsConstants, copyFileSync, existsSync, linkSync, lstatSync, mkdirSync, readFileSync, realpathSync, truncateSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { Database } from "bun:sqlite";
 import * as z from "zod/v4";
+import { isValidProviderName, hasOwnProvider } from "./config/provider-name";
 import {
   bumpConfigGenerationAtPath,
   bumpCurrentConfigGeneration,
@@ -65,13 +66,16 @@ import {
   type OcxConfig,
   type OcxApiKeyEntry,
   type OcxProviderConfig,
+  type FastWire,
   type ProviderCostOverlay,
 } from "./types";
 import { isCanonicalOpenAiForwardProvider, OPENAI_CODEX_PROVIDER_ID } from "./providers/openai-tiers";
+import { fastWireDeclarationError, hasFastWireCapabilityConflict } from "./providers/fastwire";
 import {
   getProviderRegistryEntry,
   providerMatchesRegistryTransport,
   providerModelWireDefault,
+  registryModelServiceTierCapabilityApplies,
 } from "./providers/registry";
 import { resolveOpenAiVirtualModel } from "./providers/openai-virtual-models";
 import { parseDesktopProfile } from "./claude/desktop-profile";
@@ -93,34 +97,13 @@ import { isHostedToolUnsupportedForModel } from "./responses/hosted-tool-policy"
 
 let _atomicSeq = 0;
 
-interface AtomicRenameIO {
-  platform: NodeJS.Platform;
-  rename: (source: string, destination: string) => void;
-  sleep: (milliseconds: number) => void;
-}
-
-export function renameAtomicFile(
-  source: string,
-  destination: string,
-  io: AtomicRenameIO = {
-    platform: process.platform,
-    rename: renameSync,
-    sleep: Bun.sleepSync,
-  },
-): void {
-  for (let attempt = 0; ; attempt += 1) {
-    try {
-      io.rename(source, destination);
-      return;
-    } catch (error) {
-      const code = (error as NodeJS.ErrnoException).code;
-      const transientWindowsError = io.platform === "win32"
-        && (code === "EBUSY" || code === "EPERM" || code === "EACCES");
-      if (!transientWindowsError || attempt >= 2) throw error;
-      io.sleep(25 * (attempt + 1));
-    }
-  }
-}
+// The Windows-tolerant replace lives in lib/windows-atomic-replace: config-ownership
+// is one of its callers and this module already imports config-ownership, so
+// exporting it from here would close an import cycle. Re-exported because these
+// names are part of this module's public surface and its callers.
+export type { AtomicRenameIO } from "./lib/windows-atomic-replace";
+export { renameAtomicFile } from "./lib/windows-atomic-replace";
+import { renameAtomicFile, renameAtomicFileAsync } from "./lib/windows-atomic-replace";
 
 /**
  * Write a file atomically (temp + rename) so concurrent writers — e.g. `ocx stop` and the
@@ -282,21 +265,6 @@ export interface AtomicWriteAsyncIO {
 /** Test-only crash seam. Production callers leave this undefined. */
 export interface AtomicWriteAsyncTestSeam {
   afterTempWrite?: (tempPath: string) => void | Promise<void>;
-}
-
-async function renameAtomicFileAsync(source: string, destination: string): Promise<void> {
-  for (let attempt = 0; ; attempt += 1) {
-    try {
-      renameSync(source, destination);
-      return;
-    } catch (error) {
-      const code = (error as NodeJS.ErrnoException).code;
-      const transientWindowsError = process.platform === "win32"
-        && (code === "EBUSY" || code === "EPERM" || code === "EACCES");
-      if (!transientWindowsError || attempt >= 2) throw error;
-      await Bun.sleep(25 * (attempt + 1));
-    }
-  }
 }
 
 /**
@@ -672,12 +640,14 @@ export function getRuntimeDir(): string | undefined {
 }
 
 const warnedConfigFallbacks = new Set<string>();
+const warnedInheritedFastWireConflicts = new Set<string>();
 let lastWarningReconciledGeneration = 0;
 
 export function reconcileConfigWarningMemos(generation: number): number {
   if (generation <= lastWarningReconciledGeneration) return 0;
-  const removed = warnedConfigFallbacks.size;
+  const removed = warnedConfigFallbacks.size + warnedInheritedFastWireConflicts.size;
   warnedConfigFallbacks.clear();
+  warnedInheritedFastWireConflicts.clear();
   lastWarningReconciledGeneration = generation;
   return removed;
 }
@@ -726,6 +696,16 @@ export function requestPacingConfigError(value: unknown): string | null {
   return "requestPacing must contain enabled and a valid requestsPerMinute/minIntervalMs provider rule or model overrides";
 }
 
+const fastWireSchema = z.object({
+  kind: z.string(),
+  canonicalToWire: z.record(z.string().trim(), z.string().trim()),
+  foreignCallerTiers: z.string(),
+  betas: z.array(z.string().trim()).optional(),
+}).strict().superRefine((fastWire, ctx) => {
+  const error = fastWireDeclarationError({ fastWire });
+  if (error) ctx.addIssue({ code: "custom", message: error });
+}).transform(fastWire => fastWire as FastWire);
+
 /**
  * Zod schema for one provider entry: known fields are validated strictly while unknown
  * fields pass through (preserved for runtime extensions).
@@ -741,9 +721,11 @@ const providerConfigSchema = z.object({
   responsesPath: z.string().min(1).optional(),
   statelessResponses: z.boolean().optional(),
   requiresAdjacentResponsesToolResults: z.boolean().optional(),
+  fastWire: fastWireSchema.nullable().optional(),
   supportsServiceTier: z.boolean().optional(),
   modelSupportsServiceTier: z.record(z.string().min(1), z.boolean()).optional(),
   preserveResponsesReasoningContent: z.boolean().optional(),
+  decodesNativeCompactionBlobs: z.boolean().optional(),
   allowPrivateNetwork: z.boolean().optional(),
   // The management API accepts `null` as "clear this", so a config written before the POST
   // canonicalization below can hold one on disk. Rejecting it here would send the operator
@@ -751,11 +733,17 @@ const providerConfigSchema = z.object({
   upstreamHttpVersion: z.enum(UPSTREAM_HTTP_VERSION_VALUES)
     .nullish()
     .transform(value => value ?? undefined),
+  directGeminiWireRenames: z.boolean().optional(),
   noStructuredOutputModels: z.array(z.string().min(1))
     .transform(normalizeNonBlankStringArray)
     .optional(),
   retryOn429: retryOn429PolicySchema.optional(),
   codexAccountMode: z.enum(["pool", "direct"]).optional(),
+  // Validated rather than passed through: this schema ends in `.passthrough()`, so an
+  // undeclared key survives verbatim. A misspelled `codexToolMode` therefore used to be
+  // accepted, persisted, and then silently resolved to the `code_mode_only` default — the
+  // operator asked for shell mode, got code mode, and was told nothing (#2106).
+  codexToolMode: z.enum(["code_mode_only", "shell"]).optional(),
   responsesItemIdRepair: z.object({
     message: z.array(z.string().min(1)).optional(),
     reasoning: z.array(z.string().min(1)).optional(),
@@ -765,19 +753,6 @@ const providerConfigSchema = z.object({
   responsesSnapshotRepair: z.boolean().optional(),
 }).passthrough();
 
-const RESERVED_PROVIDER_NAMES = new Set([
-  // JavaScript prototype-pollution guards.
-  "__proto__",
-  "prototype",
-  "constructor",
-  // System-reserved routing namespace (resolved before provider/account
-  // namespaces in routeModelInternal). "combo" is intentionally NOT reserved:
-  // a physical provider named `combo` is a supported pattern (combo aliases
-  // hosted on the combo provider), and the combo selector only wins when an
-  // actual combo id matches.
-  "policy",
-]);
-const PROVIDER_NAME_PATTERN = /^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,62}[A-Za-z0-9])?$/;
 const HEADER_NAME_PATTERN = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/;
 const SENSITIVE_PROVIDER_HEADERS = new Set([
   "authorization",
@@ -789,16 +764,7 @@ const SENSITIVE_PROVIDER_HEADERS = new Set([
   "x-amz-security-token",
 ]);
 
-export function isValidProviderName(name: string): boolean {
-  const trimmed = name.trim();
-  return trimmed === name
-    && PROVIDER_NAME_PATTERN.test(name)
-    && !RESERVED_PROVIDER_NAMES.has(name.toLowerCase());
-}
-
-export function hasOwnProvider(providers: Record<string, unknown>, name: string): boolean {
-  return Object.prototype.hasOwnProperty.call(providers, name);
-}
+export { isValidProviderName, hasOwnProvider } from "./config/provider-name";
 
 export function providerBaseUrlConfigError(baseUrl: string): string | null {
   try {
@@ -1425,6 +1391,13 @@ const configSchema = z.object({
       });
     }
     const provider = config.providers[name];
+    if (hasFastWireCapabilityConflict(provider)) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["providers", redactSecretString(name), "fastWire"],
+        message: "fastWire=null conflicts with supportsServiceTier=true",
+      });
+    }
     const openRouterRoutingError = openRouterRoutingConfigError(provider);
     if (openRouterRoutingError) {
       ctx.addIssue({
@@ -2164,6 +2137,54 @@ function warnDegradedNativeSubagentConfig(rawParsed: unknown, config: OcxConfig)
 }
 
 /**
+ * Registry metadata can gain service-tier capability after a config was written. An explicit
+ * `fastWire: null` remains authoritative on load and on whole-document writes; rejecting either
+ * would discard or lock access to unrelated providers and API keys. Direct contradictions within
+ * one provider row remain schema errors through the outer config refinement, where the dynamic
+ * provider name can be redacted before it reaches diagnostics.
+ */
+function inheritedFastWireConflictProviderNames(
+  config: Pick<OcxConfig, "providers">,
+): string[] {
+  const conflicts: string[] = [];
+  for (const [name, provider] of Object.entries(config.providers)) {
+    if (provider.fastWire !== null || provider.supportsServiceTier === false) continue;
+    const registry = providerMatchesRegistryTransport(name, provider)
+      ? getProviderRegistryEntry(name)
+      : undefined;
+    if (!registry) continue;
+    const effectiveProviderCapability = provider.supportsServiceTier ?? registry.supportsServiceTier;
+    const effectiveModelCapabilities = {
+      ...(registryModelServiceTierCapabilityApplies(registry, provider)
+        ? registry.modelSupportsServiceTier ?? {}
+        : {}),
+      ...(provider.modelSupportsServiceTier ?? {}),
+    };
+    if (
+      effectiveProviderCapability === true
+      || Object.values(effectiveModelCapabilities).some(value => value === true)
+    ) {
+      conflicts.push(name);
+    }
+  }
+  return conflicts;
+}
+
+function inheritedFastWireConflictWarning(name: string): string {
+  return `providers.${redactSecretString(name)}.fastWire=null overrides service-tier capability inherited from the matching registry entry`;
+}
+
+function warnInheritedFastWireConflicts(configPath: string, config: OcxConfig): void {
+  const names = inheritedFastWireConflictProviderNames(config);
+  if (names.length === 0 || warnedInheritedFastWireConflicts.has(configPath)) return;
+  warnedInheritedFastWireConflicts.add(configPath);
+  console.warn(
+    `⚠️  config.json ${names.map(inheritedFastWireConflictWarning).join("; ")}. `
+    + "The persisted providers and API keys were preserved.",
+  );
+}
+
+/**
  * Load and validate config.json into an OcxConfig. Missing files reset to
  * defaults and clear stale overlays. Broken existing files also fall back to
  * default routing (after backup), but keep the last-good cost-overlay registry
@@ -2187,6 +2208,7 @@ export function loadConfig(): OcxConfig {
     const result = configSchema.safeParse(parsed);
     if (result.success) {
       const config = normalizeApiKeyIds(result.data as OcxConfig);
+      warnInheritedFastWireConflicts(configPath, config);
       warnDegradedStreamMode(parsed, config);
       warnDegradedHostname(parsed, config);
       warnDegradedApiKeys(parsed, config);
@@ -2211,6 +2233,7 @@ export function loadConfig(): OcxConfig {
     if (retryResult.success) {
       warnConfigRepaired(configPath, result.error);
       const config = normalizeApiKeyIds(retryResult.data as OcxConfig);
+      warnInheritedFastWireConflicts(configPath, config);
       warnDegradedHostname(parsed, config);
       warnDegradedApiKeys(parsed, config);
       warnDegradedCodexAccountPriorities(parsed, config);
@@ -2230,6 +2253,7 @@ export function loadConfig(): OcxConfig {
       {
         warnDroppedConfigSections(configPath, salvaged.dropped, salvaged.issues);
         const config = normalizeApiKeyIds(salvaged.parsed);
+        warnInheritedFastWireConflicts(configPath, config);
         warnDegradedHostname(parsed, config);
         warnDegradedApiKeys(parsed, config);
         warnDegradedCodexAccountPriorities(parsed, config);
@@ -2289,6 +2313,7 @@ function validFileConfigDiagnostics(config: OcxConfig, rawParsed: unknown): Conf
   const rawEffort = rawClaudeSubagentEffort(rawParsed);
   const normalized = normalizeClaudeSubagentEffort(normalizeNativeSubagentSync(config, rawParsed), rawParsed);
   const warnings = configPlaceholderWarnings(normalized);
+  warnings.push(...inheritedFastWireConflictProviderNames(normalized).map(inheritedFastWireConflictWarning));
   warnings.push(...degradedCodexAccountPriorityWarnings(rawParsed, normalized));
   if (rawEffort !== undefined && !isClaudeSubagentEffort(rawEffort)) {
     warnings.push(`claudeCode.subagentEffort ignored: expected one of ${CLAUDE_SUBAGENT_EFFORTS.join(", ")}`);
@@ -2502,7 +2527,10 @@ export function validateConfigCandidate(value: unknown): { ok: true; config: Ocx
     ?? loopbackListenerPortError(value);
   if (boundaryError) return { ok: false, error: boundaryError };
   const result = configSchema.safeParse(value);
-  if (result.success) return { ok: true, config: normalizeApiKeyIds(result.data as OcxConfig) };
+  if (result.success) {
+    const config = normalizeApiKeyIds(result.data as OcxConfig);
+    return { ok: true, config };
+  }
   return { ok: false, error: schemaDiagnosticsError(result.error) };
 }
 

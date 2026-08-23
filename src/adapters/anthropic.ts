@@ -594,6 +594,63 @@ function orphanToolResultText(msg: OcxToolResultMessage): string {
   return `[tool_result without adjacent tool_use: ${label}]\n${content}`;
 }
 
+/**
+ * AgentRouter answers 400 `content-blocked` when the first user message is not in English
+ * (#2074), while the same request in English returns 200. The gateway is inspecting the opening
+ * user content, so an Anthropic `system` string cannot reach it — the framing has to sit in the
+ * first user turn.
+ */
+const AGENTROUTER_LANGUAGE_PREAMBLE =
+  "[Instruction: Process the user request below and respond in the appropriate language.]";
+
+/**
+ * Exact host match, not a substring.
+ *
+ * A `hostname.includes("agentrouter")` test also matches `notagentrouter.example` and
+ * `agentrouter.org.attacker.example`, which would let an unrelated destination silently
+ * receive an injected instruction block. A prompt mutation keyed on a provider's identity
+ * must be keyed on that identity exactly.
+ */
+function isAgentRouterEndpoint(baseUrl: string): boolean {
+  try {
+    const { hostname } = new URL(baseUrl);
+    return hostname === "agentrouter.org" || hostname.endsWith(".agentrouter.org");
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Prepend the framing as its OWN text block instead of splicing it into the user's string.
+ *
+ * The distinction matters: rewriting `content` to `${marker}\n\n${original}` edits what the
+ * user wrote, and every downstream consumer — logs, retries, an upstream that echoes the turn —
+ * then sees a sentence the user never typed as if they had. A separate leading block carries the
+ * same signal to the filter while the original text survives byte-for-byte.
+ *
+ * Only the first user turn is framed, because only the first is what the gateway rejects.
+ */
+function applyAgentRouterLanguageFraming(messages: unknown[]): void {
+  const firstUser = messages.find(
+    (m): m is { role: string; content: unknown } =>
+      typeof m === "object" && m !== null && (m as { role?: unknown }).role === "user",
+  );
+  if (!firstUser) return;
+  const preamble = { type: "text", text: AGENTROUTER_LANGUAGE_PREAMBLE };
+  if (typeof firstUser.content === "string") {
+    firstUser.content = firstUser.content === ""
+      ? [preamble]
+      : [preamble, { type: "text", text: firstUser.content }];
+    return;
+  }
+  if (!Array.isArray(firstUser.content)) return;
+  // Idempotence is keyed on the LEADING block being exactly the marker. A substring test would
+  // let a user who quotes the marker later in their own prompt suppress the framing entirely.
+  const [head] = firstUser.content as { type?: unknown; text?: unknown }[];
+  if (head?.type === "text" && head.text === AGENTROUTER_LANGUAGE_PREAMBLE) return;
+  (firstUser.content as unknown[]).unshift(preamble);
+}
+
 function messagesToAnthropicFormat(
   parsed: OcxParsedRequest,
   toolNames: { toWire: (name: string) => string },
@@ -743,7 +800,7 @@ function toolsToAnthropicFormat(parsed: OcxParsedRequest, toolNames: { toWire: (
     ? new Set(parsed.options.toolChoice.allowedTools)
     : undefined;
   const tools = allowed
-    ? parsed.context.tools.filter(t => toolAllowedByChoice(t, allowed))
+    ? parsed.context.tools.filter(t => toolAllowedByChoice(t, allowed, parsed.context.tools))
     : parsed.context.tools;
   if (tools.length === 0) return undefined;
   const converted = tools.map(t => ({
@@ -833,6 +890,8 @@ export function createAnthropicAdapter(provider: OcxProviderConfig, cacheRetenti
       }
 
       const { system, messages } = messagesToAnthropicFormat(parsed, toolNames);
+      // Before image normalization, so the framing block is present for every downstream pass.
+      if (isAgentRouterEndpoint(provider.baseUrl)) applyAgentRouterLanguageFraming(messages);
       // Primary image layer: resize/re-encode to fit Anthropic limits without dropping
       // (anthropic-image-normalize.ts); the guard below remains the deterministic backstop.
       // imageTierBias > 0 = upstream-413 tightened retry (030): start every image one tier lower.
@@ -989,6 +1048,18 @@ export function createAnthropicAdapter(provider: OcxProviderConfig, cacheRetenti
       const emitDone = function* (): Generator<AdapterEvent> {
         if (emittedDone) return;
         emittedDone = true;
+        // An `error` stop reason is a failed generation, not a stop. Forwarding it as `done`
+        // lets the turn report success and install replacement history on a compaction turn.
+        if (pendingStopReason === "error") {
+          yield {
+            type: "error",
+            message: "upstream ended the turn with stop_reason \"error\"",
+            status: 502,
+            errorType: "upstream_error",
+            usage: usageFromAnthropic(pendingUsage),
+          };
+          return;
+        }
         yield {
           type: "done",
           usage: usageFromAnthropic(pendingUsage),
@@ -1143,6 +1214,21 @@ export function createAnthropicAdapter(provider: OcxProviderConfig, cacheRetenti
       if (!emittedDone) {
         // Fail closed on transport EOF. Compatible providers may omit message_stop after message_delta.stop_reason.
         if (pendingStopReason !== undefined) {
+          // Same rule as emitDone: an `error` stop reason is a failed generation, not a stop.
+          // This branch bypasses emitDone entirely (it exists for providers that close after
+          // message_delta without message_stop), so the check has to be repeated here or the
+          // EOF route silently reports success.
+          if (pendingStopReason === "error") {
+            emittedDone = true;
+            yield {
+              type: "error",
+              message: "upstream ended the turn with stop_reason \"error\"",
+              status: 502,
+              errorType: "upstream_error",
+              usage: usageFromAnthropic(pendingUsage),
+            };
+            return;
+          }
           const stopReason = pendingStopReason === "max_tokens"
             ? "max_tokens"
             : pendingStopReason === "refusal" || pendingStopReason === "content_filter"
@@ -1210,6 +1296,21 @@ export function createAnthropicAdapter(provider: OcxProviderConfig, cacheRetenti
       }
       const usage = json.usage as Record<string, number> | undefined;
       const stopReason = typeof json.stop_reason === "string" ? json.stop_reason : undefined;
+      // An Anthropic-compatible upstream can forward an `error` stop reason verbatim. As a
+      // `done` it reads as a clean completion, so the turn reports success and — on a compaction
+      // turn — installs its partial summary as replacement history (#422). Usage is preserved:
+      // a failed turn still consumed tokens.
+      if (stopReason === "error") {
+        events.push({
+          type: "error",
+          message: "upstream ended the turn with stop_reason \"error\"",
+          status: 502,
+          errorType: "upstream_error",
+          usage: usageFromAnthropic(usage),
+        });
+        retainTranslatedEventBatch(events, budget);
+        return events;
+      }
       events.push({
         type: "done",
         usage: usageFromAnthropic(usage),

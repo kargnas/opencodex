@@ -36,6 +36,25 @@ import { setTrustedWindowsSystemDirectoryResolverForTests } from "../src/lib/win
 import { AtomicWriteResidualTempError, atomicWriteFile, atomicWriteFileAsync, hardenConfigDir, hardenExistingSecret, renameAtomicFile, saveConfig } from "../src/config";
 let testDir = "";
 
+/**
+ * Windows without Developer Mode or admin cannot create a file symlink (EPERM).
+ * Detect once so the dotfiles cases below report a visible skip there rather than
+ * a spurious failure in the fixture, before the writer under test is ever called.
+ * Mirrors the probe in codex-service-manager-probe and claude-agents-inject.
+ */
+const canSymlink = (() => {
+  const dir = mkdtempSync(join(tmpdir(), "ocx-config-symlink-probe-"));
+  try {
+    symlinkSync(join(dir, "probe-target"), join(dir, "probe-link"));
+    return true;
+  } catch (e: unknown) {
+    if ((e as NodeJS.ErrnoException).code === "EPERM") return false;
+    throw e;
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+})();
+
 beforeEach(() => {
   testDir = mkdtempSync(join(tmpdir(), "ocx-config-"));
   process.env.OPENCODEX_HOME = testDir;
@@ -360,6 +379,44 @@ describe("opencodex config defaults", () => {
       apiKeys: [expect.objectContaining({ id: "key-1", key: "ocx_persisted" })],
     });
     expect(backupNames()).toEqual([]);
+  });
+
+  test("an inherited FastWire conflict warns without wiping persisted providers or keys", () => {
+    writeConfig({
+      port: 12345,
+      defaultProvider: "openai-apikey",
+      providers: {
+        "openai-apikey": {
+          adapter: "openai-responses",
+          baseUrl: "https://api.openai.com/v1",
+          authMode: "key",
+          fastWire: null,
+        },
+      },
+      apiKeys: [{ id: "key-1", name: "default", key: "ocx_persisted", createdAt: "2026-07-28T00:00:00.000Z" }],
+    });
+    const warnSpy = spyOn(console, "warn").mockImplementation(() => {});
+
+    try {
+      const loaded = loadConfig();
+      const diagnostics = readConfigDiagnostics();
+
+      expect(loaded).toMatchObject({
+        port: 12345,
+        defaultProvider: "openai-apikey",
+        providers: { "openai-apikey": { fastWire: null } },
+        apiKeys: [expect.objectContaining({ id: "key-1", key: "ocx_persisted" })],
+      });
+      expect(diagnostics).toMatchObject({
+        source: "file",
+        error: null,
+        warnings: [expect.stringContaining("fastWire=null overrides service-tier capability")],
+      });
+      expect(backupNames()).toEqual([]);
+      expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("persisted providers and API keys were preserved"));
+    } finally {
+      warnSpy.mockRestore();
+    }
   });
 
   test("a non-string experimentalRealtimeWsBaseUrl degrades to unset without wiping config", () => {
@@ -744,6 +801,34 @@ describe("opencodex config defaults", () => {
     }
   });
 
+  test("accepts both codexToolMode values and rejects a misspelled one (#2106)", () => {
+    for (const codexToolMode of ["code_mode_only", "shell"] as const) {
+      writeConfig({
+        port: 12345,
+        providers: {
+          custom: { adapter: "openai-chat", baseUrl: "https://example.test/v1", codexToolMode },
+        },
+        defaultProvider: "custom",
+      });
+      expect(readConfigDiagnostics().config.providers.custom.codexToolMode).toBe(codexToolMode);
+      expect(readConfigDiagnostics().error).toBeNull();
+    }
+
+    // The regression this guards: `providerConfigSchema` ends in `.passthrough()`, so an
+    // undeclared key survives verbatim. Before the enum was declared, "shel" was accepted,
+    // persisted, and then silently resolved to the `code_mode_only` default — the operator
+    // asked for shell mode, got code mode, and was told nothing.
+    writeConfig({
+      port: 12345,
+      providers: {
+        custom: { adapter: "openai-chat", baseUrl: "https://example.test/v1", codexToolMode: "shel" },
+      },
+      defaultProvider: "custom",
+    });
+    expect(readConfigDiagnostics().source).toBe("fallback");
+    expect(readConfigDiagnostics().error).toContain("codexToolMode");
+  });
+
   test("accepts the exact responsesItemIdRepair shape and rejects the old nested placeholderIds proposal", () => {
     writeConfig({
       port: 12345,
@@ -812,6 +897,38 @@ describe("opencodex config defaults", () => {
     });
     expect(readConfigDiagnostics().source).toBe("fallback");
     expect(readConfigDiagnostics().error).toContain("responsesSnapshotRepair");
+  });
+
+  test("direct Gemini wire rename opt-out is a boolean and round-trips", () => {
+    const base = {
+      port: 12345,
+      providers: {
+        google: {
+          adapter: "google",
+          baseUrl: "https://generativelanguage.googleapis.com",
+        },
+      },
+      defaultProvider: "google",
+    };
+    writeConfig({
+      ...base,
+      providers: {
+        google: { ...base.providers.google, directGeminiWireRenames: false },
+      },
+    });
+    const config = loadConfig();
+    expect(config.providers.google.directGeminiWireRenames).toBe(false);
+    saveConfig(config);
+    expect(loadConfig().providers.google.directGeminiWireRenames).toBe(false);
+
+    writeConfig({
+      ...base,
+      providers: {
+        google: { ...base.providers.google, directGeminiWireRenames: "false" },
+      },
+    });
+    expect(readConfigDiagnostics().source).toBe("fallback");
+    expect(readConfigDiagnostics().error).toContain("directGeminiWireRenames");
   });
 
   test("accepts a relative responsesPath", () => {
@@ -2500,7 +2617,7 @@ describe("config.ts – sync writer timeout keying (#840 refinement)", () => {
 });
 
 describe("config.ts – atomic writes preserve symlinked destinations", () => {
-  test("a symlinked destination survives the write and the real file receives it", () => {
+  test.skipIf(!canSymlink)("a symlinked destination survives the write and the real file receives it", () => {
     // Dotfiles shape: ~/.codex/config.toml -> ~/dotfiles/.codex/config.toml
     const repoDir = join(testDir, "dotfiles");
     mkdirSync(repoDir, { recursive: true });
@@ -2517,7 +2634,7 @@ describe("config.ts – atomic writes preserve symlinked destinations", () => {
     expect(readFileSync(link, "utf8")).toBe("rewritten");
   });
 
-  test("no temp file is left beside the link or its target", () => {
+  test.skipIf(!canSymlink)("no temp file is left beside the link or its target", () => {
     const repoDir = join(testDir, "dotfiles-clean");
     mkdirSync(repoDir, { recursive: true });
     const realFile = join(repoDir, "config.toml");
@@ -2549,7 +2666,7 @@ describe("config.ts – atomic writes preserve symlinked destinations", () => {
     expect(readFileSync(destination, "utf8")).toBe("fresh");
   });
 
-  test("a dangling symlink is preserved and the write is refused", () => {
+  test.skipIf(!canSymlink)("a dangling symlink is preserved and the write is refused", () => {
     const link = join(testDir, "dangling.toml");
     symlinkSync(join(testDir, "gone", "config.toml"), link);
 
@@ -2562,7 +2679,7 @@ describe("config.ts – atomic writes preserve symlinked destinations", () => {
 });
 
 describe("config.ts – async atomic writes preserve symlinked destinations", () => {
-  test("a symlinked destination survives the write and the real file receives it", async () => {
+  test.skipIf(!canSymlink)("a symlinked destination survives the write and the real file receives it", async () => {
     const repoDir = join(testDir, "dotfiles-async");
     mkdirSync(repoDir, { recursive: true });
     const realFile = join(repoDir, "config.toml");
@@ -2578,7 +2695,7 @@ describe("config.ts – async atomic writes preserve symlinked destinations", ()
     expect(readFileSync(link, "utf8")).toBe("rewritten");
   });
 
-  test("no temp file is left beside the link or its target", async () => {
+  test.skipIf(!canSymlink)("no temp file is left beside the link or its target", async () => {
     const repoDir = join(testDir, "dotfiles-async-clean");
     mkdirSync(repoDir, { recursive: true });
     const realFile = join(repoDir, "config.toml");
@@ -2601,7 +2718,7 @@ describe("config.ts – async atomic writes preserve symlinked destinations", ()
     expect(readFileSync(destination, "utf8")).toBe("second");
   });
 
-  test("a dangling symlink is preserved and the write is refused", async () => {
+  test.skipIf(!canSymlink)("a dangling symlink is preserved and the write is refused", async () => {
     const link = join(testDir, "dangling-async.toml");
     symlinkSync(join(testDir, "gone-async", "config.toml"), link);
 

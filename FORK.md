@@ -39,6 +39,8 @@ upstream을 주기적으로 merge해서 버전을 따라간다. upstream이 고�
   결합했고, macOS locale 패치는 그대로 유지했다.
 - 2026-08-17 — upstream `v2.24.1`을 병합했다. WS upstream 패치는 upstream 본문을
   채택해 제거했다. OAuth GUI·Darwin locale·model discovery 패치는 유지했다.
+- 2026-08-23 — upstream `v2.31.0`을 병합했다. 서비스 재시작·Windows process
+  discovery 변경과 slot runtime 패치를 함께 통합했고, 기존 fork 패치 4개를 유지했다.
 
 ## upstream 동기화 절차
 

@@ -415,9 +415,26 @@ test("Codex discovery exposes the observed native as a selector row plus one glo
       opencodex_account_observed_native: true,
     }],
   }), "utf8");
+  writeFileSync(join(isolatedCodexHome!.path, "auth.json"), JSON.stringify({
+    tokens: { access_token: "main-token", account_id: "main-account" },
+  }), "utf8");
 
   const { resetCatalogRuntimeStateForTests } = await import("../src/codex/catalog");
+  const { resetCodexModelEntitlementCacheForTests } = await import("../src/codex/model-entitlements");
   resetCatalogRuntimeStateForTests();
+  resetCodexModelEntitlementCacheForTests();
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async (input, init) => {
+    const url = new URL(typeof input === "string" ? input : input instanceof URL ? input : input.url);
+    if (url.hostname === "chatgpt.com" && url.pathname.endsWith("/models")) {
+      return Response.json({ models: [{
+        slug: "gpt-daybreak-blue-latest",
+        supported_in_api: true,
+        visibility: "list",
+      }] });
+    }
+    return originalFetch(input, init);
+  }) as typeof fetch;
   const server = startServer(0);
   try {
     const plain = await fetch(new URL("/v1/models", server.url))
@@ -435,9 +452,8 @@ test("Codex discovery exposes the observed native as a selector row plus one glo
       config,
     );
     const management = await managementResponse!.json() as Array<{ id: string; native?: boolean }>;
-    // Once Daybreak is globally allowlisted the management surface reports it under its
-    // GLOBAL bare identity rather than as an account-qualified discovery row
-    // (model-rows.ts:59 / metadata.ts:243). Exactly one row, and no selector duplicate.
+    // The confirmed main entitlement makes the management surface report the bare native row.
+    // Management rows intentionally use the bare identity rather than duplicating selector rows.
     expect(management).toContainEqual(expect.objectContaining({
       id: "gpt-daybreak-blue-latest",
       native: true,
@@ -463,6 +479,7 @@ test("Codex discovery exposes the observed native as a selector row plus one glo
     expect(anthropic.data.some(model => model.id === claudeCodeNativeAlias("gpt-daybreak-blue-latest"))).toBe(false);
     expect(anthropic.data.some(model => model.id === claudeCodeNativeAlias("team/gpt-daybreak-blue-latest"))).toBe(false);
   } finally {
+    globalThis.fetch = originalFetch;
     await server.stop(true);
   }
 });

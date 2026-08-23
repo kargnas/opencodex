@@ -7,7 +7,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createGoogleAdapter as createGoogleAdapterProduction } from "../src/adapters/google";
-import { __resetAntigravityReplayCache } from "../src/adapters/google-antigravity-replay";
+import { __resetAntigravityReplayCache, observeAntigravityReplay } from "../src/adapters/google-antigravity-replay";
 import { parseRequest } from "../src/responses/parser";
 import {
   flushThoughtSignatureReplayForTests,
@@ -15,6 +15,7 @@ import {
   rememberThoughtSignatureForReplay,
   resetThoughtSignatureReplayForTests,
 } from "../src/responses/thought-signature-replay";
+import { durableReplayDestinationIdentity } from "../src/responses/reasoning-replay-cache";
 import type { AdapterEvent, OcxParsedRequest, OcxProviderConfig } from "../src/types";
 import { withTestTranslatorBudget } from "./helpers/translator-budget";
 
@@ -38,15 +39,23 @@ const provider = {
  * client-visible call_id is not unique across threads, accounts, providers or models,
  * so keying on it alone let one conversation's signature reach another's turn.
  */
-function scopeFor(threadId = "thread-a", modelId = MODEL, providerName = "google") {
+function scopeFor(
+  threadId = "thread-a",
+  modelId = MODEL,
+  providerName = "google",
+  destination = "https://generativelanguage.googleapis.com",
+) {
   return {
     clientThreadId: threadId,
     current: {
       providerName,
       providerDestinationIdentity: `dest-${providerName}`,
+      providerDestinationDurableIdentity: durableReplayDestinationIdentity(destination),
       adapterName: "google",
       modelId,
       credentialIdentity: `cred-${providerName}`,
+      // v4 (#1926): the durable store fails closed without a durable credential identity.
+      credentialDurableIdentity: `credential:test-${providerName}`,
     },
   };
 }
@@ -109,6 +118,20 @@ describe("#1735 thought signature survives history replay", () => {
       .toBe(SIGNATURE);
   });
 
+  test("a functionCall part with nested extra_content.google.thought_signature is read", async () => {
+    const adapter = createGoogleAdapter(provider);
+    await adapter.buildRequest(firstTurn());
+    const events = await adapter.parseResponse!(new Response(JSON.stringify(googleBody([
+      {
+        functionCall: { name: "shell_command", args: { command: "pwd" } },
+        extra_content: { google: { thought_signature: SIGNATURE } },
+      },
+    ]))));
+    const start = events.find((e: AdapterEvent) => e.type === "tool_call_start");
+    expect(start && "providerMetadata" in start ? start.providerMetadata?.google?.thoughtSignature : undefined)
+      .toBe(SIGNATURE);
+  });
+
   test("parallel calls each keep their own signature", async () => {
     const adapter = createGoogleAdapter(provider);
     await adapter.buildRequest(firstTurn());
@@ -121,6 +144,59 @@ describe("#1735 thought signature survives history replay", () => {
       .map((e: AdapterEvent) => ("providerMetadata" in e ? e.providerMetadata?.google?.thoughtSignature : undefined));
     // Neither signature may migrate onto the other call.
     expect(signatures).toEqual([SIGNATURE, SIGNATURE_B]);
+  });
+
+  test("a standalone thought part's signature attaches to all subsequent functionCalls in non-streaming parse", async () => {
+    const adapter = createGoogleAdapter(provider);
+    await adapter.buildRequest(firstTurn());
+    const events = await adapter.parseResponse!(new Response(JSON.stringify(googleBody([
+      { text: "thinking...", thought: true, thoughtSignature: SIGNATURE },
+      { functionCall: { name: "shell_command", args: { command: "pwd" } } },
+      { functionCall: { name: "shell_command", args: { command: "ls" } } },
+    ]))));
+    const starts = events.filter((e: AdapterEvent) => e.type === "tool_call_start");
+    expect(starts.length).toBe(2);
+    expect("providerMetadata" in starts[0] ? starts[0].providerMetadata?.google?.thoughtSignature : undefined)
+      .toBe(SIGNATURE);
+    expect("providerMetadata" in starts[1] ? starts[1].providerMetadata?.google?.thoughtSignature : undefined)
+      .toBe(SIGNATURE);
+  });
+
+  test("streaming SSE chunks carry thought signature across chunk boundaries to function calls", async () => {
+    const adapter = createGoogleAdapter(provider);
+    await adapter.buildRequest(firstTurn());
+    // Each SSE frame arrives as its own transport chunk so the signature has to
+    // survive the chunk boundary between the thought part and the function calls.
+    const frames = [
+      `data: ${JSON.stringify(googleBody([{ text: "thinking...", thought: true, thought_signature: SIGNATURE }]))}\n\n`,
+      `data: ${JSON.stringify(googleBody([{ functionCall: { name: "shell_command", args: { command: "pwd" } } }]))}\n\n`,
+      `data: ${JSON.stringify(googleBody([{ functionCall: { name: "shell_command", args: { command: "ls" } } }]))}\n\n`,
+      // usageMetadata is the terminal signal; no [DONE] sentinel needed.
+      `data: ${JSON.stringify({ usageMetadata: { promptTokenCount: 5, candidatesTokenCount: 2 } })}\n\n`,
+    ];
+
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        const encoder = new TextEncoder();
+        for (const frame of frames) controller.enqueue(encoder.encode(frame));
+        controller.close();
+      },
+    });
+
+    const events: AdapterEvent[] = [];
+    for await (const event of adapter.parseStream(new Response(stream))) {
+      events.push(event);
+    }
+
+    // The turn completes cleanly: no error events, terminal done last.
+    expect(events.some((e: AdapterEvent) => e.type === "error")).toBe(false);
+    expect(events[events.length - 1]?.type).toBe("done");
+    const starts = events.filter((e: AdapterEvent) => e.type === "tool_call_start");
+    expect(starts.length).toBe(2);
+    expect("providerMetadata" in starts[0] ? starts[0].providerMetadata?.google?.thoughtSignature : undefined)
+      .toBe(SIGNATURE);
+    expect("providerMetadata" in starts[1] ? starts[1].providerMetadata?.google?.thoughtSignature : undefined)
+      .toBe(SIGNATURE);
   });
 
   test("a signature replayed through Responses history reaches the rebuilt Google part", async () => {
@@ -193,6 +269,44 @@ describe("#1735 thought signature survives history replay", () => {
     const request = await createGoogleAdapter(provider).buildRequest(parsed);
     const part = modelParts(request.body as string).find(candidate => "functionCall" in candidate);
     expect(part?.thoughtSignature).toBe(SIGNATURE_B);
+  });
+
+  test("a custom_tool_call without call_id store entry falls back to in-memory replay cache by unwrapped args", async () => {
+    const adapter = createGoogleAdapter({
+      ...provider,
+      googleMode: "cloud-code-assist",
+      baseUrl: "https://daily-cloudcode-pa.googleapis.com",
+      project: "test-proj",
+      apiKey: "test-token",
+    });
+    const parsedDummy = parseRequestScoped({
+      model: MODEL,
+      input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "test-session-freeform" }] }],
+      tools: [{ type: "function", name: "default_api:exec", description: "run", parameters: { type: "object" } }],
+    }, undefined);
+    const dummyReq = await adapter.buildRequest(parsedDummy);
+    const wireModel = JSON.parse(dummyReq.body as string).model;
+    const wireSession = JSON.parse(dummyReq.body as string).request.sessionId;
+    const wireToolName = JSON.parse(dummyReq.body as string).request.tools[0].functionDeclarations[0].name;
+
+    // Warm up the Antigravity replay cache with parsed function args:
+    observeAntigravityReplay(wireModel, wireSession, [
+      { functionCall: { name: wireToolName, args: { cmd: "whoami" } }, thoughtSignature: SIGNATURE },
+    ]);
+    const parsed = parseRequestScoped({
+      model: MODEL,
+      input: [
+        { type: "message", role: "user", content: [{ type: "input_text", text: "test-session-freeform" }] },
+        { type: "custom_tool_call", call_id: "call_custom_unscoped", name: "default_api:exec", input: JSON.stringify({ cmd: "whoami" }) },
+        { type: "custom_tool_call_output", call_id: "call_custom_unscoped", output: "agent" },
+      ],
+      tools: [{ type: "function", name: "default_api:exec", description: "run", parameters: { type: "object" } }],
+    }, undefined); // unscoped so durable store cannot hit
+    const request = await adapter.buildRequest(parsed);
+    const reqObj = JSON.parse(request.body as string);
+    const contents = reqObj.request.contents;
+    const modelTurn = contents.find((c: { role: string }) => c.role === "model");
+    expect(modelTurn.parts[0].thoughtSignature).toBe(SIGNATURE);
   });
 
   test("a tool_search_call replay is re-signed from the proxy-side store", async () => {
@@ -297,5 +411,62 @@ describe("#1735 thought signature survives history replay", () => {
     // Simulate a fresh process: drop in-memory state; lookup must reload from disk.
     resetThoughtSignatureReplayForTests();
     expect(lookupReplayThoughtSignature("call_disk_1", scopeFor())).toBe(SIGNATURE);
+  });
+
+  test("one provider name serving two endpoints does not share signatures", () => {
+    // The gap the durable key closes. providerName, adapterName, modelId and thread can all
+    // be identical across two upstreams — a gateway and a direct endpoint under one config
+    // name — and an opaque signature minted by one is meaningless to the other.
+    const primary = scopeFor("thread-a", MODEL, "google", "https://generativelanguage.googleapis.com");
+    const secondary = scopeFor("thread-a", MODEL, "google", "https://gateway.internal.example/v1beta");
+
+    rememberThoughtSignatureForReplay("call_dest", SIGNATURE, primary);
+
+    expect(lookupReplayThoughtSignature("call_dest", primary)).toBe(SIGNATURE);
+    expect(lookupReplayThoughtSignature("call_dest", secondary)).toBeUndefined();
+  });
+
+  test("the durable destination identity is stable across restarts, unlike the process-local one", async () => {
+    // The reason this is a separate digest rather than the sibling cache's HMAC: that one is
+    // keyed by randomBytes minted at module load, so reusing it here would change every key
+    // on restart and the store would silently stop matching — a worse failure than the
+    // over-broad key it replaced, because it looks like it is working.
+    const url = "https://generativelanguage.googleapis.com";
+    expect(durableReplayDestinationIdentity(url)).toBe(durableReplayDestinationIdentity(url));
+    expect(durableReplayDestinationIdentity(url)).not.toBe(durableReplayDestinationIdentity("https://other.example"));
+    // Trailing-slash normalization matches the process-local form.
+    expect(durableReplayDestinationIdentity(`${url}/`)).toBe(durableReplayDestinationIdentity(url));
+
+    rememberThoughtSignatureForReplay("call_dest_restart", SIGNATURE, scopeFor());
+    await flushThoughtSignatureReplayForTests();
+    resetThoughtSignatureReplayForTests();
+    expect(lookupReplayThoughtSignature("call_dest_restart", scopeFor())).toBe(SIGNATURE);
+  });
+
+  test("adapter serialization reads the durable store with the post-parse bound scope (#1926 wiring)", async () => {
+    // The server parses BEFORE the route/credential scope exists, so the parser's own
+    // lookup cannot hit; the google adapter's serialization-time fallback must read the
+    // durable store once the scope identity has been bound.
+    rememberThoughtSignatureForReplay("call_wire_1", SIGNATURE, scopeFor());
+    await flushThoughtSignatureReplayForTests();
+    const scope: { clientThreadId: string; current?: unknown } = { clientThreadId: "thread-a" };
+    const parsed = parseRequestScoped({
+      model: MODEL,
+      stream: false,
+      input: [
+        { role: "user", content: [{ type: "input_text", text: "run pwd" }] },
+        { type: "function_call", call_id: "call_wire_1", name: "shell_command", arguments: "{}" },
+        { type: "function_call_output", call_id: "call_wire_1", output: "ok" },
+      ],
+      tools: [{ type: "function", name: "shell_command", description: "run", parameters: { type: "object" } }],
+    }, scope as never);
+    // Identity binds after parse, as bindRouteReasoningReplayScope does server-side.
+    scope.current = scopeFor().current;
+    parsed._reasoningReplayScope = scope as never;
+    const adapter = createGoogleAdapter(provider);
+    const req = await adapter.buildRequest(parsed, { headers: new Headers() });
+    const parts = modelParts(String(req.body));
+    const fnPart = parts.find(p => (p as { functionCall?: unknown }).functionCall) as { thoughtSignature?: string } | undefined;
+    expect(fnPart?.thoughtSignature).toBe(SIGNATURE);
   });
 });
