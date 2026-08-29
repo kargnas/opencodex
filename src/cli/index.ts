@@ -13,6 +13,10 @@ import {
   getConfigDir,
   getRuntimeDir,
   loadConfig,
+  saveConfig,
+  setRuntimeDir,
+} from "../config";
+import {
   readPid,
   readPidFileValue,
   readRuntimePort,
@@ -20,12 +24,11 @@ import {
   removePidIfValueIs,
   removeRuntimePort,
   removeRuntimePortIfPidIs,
-  saveConfig,
-  setRuntimeDir,
   writePid,
   writeRuntimePort,
-} from "../config";
-import { collectStatus } from "./status";
+} from "../config/process-state";
+import { collectStatus, unusedProxyWarningLines } from "./status";
+import { takeFlag } from "./runtime-api";
 
 import {
   discoverStableProxyForRestart,
@@ -45,8 +48,8 @@ import { runReady, type ReadyArgs } from "./ready";
 import { runCli } from "./root";
 import { ProxyOwnershipRefusedError, stopProxy } from "../lib/process-control";
 import { loadServiceTokenFromFile } from "../lib/service-secrets";
-import { diagnoseService, isServiceOwnershipError, serviceCommand, serviceEnvironmentOwnedHere, serviceStartableFromTray, serviceStatusSummary, stopServiceIfInstalled, uninstallServiceIfInstalled } from "../service";
-import { startupHealthSummary } from "../codex/autostart-health";
+import { assertNotAdminToken, diagnoseService, isServiceOwnershipError, serviceCommand, serviceEnvironmentOwnedHere, serviceStartableFromTray, serviceStatusSummary, stopServiceIfInstalled, uninstallServiceIfInstalled } from "../service";
+import { formatStartupRoutingDetail, startupHealthSummary } from "../codex/autostart-health";
 import { drainAndShutdown, isRecyclingForExit, startServer } from "../server";
 import { injectSystemEnv, reconcileShellHook, revertSystemEnv, uninstallShellHook } from "../server/system-env";
 import { buildDesktop3pRegistry } from "../claude/desktop-3p";
@@ -245,6 +248,11 @@ async function handleStart(options: { block?: boolean } = {}) {
   // auth path reads OPENCODEX_API_AUTH_TOKEN from the environment.
   const serviceToken = loadServiceTokenFromFile(process.env);
   if (serviceToken) process.env.OPENCODEX_API_AUTH_TOKEN = serviceToken;
+  // The service wrapper (and WinSW via OCX_API_TOKEN_FILE) can still export a colliding
+  // token that install now refuses to write. Refuse it here too, before bind, so an
+  // already-broken file cannot fence /api/* closed at boot (#2696).
+  const present = process.env.OPENCODEX_API_AUTH_TOKEN?.trim();
+  if (present) assertNotAdminToken(present);
   const requestedPort = parsePortOption();
   const owner = await findProxyOwnerBeforeJournalRecovery();
   if (owner.live) {
@@ -852,8 +860,12 @@ async function handleUninstall() {
 
 async function handleStatus() {
   const statusArgs = args.slice(1);
-  const wantsJson = statusArgs.length === 1 && statusArgs[0] === "--json";
-  if (statusArgs.length > 1 || (statusArgs.length === 1 && !wantsJson)) {
+  // Order-independent: the previous form only honoured `--json` as the LONE argument, so
+  // `ocx status --json --anything` silently printed human output to a caller that asked
+  // for JSON. Take the flag out of argv, then reject whatever is left over -- which keeps
+  // the strict unknown-argument behaviour rather than trading one defect for another.
+  const wantsJson = takeFlag(statusArgs, "--json");
+  if (statusArgs.length > 0) {
     console.error("Usage: ocx status [--json]");
     process.exit(1);
   }
@@ -870,6 +882,18 @@ async function handleStatus() {
     console.log(`❌ Proxy: ${status.proxyLabel}`);
   }
   console.log(`   Health: ${status.healthLabel}`);
+  // Printed here, not only in --json: a stale ocx on PATH is exactly the situation where
+  // the operator is reading human output and wondering why the CLI disagrees with the
+  // dashboard. Adding the JSON field alone would satisfy a test and help nobody (#2701).
+  if (status.json.versionSkew.warning) {
+    console.log(`   ⚠️  ${status.json.versionSkew.warning}`);
+  }
+  for (const line of unusedProxyWarningLines({
+    proxyUp: Boolean(status.json.proxy.pid || status.json.proxy.health.ok),
+    routingKind: status.json.startup.routingKind,
+  })) {
+    console.log(`   ${line}`);
+  }
   if (!(status.json.proxy.pid || status.json.proxy.health.ok)) {
     console.log("   ↳ Not running — Codex/Claude requests will fail with connection errors.");
     // The service summary a few lines below already tells a registered-but-not-serving
@@ -889,6 +913,7 @@ async function handleStatus() {
   console.log(`   Default provider: ${status.json.defaultProvider}`);
   console.log(`   Codex autostart: ${status.json.codexAutostart ? "enabled" : "disabled"}`);
   console.log(`   Restart safety: ${startupHealthSummary(status.json.startup)}`);
+  console.log(`   ${formatStartupRoutingDetail(status.json.startup)}`);
   console.log(`   Service: ${status.json.service.summary}`);
   console.log(`   ${status.json.codexShim.summary}`);
   console.log(`   Codex runtime: ${status.json.codexRuntime.path}`);
@@ -929,8 +954,13 @@ async function handleStatus() {
 
 async function handleRecoverHistory() {
   if (args[1] !== "--legacy-openai") {
-    console.error("Usage: ocx recover-history --legacy-openai");
-    console.error("Only use this if an older syncResumeHistory build already remapped OpenAI Codex App history to opencodex before backup support existed.");
+    console.error("Usage: ocx recover-history --legacy-openai --yes");
+    console.error("This force-relabels every user-message opencodex row to OpenAI, including legitimate dedicated-provider history. Back up first and use it only for pre-backup legacy recovery.");
+    process.exit(1);
+  }
+  console.error("WARNING: this force-relabels every user-message opencodex row to OpenAI, normalizes exec to cli, and includes legitimate dedicated-provider history.");
+  if (args.length !== 3 || args[2] !== "--yes") {
+    console.error("Re-run with explicit confirmation: ocx recover-history --legacy-openai --yes");
     process.exit(1);
   }
   // Manifest-independent legacy ejection, serialized like every other history

@@ -1,4 +1,5 @@
 import { markActivity } from "../lib/sidecar-tracker";
+import { knownModelIdsForProvider } from "../router";
 import {
   buildWarmupCompletionFrames,
   buildWsErrorFrame,
@@ -22,10 +23,11 @@ import {
 import { reconcileOAuthProviders } from "../oauth";
 import { withCatalogWriteSerialization } from "../codex/catalog-write-serialization";
 import { invalidateCodexModelsCacheWithPermit } from "../codex/catalog/sync";
-import { getCodexHome } from "../codex/paths";
+import { currentServiceHomes, serviceStatePathsForOpenCodexHome } from "../service";
 import { shouldSyncCodexOnStart } from "../codex/desired-state";
 import {
   inspectNativeCodexOwnership,
+  type NativeCodexOwnership,
   type OwnershipInspection,
 } from "../integrations/native/ownership-preflight";
 import { registerCodexCooldownRecoveryProbeWorker } from "../codex/auth-api";
@@ -108,6 +110,7 @@ import {
   type RequestLogContext,
   type RequestLogEntry,
 } from "./request-log";
+import { sessionLaneIdFromRequest } from "./request-log-conversation";
 export {
   addFinalRequestLog,
   filterRequestLogs,
@@ -176,8 +179,8 @@ import { runClaudeAuthModeMigration } from "../claude/auth-mode-migration";
 import {
   bindNativeMainStartupLifecycle,
   blockNativeMainStartupForUnownedServiceHome,
+  prepareNativeMainStartupLifecycle,
   releaseNativeMainStartupLifecycle,
-  startNativeMainStartupLifecycle,
   type NativeMainStartupGateDeps,
   type NativeMainStartupLifecycle,
 } from "../codex/native-profile-startup";
@@ -201,6 +204,11 @@ import {
 import { SYSTEM_RESTART_CAPABILITY_VERSION } from "../lib/system-restart-contract";
 import { LOCAL_PROVIDER_RELOAD_CAPABILITY_VERSION } from "../lib/local-provider-reload-contract";
 import { createReadinessGate, type ReadinessGate } from "./readiness";
+import {
+  createRuntimePackageTreeIntegrityGuard,
+  type PackageTreeIntegrityGuard,
+} from "../lib/package-tree-integrity";
+import { detectInstall } from "../update/index";
 
 export const MAX_WS_FRAME_BYTES = 50 * 1024 * 1024;
 const WEBSOCKET_IDLE_TIMEOUT_SECONDS = 0;
@@ -445,17 +453,34 @@ export interface StartServerDeps {
   nativeMainStartup?: NativeMainStartupGateDeps;
   /** Test-only ownership evidence; production inspects the installed service state. */
   inspectNativeCodexOwnership?: typeof inspectNativeCodexOwnership;
+  /** Test-only service-home resolver; production resolves the current homes directly. */
+  resolveServiceHomes?: typeof currentServiceHomes;
   /** Test-only seam for an upstream that cannot complete its WebSocket close handshake. */
   liveSidebandWebSocketFactory?: LiveSidebandWebSocketFactory;
   /** Test-only seam; production derives a fresh local-attestation secret per process. */
   localAttestationSecret?: string;
   /** Optional readiness gate; a fresh pending gate is created when omitted. */
   readinessGate?: ReadinessGate;
+  /** Test-only package-tree observation; production captures package.json identity at boot. */
+  packageTreeIntegrity?: PackageTreeIntegrityGuard;
 }
 
-function inspectStartupOwnership(deps: StartServerDeps): OwnershipInspection {
+function inspectStartupOwnership(
+  deps: StartServerDeps,
+  currentHomes: ReturnType<typeof currentServiceHomes> | null,
+  statePaths: readonly string[] | null,
+): OwnershipInspection {
   try {
-    return (deps.inspectNativeCodexOwnership ?? inspectNativeCodexOwnership)();
+    if (currentHomes === null || statePaths === null) {
+      return {
+        ownership: "unknown",
+        reason: "startup service-home resolution failed",
+      };
+    }
+    if (deps.inspectNativeCodexOwnership) {
+      return deps.inspectNativeCodexOwnership({ currentHomes, statePaths });
+    }
+    return inspectNativeCodexOwnership({ currentHomes, statePaths });
   } catch {
     return {
       ownership: "unknown",
@@ -542,15 +567,27 @@ export function startServer(port?: number, deps: StartServerDeps = {}): Server<W
   // journal, or credential path. Both positive foreign evidence and an unprovable
   // ownership state are non-authority.
   startupCacheInvalidationWrote = false;
-  const startupCacheOwnership = inspectStartupOwnership(deps);
+  const resolveServiceHomes = deps.resolveServiceHomes ?? currentServiceHomes;
+  let startupOwnershipHomes: ReturnType<typeof currentServiceHomes> | null = null;
+  let startupOwnershipStatePaths: readonly string[] | null = null;
+  try {
+    const homes = resolveServiceHomes();
+    const statePaths = serviceStatePathsForOpenCodexHome(homes.opencodexHome);
+    startupOwnershipHomes = homes;
+    startupOwnershipStatePaths = statePaths;
+  } catch { /* inspection below stays unknown */ }
+  const startupCacheOwnership = inspectStartupOwnership(
+    deps,
+    startupOwnershipHomes,
+    startupOwnershipStatePaths,
+  );
   // Startup cache invalidation is best-effort and must never block the server from
-  // serving. It now takes K so it cannot race a convergence commit, but both the
-  // home resolution and the acquisition can fail on a machine with no Codex home —
-  // `getCodexHome()` THROWS when CODEX_HOME names a missing directory, which would
-  // otherwise turn "no Codex installed" into "proxy will not start".
-  if (startupCacheOwnership.ownership === "owned") {
+  // serving. It now takes K so it cannot race a convergence commit. Use the home
+  // paired with the ownership inspection; re-reading ambient CODEX_HOME here could
+  // invalidate a different installation after an environment or mount change.
+  if (startupCacheOwnership.ownership === "owned" && startupOwnershipHomes !== null) {
     try {
-      const startupCodexHome = getCodexHome();
+      const startupCodexHome = startupOwnershipHomes.codexHome;
       // #1046: record whether this actually rewrote the cache. `handleStart` ORs this
       // with the later startup sync and warns ONCE about stale app-servers; warning
       // here instead would read a catalog mtime the sync is about to move.
@@ -670,12 +707,21 @@ export function startServer(port?: number, deps: StartServerDeps = {}): Server<W
     }), req, policy);
   }
 
+  function packageTreeChangedResponse(req: Request, policy: RequestPolicyView, message: string): Response {
+    return withCors(new Response(JSON.stringify({
+      error: { type: "server_error", code: "package_tree_changed", message },
+    }), {
+      status: 503,
+      headers: { "Content-Type": "application/json" },
+    }), req, policy);
+  }
+
   async function runAdmittedHttpTurn(
     req: Request,
     policy: RequestPolicyView,
     work: (lease: ActiveTurnLease) => Promise<Response>,
   ): Promise<Response> {
-    const lease = tryAdmitTurn();
+    const lease = tryAdmitTurn(sessionLaneIdFromRequest(req.headers));
     if (!lease) return serverBusyResponse(req, "active turns", policy);
     let response: Response;
     try {
@@ -696,6 +742,8 @@ export function startServer(port?: number, deps: StartServerDeps = {}): Server<W
   // passes it in, and transitions it after the post-startup sync settles. When
   // no gate is supplied (tests, ad-hoc starts) a fresh pending gate is created.
   const readinessGate = deps.readinessGate ?? createReadinessGate();
+  const packageTreeIntegrity = deps.packageTreeIntegrity
+    ?? createRuntimePackageTreeIntegrityGuard(detectInstall());
   // Actual bound port, filled in after Bun.serve binds so /readyz reports the
   // real ephemeral port for startServer(0). /healthz keeps its existing port
   // field (the requested listenPort) byte-for-byte.
@@ -707,18 +755,71 @@ export function startServer(port?: number, deps: StartServerDeps = {}): Server<W
   // clients; no Codex request can use this lifecycle in that state.
   // Re-probe here instead of trusting the earlier cache decision: startup work
   // between the two sites must not widen the service-install race.
-  const nativeOwnership = inspectStartupOwnership(deps);
+  const nativeOwnership = inspectStartupOwnership(deps, startupOwnershipHomes, startupOwnershipStatePaths);
+  const preparedNativeMainLifecycle = nativeOwnership.ownership !== "foreign"
+    && startupOwnershipHomes !== null
+    ? prepareNativeMainStartupLifecycle(
+      deps.nativeMainStartup,
+      { codexHome: startupOwnershipHomes.codexHome, configDir: startupOwnershipHomes.opencodexHome },
+    )
+    : null;
+  let retryOwnershipHomes = startupOwnershipHomes;
+  let retryOwnershipStatePaths = startupOwnershipStatePaths;
+  let retryPreparedNativeMainLifecycle = preparedNativeMainLifecycle;
+  const reprobeNativeOwnership = (): NativeCodexOwnership => {
+    // If startup could not resolve the homes at all, preserve a bounded retry
+    // without guessing an authority. The first successful resolution is pinned
+    // together with its service-state paths before ownership is inspected.
+    if (retryOwnershipHomes === null || retryOwnershipStatePaths === null) {
+      try {
+        const homes = resolveServiceHomes();
+        const statePaths = serviceStatePathsForOpenCodexHome(homes.opencodexHome);
+        retryOwnershipHomes = homes;
+        retryOwnershipStatePaths = statePaths;
+      } catch {
+        return "unknown";
+      }
+    }
+    const homes = retryOwnershipHomes;
+    const statePaths = retryOwnershipStatePaths;
+    const answer = inspectStartupOwnership(deps, homes, statePaths).ownership;
+    if (answer !== "owned") return answer;
+    retryPreparedNativeMainLifecycle ??= prepareNativeMainStartupLifecycle(
+      deps.nativeMainStartup,
+      { codexHome: homes.codexHome, configDir: homes.opencodexHome },
+    );
+    // An ownership verdict without a lifecycle bound to that same home is not
+    // enough to reopen native-main admission.
+    return retryPreparedNativeMainLifecycle ? "owned" : "unknown";
+  };
+  const ownershipRetryOptions = {
+    reprobe: reprobeNativeOwnership,
+    expectedHomeId: () => retryPreparedNativeMainLifecycle?.homeId ?? null,
+    startOwnedLifecycle: () => {
+      if (!retryPreparedNativeMainLifecycle) {
+        throw new Error("Native-main ownership became known before its startup lifecycle was prepared.");
+      }
+      return retryPreparedNativeMainLifecycle.start();
+    },
+  };
   const nativeMainLifecycle: NativeMainStartupLifecycle = shouldSyncCodexOnStart(config)
     ? nativeOwnership.ownership === "owned"
-      ? startNativeMainStartupLifecycle(deps.nativeMainStartup)
-      : blockNativeMainStartupForUnownedServiceHome(
-        nativeOwnership.ownership === "foreign" ? "foreign-ownership" : "ownership-unknown",
-        // #2108: an `unknown` verdict means the probe could not answer, not that this host
-        // is unownable. Hand the fence a way to re-ask so a host that becomes answerable
-        // after boot reopens on its own instead of needing `ocx restart`. A `foreign`
-        // verdict ignores this by design — that one is a fact, not a question.
-        { reprobe: () => inspectStartupOwnership(deps).ownership },
-      )
+      ? preparedNativeMainLifecycle
+        ? preparedNativeMainLifecycle.start()
+        : blockNativeMainStartupForUnownedServiceHome(
+          "ownership-unknown",
+          ownershipRetryOptions,
+        )
+      : nativeOwnership.ownership === "foreign"
+        ? blockNativeMainStartupForUnownedServiceHome("foreign-ownership")
+        : blockNativeMainStartupForUnownedServiceHome(
+          "ownership-unknown",
+          // #2108: an `unknown` verdict means the probe could not answer, not that this host
+          // is unownable. Hand the fence a way to re-ask so a host that becomes answerable
+          // after boot reopens on its own instead of needing `ocx restart`. A `foreign`
+          // verdict ignores this by design — that one is a fact, not a question.
+          ownershipRetryOptions,
+        )
     : {
       homeId: null,
       settled: Promise.resolve({ status: "ready", homeId: null }),
@@ -769,6 +870,29 @@ export function startServer(port?: number, deps: StartServerDeps = {}): Server<W
         if (decoded === "/readyz" || decoded === "/readyz/") readyzPath = decoded;
       } catch { /* malformed encoding — not a readiness path */ }
 
+      const packageTreeStatus = packageTreeIntegrity.status();
+      if (!packageTreeStatus.ok && (
+        url.pathname === "/healthz"
+        || readyzPath !== undefined
+        || url.pathname.startsWith("/v1/")
+      )) {
+        const message = "OpenCodex package files changed while this proxy was running; restart OpenCodex before retrying.";
+        const response = url.pathname === "/healthz" || readyzPath !== undefined
+          ? jsonResponse({
+              status: "restart_required",
+              service: "opencodex",
+              version: VERSION,
+              uptime: process.uptime(),
+              pid: process.pid,
+              port: boundPort ?? requestServer.port ?? listenPort,
+              error: { code: "package_tree_changed", message },
+            }, 503, req, policy)
+          : packageTreeChangedResponse(req, policy, message);
+        const headers = new Headers(response.headers);
+        headers.set("Retry-After", "5");
+        return new Response(response.body, { status: 503, headers });
+      }
+
       if (req.method === "OPTIONS") {
         // /readyz is exact-GET only; OPTIONS (like POST and the trailing-slash
         // path) must answer the deterministic JSON 404, never the generic 204
@@ -817,7 +941,12 @@ export function startServer(port?: number, deps: StartServerDeps = {}): Server<W
         // unauthenticated loopback listener (#1102) is a second Bun.serve, and handing its
         // request to the public server's upgrade would fail or cross sockets.
         if (requestServer.upgrade(req, {
-          data: buildResponsesWsData(selectForwardHeaders(req.headers), admission, websocketLease),
+          data: buildResponsesWsData(
+            selectForwardHeaders(req.headers),
+            admission,
+            websocketLease,
+            sessionLaneIdFromRequest(req.headers),
+          ),
         })) return undefined as unknown as Response;
         websocketLease.release();
         return withCors(formatErrorResponse(426, "upgrade_required", "WebSocket upgrade failed"), req, policy);
@@ -951,6 +1080,7 @@ export function startServer(port?: number, deps: StartServerDeps = {}): Server<W
           : [];
         const disabledNatives = disabledNativeSlugs(config);
         const disabledModels = new Set(config.disabledModels ?? []);
+        const exactComboSlugs = exactComboCatalogSlugs(config);
         const shadowedNativeSlugs = configuredNativeAliasSlugs(config);
         const suppressedBareNativeSlugs = new Set([
           ...desktopAllowlistSuppressedNativeSlugs(config),
@@ -1035,7 +1165,7 @@ export function startServer(port?: number, deps: StartServerDeps = {}): Server<W
             config.subagentModels,
             websocketsEnabled(config),
             maMode as "v1" | "default" | "v2",
-            exactComboCatalogSlugs(config),
+            exactComboSlugs,
             accountSelectors,
             suppressedBareNativeSlugs,
             new Set(),
@@ -1112,12 +1242,29 @@ export function startServer(port?: number, deps: StartServerDeps = {}): Server<W
         const data = [
           ...visibleNatives.map(id => nativeModelRow(`openai/${id}`, id)),
           ...visibleAccountNatives.map(({ id, metadataId }) => nativeModelRow(id, metadataId)),
-          ...uniqueCatalogModelsForRawPublicList(goOrdered).map(m => ({
-            id: m.alias ?? `${m.provider}/${m.id}`,
-            object: "model",
-            created: 0,
-            owned_by: m.owned_by ?? m.provider,
-            ...grokEffortFields(m.reasoningEfforts ?? [], m.defaultReasoningEffort),
+          ...await Promise.all(uniqueCatalogModelsForRawPublicList(goOrdered).map(async m => {
+            const publicId = m.alias ?? `${m.provider}/${m.id}`;
+            const isCombo = m.provider === "combo" && exactComboSlugs.has(publicId);
+            const provider = config.providers[m.provider];
+            const effective = provider
+              ? (await import("../providers/default-aliases")).effectiveModelAliases(
+                  config,
+                  provider,
+                  knownModelIdsForProvider(m.provider, provider, config),
+                ).get(m.id)
+              : undefined;
+            return {
+              id: publicId,
+              object: "model",
+              created: 0,
+              // This endpoint is an OpenAI-compatible inbound contract. Some clients use
+              // owned_by as an adapter selector, so a virtual combo must name that wire
+              // adapter rather than the internal catalog authority marker.
+              owned_by: isCombo ? "openai" : (m.owned_by ?? m.provider),
+              ...(isCombo ? { is_combo: true } : {}),
+              ...(effective ? { alias_of: `${provider?.alias || m.provider}/${effective.alias}` } : {}),
+              ...grokEffortFields(m.reasoningEfforts ?? [], m.defaultReasoningEffort),
+            };
           })),
         ];
         return jsonResponse({ object: "list", data }, 200, req, policy);
@@ -1424,7 +1571,7 @@ export function startServer(port?: number, deps: StartServerDeps = {}): Server<W
           provider: "unknown",
           ...admissionFields(admission),
         };
-        const turnAdmissionLease = tryAdmitTurn();
+        const turnAdmissionLease = tryAdmitTurn(sessionLaneIdFromRequest(req.headers));
         if (!turnAdmissionLease) return serverBusyResponse(req, "active turns", policy);
         let resolved;
         try {
@@ -1576,7 +1723,7 @@ export function startServer(port?: number, deps: StartServerDeps = {}): Server<W
           return;
         }
 
-        const turnAdmissionLease = tryAdmitTurn();
+        const turnAdmissionLease = tryAdmitTurn(ws.data.sessionLaneId);
         if (!turnAdmissionLease) {
           sendJsonFrame(ws, buildWsErrorFrame(503, {
             type: "server_error",

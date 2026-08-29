@@ -10,11 +10,14 @@
 import { accessSync, constants, existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
-import { getConfigDir, getConfigPath, readConfigDiagnostics, readPid, resolveEnvValue } from "../config";
+import { getConfigDir, getConfigPath, readConfigDiagnostics, resolveEnvValue } from "../config";
+import { readPid } from "../config/process-state";
 import { findLiveProxy, type LiveProxy } from "../server/proxy-liveness";
 import { BUN_RUNTIME_SOURCES } from "../lib/bun-runtime";
 import type { BunRuntimeSource } from "../lib/bun-runtime";
 import { maskAccountId } from "../lib/privacy";
+import { tokenCollidesWithAdmin } from "../lib/admin-secrets";
+import { readInstalledServiceToken } from "../lib/service-secrets";
 import { PROXY_ENV_KEYS, proxyEnvPresent } from "../lib/proxy-env";
 import { LOCAL_MANAGEMENT_READ_PATHS } from "../lib/local-management-capability";
 import { readCodexTokens } from "../codex/auth-collision";
@@ -41,7 +44,7 @@ import {
   resolveEffectiveUserIdentity,
 } from "../codex/user-identity";
 import { collectProjectCodexConfigWarnings, formatProjectCodexConfigWarningsForDoctor } from "../codex/project-config-warnings";
-import { collectStartupHealth, startupHealthSummary } from "../codex/autostart-health";
+import { collectStartupHealth, formatStartupRoutingDetail, startupHealthSummary } from "../codex/autostart-health";
 import {
   displayCodexRuntimePath,
   loadLastEffortClamp,
@@ -57,7 +60,35 @@ import {
 } from "../server/local-management-read-client";
 export { resolveCodexHomeDir } from "../codex/home";
 
-export type OAuthDoctorCheck = { level: "OK" | "WARN"; message: string };
+/**
+ * `FAIL` exists for a condition that makes the surface unusable rather than degraded.
+ * A review of the #2696 work pointed out that reporting a fully fenced management plane
+ * — every `/api/*` returning 503 — at the same level as a directory-permission note
+ * misleads the reader about severity.
+ *
+ * Doctor's own exit code still belongs to the uniform contract in wp3b (devlog 025);
+ * this type only fixes what the operator is told.
+ */
+export type OAuthDoctorCheck = { level: "OK" | "WARN" | "FAIL"; message: string };
+
+/**
+ * Whether any FAIL-level condition was seen during this `runDoctor` pass.
+ *
+ * Module-scoped and reset at the top of `runDoctor` rather than threaded through, because
+ * `runDoctor` reports by direct `console.log` across a dozen sections and has no checks
+ * collection to inspect. Reset matters for the test suite, which calls `runDoctor` several
+ * times in one process; a sticky flag would make the second call fail because the first did.
+ */
+let doctorSawFailure = false;
+
+function recordDoctorFailure(): void {
+  doctorSawFailure = true;
+}
+
+/** True when the last `runDoctor` pass saw a FAIL-level condition. */
+export function doctorFailed(): boolean {
+  return doctorSawFailure;
+}
 
 function pathIsWritable(path: string): boolean {
   try {
@@ -137,6 +168,50 @@ function describeDoctorHealth(entry: OAuthHealthEntry): string {
 }
 
 /**
+ * Detect the management/data-plane credential collision behind #2696.
+ *
+ * The service exports the service token file as `OPENCODEX_API_AUTH_TOKEN` before
+ * starting the proxy. When that value is the admin token, the server treats the
+ * management credential as a data-plane admission secret and fences the ENTIRE
+ * management plane closed at boot: every `/api/*` returns 503, including on a loopback
+ * install that never needed a data-plane secret.
+ *
+ * `assertNotAdminToken` in src/service.ts now refuses to create this state, but an
+ * install made before that guard existed is already broken on disk, and the symptom
+ * (every management command failing) points nowhere. This is the check that names it.
+ *
+ * Observe-only, like the rest of doctor: it compares shapes and never prints, logs, or
+ * returns a credential value.
+ */
+export function dataPlaneCredentialCollisionCheck(
+  env: NodeJS.ProcessEnv = process.env,
+  installedServiceToken: string | null = readInstalledServiceToken(),
+): OAuthDoctorCheck {
+  const dataPlane = env.OPENCODEX_API_AUTH_TOKEN?.trim() || installedServiceToken?.trim() || "";
+  if (!dataPlane) {
+    return { level: "OK", message: "No data-plane token is set, so it cannot collide with the management token." };
+  }
+  // Same comparison as assertNotAdminToken: minted prefix or configuredAdminToken
+  // (env or admin-api-token file). The file token is the one the service wrapper
+  // actually exports; inspecting only the doctor process env reported OK on every
+  // already-broken install (#2696).
+  if (!tokenCollidesWithAdmin(dataPlane, env)) {
+    return { level: "OK", message: "Data-plane and management credentials are distinct." };
+  }
+  return {
+    // Not a degradation: while this holds, every /api/* returns 503 and no ocx
+    // management command can work at all.
+    level: "FAIL",
+    message:
+      "The data-plane secret (OPENCODEX_API_AUTH_TOKEN or the service token file) holds the "
+      + "management (admin) token, so the proxy fences the whole management API closed and "
+      + "every ocx management command fails with 503. "
+      + "Action: unset OPENCODEX_API_AUTH_TOKEN, replace the service token file with a distinct "
+      + "data-plane key, then re-run `ocx service install` and restart the proxy",
+  };
+}
+
+/**
  * OAuth reliability checks for `ocx doctor`. Observe-only: never mutates
  * credentials, locks, or networking. Every WARN includes a recovery Action.
  */
@@ -145,6 +220,8 @@ export async function collectOAuthDoctorChecks(
   deps: Parameters<typeof collectOAuthHealthEntriesForCli>[1] = {},
 ): Promise<OAuthDoctorCheck[]> {
   const checks: OAuthDoctorCheck[] = [];
+
+  checks.push(dataPlaneCredentialCollisionCheck());
 
   if (isOAuthCredentialStorageWritable()) {
     checks.push({ level: "OK", message: "OAuth credential storage directory is writable for atomic auth.json updates." });
@@ -934,6 +1011,9 @@ export async function runDoctor(args: string[] = []): Promise<void> {
   }
 
   console.log("opencodex doctor\n");
+  // Reset per pass: the suite drives runDoctor several times in one process, and a sticky
+  // flag would fail the second call because the first saw a problem.
+  doctorSawFailure = false;
 
   // Ordering note: the memory/runtime section renders after "Running proxy
   // process proxy env" below; helpers live above runDoctor for testability.
@@ -982,7 +1062,7 @@ export async function runDoctor(args: string[] = []): Promise<void> {
   const startup = collectStartupHealth(doctorConfig);
   console.log("\nCodex restart safety");
   console.log(`  ${startup.rebootSafe ? "ok " : "!! "} ${startupHealthSummary(startup)}`);
-  console.log(`       routing=${startup.routingKind}, service=${startup.serviceViable ? "viable" : startup.serviceInstalled ? "installed-but-unhealthy" : "absent"}, shim=${startup.shimHealthy ? "healthy" : startup.shimInstalled ? "stale" : "absent"}`);
+  console.log(`       ${formatStartupRoutingDetail(startup)}`);
 
   console.log("\nCodex runtime selection");
   {
@@ -1018,6 +1098,20 @@ export async function runDoctor(args: string[] = []): Promise<void> {
   const live = await findLiveProxy({
     configFn: () => ({ port: doctorConfig.port, hostname: doctorConfig.hostname }),
   });
+
+  // Mirrors `ocx status` through the same comparison rather than a second implementation:
+  // two diagnostics disagreeing about whether an install is stale is worse than one (#2701).
+  // No extra probe -- findLiveProxy already carried the version back.
+  {
+    const { packageVersion } = await import("./help");
+    const { computeVersionSkew } = await import("./version-skew");
+    const skew = computeVersionSkew(packageVersion(), live?.version);
+    if (skew.skewed && skew.warning) {
+      console.log(`!! ${skew.warning}`);
+    } else if (skew.proxyVersion !== null) {
+      console.log(`ok ocx ${skew.cliVersion} matches the running proxy`);
+    }
+  }
 
   const currentProxyEnv = collectProxyEnv();
   const configuredProxy = collectConfiguredProxy();
@@ -1072,10 +1166,10 @@ export async function runDoctor(args: string[] = []): Promise<void> {
   console.log(`  ${probe.ok ? "ok " : "-- "} ${WHAM_USAGE_URL}`);
   console.log(`       ${detail}, ${probe.durationMs}ms, ${probe.authenticated ? "authenticated" : "unauthenticated"}`);
 
-  // Design B upgrade visibility: threads still tagged opencodex are invisible to the native
-  // Codex app until the one-time migration lands. Read-only probe (readonly sqlite, 100ms
-  // busy timeout) — reports state, never mutates.
-  console.log("\nCodex history migration");
+  // Design B upgrade visibility: only the backup manifest authorizes restoring provider
+  // metadata. Bare routed rows have unknown provenance and remain unchanged. This read-only
+  // probe reports manifest work and database readability; it never mutates.
+  console.log("\nCodex history metadata restore");
   // The history failure messages point here; make the visit worthwhile by
   // probing the coordinator namespace the locks live in. The probe exercises
   // identity, runtime-root, and permission checks without taking any lock or
@@ -1096,11 +1190,17 @@ export async function runDoctor(args: string[] = []): Promise<void> {
   for (const line of formatCoordinatorDoctorLines(inspectCodexCoordinator())) console.log(line);
   const pending = countPendingOpencodexHistory();
   if (pending.failed) {
-    console.log("  --     state DB locked or unreadable (Codex app open?) — migration state unknown");
+    if (pending.failureReason === "busy") {
+      console.log("  --     history database, backup manifest, or rollout file is busy — exact metadata restore is pending");
+    } else if (pending.failureReason === "permission") {
+      console.log("  --     state DB or backup manifest access was denied — restore state unknown");
+    } else {
+      console.log("  --     backup manifest or restore target failed integrity checks — manual review required");
+    }
   } else if (pending.pendingRows === 0 && pending.backupEntries === 0) {
-    console.log("  ok     no legacy opencodex-tagged threads pending");
+    console.log("  ok     no manifest-backed provider metadata pending; untracked routed history is unchanged");
   } else {
-    console.log(`  --     ${pending.pendingRows} thread(s) still tagged opencodex, ${pending.backupEntries} backup manifest entr${pending.backupEntries === 1 ? "y" : "ies"}`);
+    console.log(`  --     ${pending.backupEntries} backup manifest entr${pending.backupEntries === 1 ? "y" : "ies"} pending exact metadata restore`);
   }
 
   console.log("\nProject Codex configs");
@@ -1141,6 +1241,12 @@ export async function runDoctor(args: string[] = []): Promise<void> {
   console.log("\nOAuth reliability");
   for (const check of await collectOAuthDoctorChecks()) {
     console.log(`  [${check.level}] ${check.message}`);
+    // A diagnostic that always exits 0 cannot gate anything, which defeats the point of
+    // running it from a script (#2697's sibling defect). FAIL is the level reserved for a
+    // surface that is unusable rather than degraded, so it -- and only it -- fails the
+    // command. WARN stays exit 0 on purpose: warning on a degraded-but-working install
+    // must not break a pipeline that is legitimately green.
+    if (check.level === "FAIL") recordDoctorFailure();
   }
 
   // #857: a running Codex app-server can keep an older in-memory catalog than
@@ -1148,7 +1254,7 @@ export async function runDoctor(args: string[] = []): Promise<void> {
   const { collectCodexAppServerCatalogState } = await import("../codex/app-server-processes");
   const catalogState = collectCodexAppServerCatalogState();
   if (catalogState.state === "stale") {
-    console.log(`  [WARN] Codex app-server (PID(s): ${catalogState.processes.map(p => p.pid).join(", ")}) started before the on-disk catalog changed; its in-memory model list disagrees with ocx. Action: restart Codex (or run \`ocx sync --restart-codex\`)`);
+    console.log(`  [WARN] Codex app-server (PID(s): ${catalogState.processes.map(p => p.pid).join(", ")}) started before the on-disk catalog changed; its in-memory model list disagrees with ocx. Action: restart Codex (or run \`ocx sync --restart-codex\`; on Windows the desktop app may need \`ocx sync --restart-desktop-app\`)`);
   } else if (catalogState.state === "unknown") {
     console.log("  [WARN] Could not verify whether the running Codex app-server's model catalog is current (start time or catalog unreadable). Action: if the model list looks stale, restart Codex");
   } else if (catalogState.state === "fresh") {
@@ -1185,8 +1291,14 @@ export async function runDoctor(args: string[] = []): Promise<void> {
       }
     }
   }
-  if (pending.failed || pending.pendingRows > 0 || pending.backupEntries > 0) {
-    hints.push("Legacy chat threads are still tagged opencodex (or the DB was locked). The running proxy retries the migration automatically; to force it now, close the Codex app and run 'ocx sync'.");
+  if (pending.failed && pending.failureReason === "busy") {
+    hints.push("Backed-up history metadata is pending or its state is unreadable. The running proxy retries exact restoration automatically; to force it now, close the Codex app and run 'ocx sync'. Untracked routed history is not relabeled.");
+  } else if (pending.failed && pending.failureReason === "permission") {
+    hints.push("Backed-up history metadata could not be inspected because access was denied. Fix access to the reported Codex history paths, then run 'ocx sync'; repeated retries do not repair permissions.");
+  } else if (pending.failed) {
+    hints.push("The history manifest or its target is invalid or changed. Preserve both, inspect the manifest/database/rollout identity, and do not repeatedly run 'ocx sync' until the mismatch is understood. Untracked routed history is not relabeled.");
+  } else if (pending.backupEntries > 0) {
+    hints.push("Backed-up history metadata is pending. The running proxy retries exact restoration automatically; to force it now, close the Codex app and run 'ocx sync'. Untracked routed history is not relabeled.");
   }
   if (dual.dualInstall && !dual.effectiveIsWindowsMount) {
     hints.push(`Codex is installed on BOTH WSL and Windows. Each side keeps its own ~/.codex (logins, config, catalog are separate); ocx here manages the Linux one. To share a single home, set CODEX_HOME=${dual.windowsCodexHomes[0] ?? `${dual.automountRoot}/c/Users/<you>/.codex`} in WSL (drvfs file locking is less reliable).`);

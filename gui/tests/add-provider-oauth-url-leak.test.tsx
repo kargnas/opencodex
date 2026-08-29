@@ -24,7 +24,9 @@ let host: HTMLElement;
 let root: Root | null = null;
 let originalFetch: typeof globalThis.fetch;
 let pendingLogins: Array<(url: string) => void> = [];
-let oauthStatus: { loggedIn: boolean; error?: string } = { loggedIn: false };
+let oauthStatus: { loggedIn: boolean; done?: boolean; error?: string } = { loggedIn: false };
+let oauthStatusQueue: Array<typeof oauthStatus> = [];
+let oauthStatusRequests = 0;
 
 const PRESETS = [
   { id: "claude", label: "Claude", adapter: "anthropic", baseUrl: "https://api.anthropic.com", auth: "oauth", oauthProvider: "claude" },
@@ -46,6 +48,8 @@ beforeEach(() => {
 
   pendingLogins = [];
   oauthStatus = { loggedIn: false };
+  oauthStatusQueue = [];
+  oauthStatusRequests = 0;
   Object.defineProperty(globalThis, "fetch", {
     configurable: true,
     value: async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -59,7 +63,10 @@ beforeEach(() => {
           pendingLogins.push((authUrl: string) => resolve(Response.json({ url: authUrl })));
         });
       }
-      if (url.pathname === "/api/oauth/status") return Response.json(oauthStatus);
+      if (url.pathname === "/api/oauth/status") {
+        oauthStatusRequests += 1;
+        return Response.json(oauthStatusQueue.shift() ?? oauthStatus);
+      }
       return Response.json({});
     },
   });
@@ -209,6 +216,47 @@ test("a login error wins over a retained OAuth credential", async () => {
 
     expect(added).toEqual([]);
     expect(host.textContent).toContain("provider entry was not written");
+  } finally {
+    timeoutSpy.mockRestore();
+  }
+});
+
+test("a retained credential does not complete a new OAuth flow before done", async () => {
+  const added: string[] = [];
+  oauthStatusQueue = [
+    { loggedIn: true, done: false },
+    { loggedIn: true, done: true },
+  ];
+  const realSetTimeout = globalThis.setTimeout;
+  const timeoutSpy = spyOn(globalThis, "setTimeout").mockImplementation(((
+    callback: (...args: unknown[]) => void,
+    delay?: number,
+    ...args: unknown[]
+  ) => {
+    if (delay === OAUTH_LOGIN_POLL_INTERVAL_MS) {
+      queueMicrotask(() => callback(...args));
+      return 0 as unknown as ReturnType<typeof setTimeout>;
+    }
+    return realSetTimeout(callback, delay, ...args);
+  }) as typeof setTimeout);
+
+  try {
+    await mountModal(name => added.push(name));
+    await act(async () => {
+      clickByText("Claude");
+      await new Promise((r) => setTimeout(r, 20));
+    });
+    await act(async () => {
+      clickByText("Log in with Claude");
+      await new Promise((r) => setTimeout(r, 20));
+    });
+    await act(async () => {
+      pendingLogins.shift()!(A_URL);
+      await new Promise((r) => setTimeout(r, 40));
+    });
+
+    expect(added).toEqual(["claude"]);
+    expect(oauthStatusRequests).toBe(2);
   } finally {
     timeoutSpy.mockRestore();
   }

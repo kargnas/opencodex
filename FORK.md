@@ -13,11 +13,11 @@ upstream을 주기적으로 merge해서 버전을 따라간다. upstream이 고�
 
 ## 현재 패치 목록 (upstream 반영되면 삭제)
 
-- `fix(gui): complete OAuth logins from the web UI` — ① add-provider 모달 Accounts 탭이
-  로그인 URL/device code를 렌더하지 않던 것 ② 이미 로그인된 provider에 계정 추가 시
-  완료 오탐(`loggedIn`/계정수 baseline)으로 모달 즉사 → `done` 판정으로 교체
-  ③ loopback 콜백(Anthropic localhost:54545) 리다이렉트 URL 수동 paste 입력을
-  워크스페이스 패널·모달 계정 행에 추가.
+- `fix(gui): wait for explicit OAuth flow completion` — 이미 로그인된 provider에서
+  `loggedIn`/계정수 baseline으로 완료를 추정하면 새 OAuth 화면이 즉시 닫히므로,
+  add-provider와 account-add 흐름 모두 서버의 `done` 상태만 완료로 판정한다.
+  로그인 URL/device code 표시, 첫 provider 추가 hint, loopback redirect URL 수동 제출
+  UI는 upstream v2.33.0의 #2530, #2534, #2540, #2543 구현을 그대로 사용한다.
 - `fix(codex): keep Darwin ps timestamps locale-independent` — macOS의 `/bin/ps lstart`
   출력을 `LC_ALL=C`로 고정해서 비영어 locale에서도 Codex 프로세스 시작 시각을 읽는다.
 - `fix(proxy): model discovery flavor + auth conflict` — `/v1/models`에서
@@ -32,6 +32,8 @@ upstream을 주기적으로 merge해서 버전을 따라간다. upstream이 고�
 
 - `perf: ChatGPT Codex upstream을 responses_websockets 전송으로 전환` 및 후속
   리뷰 수정 — upstream `rebase/1487-ws-upstream` (#1558)으로 들어갔다.
+- `fix(quota): preserve additional quota windows` — upstream v2.35.0의 #2572로
+  들어가 Codex WHAM·Anthropic 모델별 기간과 sparse refresh의 월간 기간을 보존한다.
 
 ## 동기화 이력
 
@@ -41,6 +43,9 @@ upstream을 주기적으로 merge해서 버전을 따라간다. upstream이 고�
   채택해 제거했다. OAuth GUI·Darwin locale·model discovery 패치는 유지했다.
 - 2026-08-23 — upstream `v2.31.0`을 병합했다. 서비스 재시작·Windows process
   discovery 변경과 slot runtime 패치를 함께 통합했고, 기존 fork 패치 4개를 유지했다.
+- 2026-08-29 — upstream `v2.35.0`을 병합했다. upstream의 OAuth login hint와
+  process-state 분리를 채택하고, 명시적 OAuth 완료 판정·slot runtime·모델 discovery·
+  quota window 패치를 새 구조에 맞춰 유지했다.
 
 ## upstream 동기화 절차
 

@@ -34,6 +34,7 @@ import {
 import * as windowsAcl from "../src/lib/windows-secret-acl";
 import { setTrustedWindowsSystemDirectoryResolverForTests } from "../src/lib/windows-elevation";
 import { AtomicWriteResidualTempError, atomicWriteFile, atomicWriteFileAsync, hardenConfigDir, hardenExistingSecret, renameAtomicFile, saveConfig } from "../src/config";
+import { providerManagementConfigError } from "../src/server/auth-cors";
 let testDir = "";
 
 /**
@@ -1246,6 +1247,38 @@ describe("opencodex config defaults", () => {
     }
   });
 
+  test("modelSupportsVerbosity accepts only plain boolean records", () => {
+    writeConfig({
+      port: 12345,
+      providers: {
+        custom: {
+          adapter: "openai-responses",
+          baseUrl: "https://example.test/v1",
+          modelSupportsVerbosity: { strict: false, normal: true },
+        },
+      },
+      defaultProvider: "custom",
+    });
+    expect(readConfigDiagnostics().error).toBeNull();
+
+    for (const invalid of [[], { strict: "false" }, { "": false }]) {
+      writeConfig({
+        port: 12345,
+        providers: {
+          custom: {
+            adapter: "openai-responses",
+            baseUrl: "https://example.test/v1",
+            modelSupportsVerbosity: invalid,
+          },
+        },
+        defaultProvider: "custom",
+      });
+      expect(readConfigDiagnostics().source).toBe("fallback");
+      expect(readConfigDiagnostics().error).toContain("modelSupportsVerbosity");
+    }
+
+  });
+
   test("modelReasoningSummaryDelivery validates known values and rejects summary opt-out conflicts (#538)", () => {
     writeConfig({
       port: 12345,
@@ -1617,6 +1650,40 @@ describe("opencodex config defaults", () => {
     });
     expect(readConfigDiagnostics().source).toBe("fallback");
     expect(readConfigDiagnostics().error).toContain("providers.custom.modelMaxInputTokens");
+  });
+
+  test("disk config validates per-model auto-compaction budgets with native exact ids", () => {
+    writeConfig({
+      port: 10100,
+      providers: {
+        custom: {
+          adapter: "openai-chat",
+          baseUrl: "https://example.test/v1",
+          modelAutoCompactTokenLimits: { model: 1.5 },
+        },
+      },
+      defaultProvider: "custom",
+    });
+    expect(readConfigDiagnostics().source).toBe("fallback");
+    expect(readConfigDiagnostics().error).toContain("providers.custom.modelAutoCompactTokenLimits");
+
+    rmSync(testDir, { recursive: true, force: true });
+    mkdirSync(testDir, { recursive: true });
+    writeConfig({
+      port: 10100,
+      providers: {
+        openai: {
+          adapter: "openai-responses",
+          baseUrl: "https://chatgpt.com/backend-api/codex",
+          authMode: "forward",
+          codexAccountMode: "direct",
+          modelAutoCompactTokenLimits: { "team/gpt-5.6-sol": 64_000 },
+        },
+      },
+      defaultProvider: "openai",
+    });
+    expect(readConfigDiagnostics().source).toBe("fallback");
+    expect(readConfigDiagnostics().error).toContain("exact supported native model id");
   });
 
   test("disk config preserves valid OpenRouter routing and rejects invalid destinations", () => {
@@ -2578,7 +2645,7 @@ describe("config.ts – Windows ACL hardening integration", () => {
 
 describe("config.ts – sync writer timeout keying (#840 refinement)", () => {
   test("the production sync harden keys timeouts by destination", () => {
-    const source = readFileSync(join(import.meta.dir, "..", "src", "config.ts"), "utf-8");
+    const source = readFileSync(join(import.meta.dir, "..", "src", "config", "atomic-write.ts"), "utf-8");
     expect(source).toContain("hardenSecretPath(target, { required: true, timeoutMemoKey: path })");
   });
 

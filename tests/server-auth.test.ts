@@ -150,7 +150,7 @@ afterEach(() => {
   if (existsSync(TEST_DIR)) rmSync(TEST_DIR, { recursive: true });
 });
 
-const POOL_RETRY_MODEL = "gpt-5.6-sol";
+const POOL_RETRY_MODEL = "gpt-5.5";
 
 function unsupportedModelBody(model = POOL_RETRY_MODEL): string {
   return JSON.stringify({
@@ -2167,7 +2167,10 @@ describe("server local API auth", () => {
     const harness = await startPoolRetryHarness(
       async (_accountId, request) => {
         upstreamBody = await request.json() as Record<string, unknown>;
-        return Response.json({ id: "canonical-wire-success", status: "completed", output: [] });
+        return Response.json(
+          { id: "canonical-wire-success", status: "completed", output: [], usage: { input_tokens: 1000, output_tokens: 100 } },
+          { headers: { "openai-model": "gpt-5.6-sol" } },
+        );
       },
       {
         secondAccount: false,
@@ -2183,6 +2186,14 @@ describe("server local API auth", () => {
       expect(upstreamBody?.model).toBe("gpt-5.6-sol");
       expect(upstreamBody).not.toHaveProperty("prompt_cache_retention");
       expect(harness.dispatches).toEqual(["acct-pool-a"]);
+
+      const logs = logsFromApiBody(await fetch(new URL("/api/logs?tail=1", harness.server.url), { headers: managementHeaders() }).then(r => r.json()));
+      expect(logs.at(-1)).toMatchObject({
+        model: "gpt-daybreak-blue-latest",
+        status: 200,
+      });
+      expect(logs.at(-1)?.resolvedModel).toBeUndefined();
+      expect(logs.at(-1)?.displayMetrics?.cost?.kind).toBe("value");
     } finally {
       await stopPoolRetryHarness(harness);
     }
@@ -2232,7 +2243,11 @@ describe("server local API auth", () => {
     } finally {
       await stopPoolRetryHarness(harness);
     }
-  });
+    // Same budget as the other harness cases in this file: this one starts a real server and
+    // was left on Bun's 5s default, so it timed out at 5003ms under full-suite parallel load
+    // while passing 3/3 in isolation on two machines. A server-backed case measured against a
+    // default meant for pure unit tests is a load flake, not a signal.
+  }, { timeout: SERVER_BUDGET_MS });
 
   test("#2097: a confirmed entitled account survives two transient unsupported-model 400s in place", async () => {
     const model = "gpt-daybreak-blue-latest";
@@ -2957,11 +2972,29 @@ describe("server local API auth", () => {
     }
   }, { timeout: SERVER_BUDGET_MS });
 
+  // #2398 changed what the caller sees here, and this test had to move with it.
+  //
+  // The invariant this test exists for is unchanged and still asserted: an oversized 400
+  // must NOT authorize a pool retry, so exactly one account is dispatched and neither
+  // account is marked unhealthy. What changed is the body. Relaying 65 KiB of
+  // attacker-controlled bytes back to the client is precisely what #2398 stopped, so the
+  // caller now gets #452's bounded status-only JSON instead of the original prefix
+  // (pinned from the other side by "oversized passthrough errors become bounded
+  // status-only JSON" in tests/issue-452-empty-503.test.ts).
+  //
+  // The upstream's own headers still survive, which is what keeps pool-retry diagnostics
+  // honest — that part is still checked below.
   test("oversized 400 body never authorizes a pool retry", async () => {
-    const body = `${unsupportedModelBody()}${"x".repeat(65_536)}`;
+    const hostileSuffix = "x".repeat(65_536);
+    const body = `${unsupportedModelBody()}${hostileSuffix}`;
     const harness = await startPoolRetryHarness(() => rejectionResponse(body));
     try {
-      await expectOriginal400(await harness.request(), body);
+      const response = await harness.request();
+      expect(response.status).toBe(400);
+      const text = await response.text();
+      expect(text).not.toContain(hostileSuffix);
+      expect(text.length).toBeLessThan(1_024);
+
       expect(harness.dispatches).toEqual(["acct-pool-a"]);
       expect(getCodexUpstreamHealth("pool-a")).toBeNull();
       expect(getCodexUpstreamHealth("pool-b")).toBeNull();
@@ -3397,7 +3430,7 @@ describe("server local API auth", () => {
       await server.stop(true);
       await upstream.stop(true);
     }
-  });
+  }, { timeout: SERVER_BUDGET_MS });
 
   test("passthrough SSE cyber terminal is logged as 400 cyber_policy", async () => {
     if (existsSync(TEST_DIR)) rmSync(TEST_DIR, { recursive: true });
