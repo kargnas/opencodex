@@ -271,6 +271,39 @@ export function nativeOpenAiContextWindow(slug: string, limits?: NativeContextLi
   return narrowToLimits(raw, slug, limits);
 }
 
+export function nativeOpenAiMaxOutputTokens(slug: string): number | undefined {
+  const sourceSlug = nativeOpenAiCapabilitySourceSlug(slug);
+  return positiveInt(getModelMetadata("openai", sourceSlug)?.maxTokens);
+}
+
+/**
+ * Long-context tier for a native slug as a (default, long) pair, for clients that let the user
+ * pick a window per request (Cursor's local-agent "Context" selector). The pair is the family's
+ * pinned default window and its opt-in ceiling, independent of whether the operator has
+ * already opted the proxy into the long window: the selector exists so the client can choose.
+ * Any user lever below the long window removes the tier: a per-model window override, the
+ * provider-level window override, or a provider context cap. A lever at or above it leaves the
+ * tier intact (the 922k/1050k opt-in values are the levers, not a request to shrink). Undefined
+ * when the family has no separate tier or when the two windows coincide.
+ */
+export function nativeOpenAiContextTier(
+  slug: string,
+  limits?: NativeContextLimitsInput,
+): { defaultWindow: number; longWindow: number } | undefined {
+  const override = NATIVE_OPENAI_CONTEXT_OVERRIDES[slug];
+  const defaultWindow = positiveInt(override?.contextWindow);
+  const longWindow = positiveInt(override?.maxContextWindow);
+  if (defaultWindow === undefined || longWindow === undefined || longWindow <= defaultWindow) return undefined;
+  const resolved = asLimits(limits);
+  const levers = [
+    positiveInt(resolved.modelWindows?.[slug]),
+    positiveInt(resolved.providerWindow),
+    positiveInt(resolved.cap),
+  ];
+  if (levers.some(lever => lever !== undefined && lever < longWindow)) return undefined;
+  return { defaultWindow, longWindow };
+}
+
 /**
  * Largest input a native slug accepts, or undefined when no separate limit is known
  * (the caller then falls back to the context window).
@@ -548,7 +581,7 @@ function hasNativeCatalogRowShape(entry: RawEntry): boolean {
   return typeof entry.base_instructions === "string"
     && entry.base_instructions.length > 0
     && (typeof entry.comp_hash === "string" || entry.comp_hash === null)
-    && entry.shell_type === "shell_command"
+    && (entry.shell_type === "unified_exec" || entry.shell_type === "shell_command")
     && Array.isArray(levels)
     && levels.length > 0
     && levels.every(level => typeof level === "object" && level !== null

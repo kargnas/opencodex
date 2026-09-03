@@ -1,13 +1,15 @@
 import { afterEach, describe, expect, spyOn, test } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { applyNativeVisibility, augmentRoutedModelsWithMetadata, augmentRoutedModelsWithRegistryOpenAiApiRows, buildCatalogEntries, buildComboCatalogOmission, catalogModelSlug, clampCatalogModelsToCodexSupport, clampEntryToCodexSupportedEfforts, clampedDefaultEffort, CODEX_ACCOUNT_BOUND_CATALOG_KIND, CODEX_NATIVE_ALIAS_CATALOG_KIND, comboCatalogOmissionReason, deriveComboCatalogModel, exactComboCatalogSlugs, filterCatalogVisibleModels, filterSupportedNativeSlugs, gatherRoutedModels as gatherRoutedModelsDirect, isDatedVariantId, isMediaGenerationModelId, loadBundledCodexCatalog, materializeBundledCodexCatalog, mergeCatalogEntriesForSync, NATIVE_DAYBREAK_BLUE_MODEL, NATIVE_OPENAI_MODELS, nativeDefaultReasoningEffort, nativeInputModalities, nativeOpenAiCapabilitySourceSlug, nativeOpenAiContextWindow, nativeReasoningEfforts, normalizeRoutedCatalogEntry, resetCatalogRuntimeStateForTests, resetOpenAiApiCatalogWarningStateForTests, resolveComboCatalogMember, shouldExposeRoutedModel, upstreamNativeEntry } from "../src/codex/catalog";
-import { applyProviderConfigHints } from "../src/codex/catalog/provider-fetch";
+import { applyProviderConfigHints, mergeConfiguredModelsIntoLiveCatalog } from "../src/codex/catalog/provider-fetch";
 import {
   CODEX_CUSTOM_MODEL_CATALOG_KIND,
   CODEX_PROVIDER_MODEL_CATALOG_KIND,
+  ensureStrictCatalogFields,
   findNativeTemplate,
+  findSupportedNativeTemplate,
 } from "../src/codex/catalog/parsing";
 import { withStubbedProviderFetch } from "./helpers/catalog-provider-fetch";
 import {
@@ -45,6 +47,7 @@ import {
   mergeCatalogEntriesFromObservedState,
   type ObservedCatalogMergeInput,
 } from "../src/codex/catalog/sync";
+import { removeTreeWithRetry } from "./helpers/remove-tree";
 
 const originalFetch = globalThis.fetch;
 
@@ -70,6 +73,7 @@ function normalizedCombo(
     strategy: "failover",
     stickyLimit: 1,
     defaultEffort: "medium",
+    reasoningEffortMode: "strict",
     imageInput: "auto",
     alias: null,
     nativeAlias: false,
@@ -222,6 +226,20 @@ describe("combo catalog capability intersection", () => {
     });
   });
 
+  test("combo output ceiling is the smallest known member ceiling and stays unknown if any member is unknown", () => {
+    const known = deriveComboCatalogModel("known-output", normalizedCombo(), [
+      { provider: "a", id: "m1", contextWindow: 128_000, maxOutputTokens: 64_000 },
+      { provider: "b", id: "m2", contextWindow: 128_000, maxOutputTokens: 32_000 },
+    ]);
+    expect(known?.maxOutputTokens).toBe(32_000);
+
+    const partial = deriveComboCatalogModel("partial-output", normalizedCombo(), [
+      { provider: "a", id: "m1", contextWindow: 128_000, maxOutputTokens: 64_000 },
+      { provider: "b", id: "m2", contextWindow: 128_000 },
+    ]);
+    expect(partial).not.toHaveProperty("maxOutputTokens");
+  });
+
   test("handles vision, missing modalities, reasoning defaults, and parallel tools conservatively", () => {
     expect(deriveComboCatalogModel("vision", normalizedCombo({ defaultEffort: "low" }), [
       memberA,
@@ -261,6 +279,33 @@ describe("combo catalog capability intersection", () => {
     ]);
     expect(empty?.reasoningEfforts).toEqual([]);
     expect(empty).not.toHaveProperty("defaultReasoningEffort");
+  });
+
+  test("adaptive mode keeps the surviving ladder when a target advertises no effort control", () => {
+    // The strict case above is the baseline: memberB's explicit [] empties the picker for
+    // the whole combo. Adaptive is the opt-in that excludes it instead, so the effort
+    // control stays usable for the siblings that do support tuning.
+    const adaptive = deriveComboCatalogModel(
+      "adaptive",
+      normalizedCombo({ defaultEffort: "medium", reasoningEffortMode: "adaptive" }),
+      [memberA, { ...memberB, reasoningEfforts: [] }],
+    );
+    expect(adaptive?.reasoningEfforts).toEqual(["low", "medium", "high"]);
+    expect(adaptive?.defaultReasoningEffort).toBe("medium");
+
+    // Adaptive only drops EMPTY ladders; non-empty ones still intersect normally.
+    expect(deriveComboCatalogModel(
+      "adaptive-intersect",
+      normalizedCombo({ defaultEffort: "medium", reasoningEffortMode: "adaptive" }),
+      [memberA, { ...memberB, reasoningEfforts: ["medium", "high"] }],
+    )?.reasoningEfforts).toEqual(["medium", "high"]);
+
+    // Every target empty under adaptive still yields no ladder — there is nothing to keep.
+    expect(deriveComboCatalogModel(
+      "adaptive-all-empty",
+      normalizedCombo({ defaultEffort: "medium", reasoningEffortMode: "adaptive" }),
+      [{ ...memberA, reasoningEfforts: [] }, { ...memberB, reasoningEfforts: [] }],
+    )?.reasoningEfforts).toEqual([]);
   });
 
   test("fails closed for missing members, unknown context, duplicate targets, and empty modalities", () => {
@@ -1059,7 +1104,9 @@ describe("combo catalog capability intersection", () => {
           liveModels: false,
           models: ["m2"],
           modelContextWindows: { m2: 128_000 },
-          modelInputModalities: { m2: ["text"] },
+          // No declaration: text-only by catalog default, NOT sidecar-covered. A declared
+          // text-only member would widen to image (isModelTextOnly parity) and the pair
+          // would no longer be disjoint.
         },
       },
       combos: {
@@ -1200,7 +1247,9 @@ describe("combo catalog capability intersection", () => {
       contextWindow: 128_000,
       contextCapped: false,
       maxInputTokens: 100_000,
-      inputModalities: ["text"],
+      // The text-only modelInputModalities declaration is sidecar-covered at runtime
+      // (isModelTextOnly), so the combo advertises image input like its member does.
+      inputModalities: ["text", "image"],
       reasoningEfforts: ["high"],
     });
     expect(rows.find(row => row.provider === "combo" && row.id === "nova-sol"))
@@ -1513,7 +1562,7 @@ describe("combo catalog capability intersection", () => {
           liveModels: false,
           models: ["m1"],
           modelContextWindows: { m1: 128_000 },
-          // Disjoint modalities with b → empty intersection (incompatible_modalities).
+          // Image-only member. An image-only declaration is not sidecar-covered.
           modelInputModalities: { m1: ["image"] },
         },
         b: {
@@ -1522,7 +1571,10 @@ describe("combo catalog capability intersection", () => {
           liveModels: false,
           models: ["m2"],
           modelContextWindows: { m2: 128_000 },
-          modelInputModalities: { m2: ["audio"] },
+          // No modality declaration: the member is text-only by catalog default and the
+          // sidecar does not cover it, so text and image stay genuinely disjoint
+          // (incompatible_modalities). A DECLARED text-only member would be widened to
+          // image (isModelTextOnly parity) and no longer be disjoint.
         },
       },
       combos: {
@@ -1780,6 +1832,202 @@ describe("Cursor Kimi K3 catalog default effort", () => {
   });
 });
 
+describe("provider discovered model display names", () => {
+  const provider = {
+    adapter: "openai-responses",
+    baseUrl: "https://api.x.ai/v1",
+    modelDisplayNames: { "grok-4.6": "Grok 4.6" },
+  };
+
+  test("an exact provider model id receives the configured display name without losing catalog metadata", () => {
+    const discovered = {
+      provider: "xai",
+      id: "grok-4.6",
+      displayName: "Provider Grok",
+      contextWindow: 131_072,
+      maxInputTokens: 100_000,
+      autoCompactTokenLimit: 90_000,
+      inputModalities: ["text", "image"],
+      reasoningEfforts: ["low", "high"],
+      defaultReasoningEffort: "high",
+      supportsReasoningSummaries: true,
+      supportsVerbosity: false,
+      priority: 17,
+      fallbackModels: ["grok-4.5"],
+      owned_by: "xai",
+    } as const;
+
+    const output = applyProviderConfigHints("xai", provider, discovered);
+    const { displayName: _beforeDisplayName, ...beforeIdentity } = discovered;
+    const { displayName: _afterDisplayName, ...afterIdentity } = output;
+
+    expect(output.displayName).toBe("Grok 4.6");
+    expect(afterIdentity).toEqual({
+      ...beforeIdentity,
+      maxOutputTokens: 500_000,
+      supportsServiceTier: false,
+    });
+    expect(catalogModelSlug(output)).toBe("xai/grok-4.6");
+  });
+
+  test("output ceilings prefer live metadata and only model-scoped config may narrow", () => {
+    const generated = applyProviderConfigHints("xai", {
+      ...provider,
+      defaultMaxOutputTokens: 1,
+    }, { provider: "xai", id: "grok-4.6" });
+    expect(generated.maxOutputTokens).toBe(500_000);
+
+    const narrowed = applyProviderConfigHints("xai", {
+      ...provider,
+      modelMaxOutputTokens: { "grok-4.6": 64_000 },
+    }, { provider: "xai", id: "grok-4.6", maxOutputTokens: 128_000 });
+    expect(narrowed.maxOutputTokens).toBe(64_000);
+
+    const discoveredSmaller = applyProviderConfigHints("xai", {
+      ...provider,
+      modelMaxOutputTokens: { "grok-4.6": 64_000 },
+    }, { provider: "xai", id: "grok-4.6", maxOutputTokens: 32_000 });
+    expect(discoveredSmaller.maxOutputTokens).toBe(32_000);
+
+    const defaultOnly = applyProviderConfigHints("unknown", {
+      ...provider,
+      defaultMaxOutputTokens: 1,
+    }, { provider: "unknown", id: "unknown-model" });
+    expect(defaultOnly.maxOutputTokens).toBeUndefined();
+  });
+
+  test("display names use exact case-sensitive ids and stay provider scoped", () => {
+    const wrongCase = applyProviderConfigHints("xai", provider, { provider: "xai", id: "GROK-4.6" });
+    const otherProvider = applyProviderConfigHints("other", {
+      ...provider,
+      modelDisplayNames: { "grok-4.6": "Other Grok" },
+    }, { provider: "other", id: "grok-4.6" });
+
+    expect(wrongCase.displayName).toBeUndefined();
+    expect(otherProvider.displayName).toBe("Other Grok");
+  });
+
+  test("provider metadata remains when no operator display name exists", () => {
+    const output = applyProviderConfigHints("xai", {
+      ...provider,
+      modelDisplayNames: undefined,
+    }, {
+      provider: "xai",
+      id: "grok-4.6",
+      displayName: "Provider Grok",
+    });
+
+    expect(output.displayName).toBe("Provider Grok");
+  });
+
+  test("a configured display name emits into the Codex picker without changing its slug", () => {
+    const model = applyProviderConfigHints("xai", provider, { provider: "xai", id: "grok-4.6" });
+    const row = buildCatalogEntries(nativeTemplate(), [], [model])
+      .find(entry => entry.slug === "xai/grok-4.6");
+
+    expect(row?.display_name).toBe("Grok 4.6");
+    expect(row?.slug).toBe("xai/grok-4.6");
+  });
+
+  test("the label survives static, live, and configured failure catalog paths", async () => {
+    const staticModels = await gatherRoutedModels({
+      defaultProvider: "display-static",
+      providers: {
+        "display-static": {
+          adapter: "openai-chat",
+          baseUrl: "https://static.example.test/v1",
+          liveModels: false,
+          models: ["model-a"],
+          modelDisplayNames: { "model-a": "Static Model" },
+        },
+      },
+    });
+    expect(staticModels).toContainEqual(expect.objectContaining({
+      provider: "display-static",
+      id: "model-a",
+      displayName: "Static Model",
+    }));
+
+    globalThis.fetch = (async () => new Response(JSON.stringify({
+      data: [{ id: "model-a", name: "Provider Model" }],
+    }), { headers: { "content-type": "application/json" } })) as typeof fetch;
+    const liveModels = await gatherRoutedModels({
+      defaultProvider: "display-live",
+      providers: {
+        "display-live": {
+          adapter: "openai-chat",
+          baseUrl: "https://93.184.216.34/v1",
+          apiKey: "sk-test",
+          modelDisplayNames: { "model-a": "Live Model" },
+        },
+      },
+    });
+    expect(liveModels).toContainEqual(expect.objectContaining({
+      provider: "display-live",
+      id: "model-a",
+      displayName: "Live Model",
+    }));
+
+    globalThis.fetch = (async () => new Response(null, { status: 503 })) as typeof fetch;
+    const warning = spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const failedModels = await gatherRoutedModels({
+        defaultProvider: "display-failure",
+        providers: {
+          "display-failure": {
+            adapter: "openai-chat",
+            baseUrl: "https://93.184.216.34/v1",
+            apiKey: "sk-test",
+            models: ["model-a"],
+            modelDisplayNames: { "model-a": "Failure Model" },
+          },
+        },
+      });
+      expect(failedModels).toContainEqual(expect.objectContaining({
+        provider: "display-failure",
+        id: "model-a",
+        displayName: "Failure Model",
+      }));
+    } finally {
+      warning.mockRestore();
+    }
+  });
+
+  test("a stale cached row receives the current operator label on every gather", async () => {
+    const providerName = "display-stale";
+    setCached(providerName, [{
+      provider: providerName,
+      id: "model-a",
+      displayName: "Old Provider Name",
+    }], Date.now() - 10_000);
+    globalThis.fetch = (async () => new Response(null, { status: 503 })) as typeof fetch;
+    const warning = spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const config = {
+        modelCacheTtlMs: 1,
+        defaultProvider: providerName,
+        providers: {
+          [providerName]: {
+            adapter: "openai-chat" as const,
+            baseUrl: "https://93.184.216.34/v1",
+            apiKey: "sk-test",
+            modelDisplayNames: { "model-a": "Current Name" },
+          },
+        },
+      };
+      const first = await gatherRoutedModels(config);
+      const second = await gatherRoutedModels(config);
+
+      expect(first).toContainEqual(expect.objectContaining({ id: "model-a", displayName: "Current Name" }));
+      expect(second).toContainEqual(expect.objectContaining({ id: "model-a", displayName: "Current Name" }));
+      expect(first.filter(model => catalogModelSlug(model) === `${providerName}/model-a`)).toHaveLength(1);
+    } finally {
+      warning.mockRestore();
+      clearModelCache(providerName);
+    }
+  });
+});
+
 describe("configured CatalogModel displayName -> catalog display_name", () => {
   test("a routed CatalogModel displayName becomes the catalog display_name", () => {
     const model = { provider: "deepseek", id: "deepseek-v4", displayName: "DeepSeek V4", owned_by: "deepseek" };
@@ -1916,6 +2164,156 @@ describe("configured CatalogModel displayName -> catalog display_name", () => {
     } finally {
       globalThis.fetch = originalFetch;
       clearModelCache("custom-provider");
+    }
+  });
+
+  test("provider and model aliases label picker rows without changing routing slugs", async () => {
+    clearModelCache("google-antigravity");
+    try {
+      const models = await gatherRoutedModels({
+        port: 10100,
+        defaultProvider: "google-antigravity",
+        providers: {
+          "google-antigravity": {
+            baseUrl: "https://example.invalid/v1",
+            adapter: "openai-chat",
+            liveModels: false,
+            models: ["gemini-3.7-flash"],
+            alias: "ga",
+            modelAliases: { "gemini-3.7-flash": "g3f" },
+          },
+        },
+      });
+      const row = buildCatalogEntries(nativeTemplate(), [], models)
+        .find(entry => entry.slug === "google-antigravity/gemini-3.7-flash");
+
+      expect(row?.display_name).toBe("ga/g3f");
+      expect(row?.slug).toBe("google-antigravity/gemini-3.7-flash");
+    } finally {
+      clearModelCache("google-antigravity");
+    }
+  });
+
+  test("the issue reproduction uses the effective model alias for the picker label", async () => {
+    clearModelCache("google-antigravity");
+    try {
+      const models = await gatherRoutedModels({
+        port: 10100,
+        defaultProvider: "google-antigravity",
+        providers: {
+          "google-antigravity": {
+            adapter: "google",
+            baseUrl: "https://daily-cloudcode-pa.googleapis.com",
+            authMode: "oauth",
+            liveModels: false,
+            models: ["gemini-3.7-flash"],
+            modelAliases: { "gemini-3.7-flash": "gemini-3.7" },
+          },
+        },
+      });
+      const row = buildCatalogEntries(nativeTemplate(), [], models)
+        .find(entry => entry.slug === "google-antigravity/gemini-3.7-flash");
+
+      expect(row?.display_name).toBe("google-antigravity/gemini-3.7");
+      expect(row?.slug).toBe("google-antigravity/gemini-3.7-flash");
+    } finally {
+      clearModelCache("google-antigravity");
+    }
+  });
+
+  test("an explicit custom displayName wins over an effective model alias", async () => {
+    clearModelCache("google-antigravity");
+    try {
+      const models = await gatherRoutedModels({
+        port: 10100,
+        defaultProvider: "google-antigravity",
+        providers: {
+          "google-antigravity": {
+            adapter: "google",
+            baseUrl: "https://daily-cloudcode-pa.googleapis.com",
+            authMode: "oauth",
+            liveModels: false,
+            models: ["gemini-3.7-flash"],
+            modelAliases: { "gemini-3.7-flash": "gemini-3.7" },
+          },
+        },
+        customModels: [{
+          id: "custom-gemini",
+          provider: "google-antigravity",
+          modelId: "gemini-3.7-flash",
+          displayName: "My Gemini",
+          addedAt: "2026-01-01T00:00:00.000Z",
+        }],
+      });
+      const row = buildCatalogEntries(nativeTemplate(), [], models)
+        .find(entry => entry.slug === "google-antigravity/gemini-3.7-flash");
+
+      expect(row?.display_name).toBe("My Gemini");
+      expect(row?.slug).toBe("google-antigravity/gemini-3.7-flash");
+    } finally {
+      clearModelCache("google-antigravity");
+    }
+  });
+
+  test("a case-folded live model id keeps its configured picker alias", async () => {
+    clearModelCache("mixed-case-live");
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async () => new Response(JSON.stringify({
+      data: [{ id: "LIVE-Model" }, { id: "MODEL" }, { id: "model" }],
+    }), { status: 200, headers: { "content-type": "application/json" } })) as typeof fetch;
+    try {
+      const models = await gatherRoutedModels({
+        port: 10100,
+        defaultProvider: "mixed-case-live",
+        providers: {
+          "mixed-case-live": {
+            adapter: "openai-chat",
+            baseUrl: "https://example.invalid/v1",
+            authMode: "key",
+            apiKey: "test-key",
+            liveModels: true,
+            modelAliases: { "live-model": "short", "mOdEl": "ambiguous" },
+          },
+        },
+      });
+      const entries = buildCatalogEntries(nativeTemplate(), [], models);
+      const row = entries.find(entry => entry.slug === "mixed-case-live/LIVE-Model");
+
+      expect(row?.display_name).toBe("mixed-case-live/short");
+      expect(row?.slug).toBe("mixed-case-live/LIVE-Model");
+      expect(entries.find(entry => entry.slug === "mixed-case-live/MODEL")?.display_name)
+        .toBe("mixed-case-live/MODEL");
+      expect(entries.find(entry => entry.slug === "mixed-case-live/model")?.display_name)
+        .toBe("mixed-case-live/model");
+    } finally {
+      globalThis.fetch = originalFetch;
+      clearModelCache("mixed-case-live");
+    }
+  });
+
+  test("built-in model aliases label picker rows without changing routing slugs", async () => {
+    clearModelCache("builtin-alias");
+    try {
+      const models = await gatherRoutedModels({
+        port: 10100,
+        defaultProvider: "builtin-alias",
+        providers: {
+          "builtin-alias": {
+            adapter: "openai-chat",
+            baseUrl: "https://example.invalid/v1",
+            liveModels: false,
+            defaultAliases: true,
+            models: ["grok-4.6"],
+          },
+        },
+      });
+      const row = buildCatalogEntries(nativeTemplate(), [], models)
+        .find(entry => entry.slug === "builtin-alias/grok-4.6");
+
+      expect(row?.display_name).toBe("builtin-alias/grok");
+      expect(row?.slug).toBe("builtin-alias/grok-4.6");
+    } finally {
+      clearModelCache("builtin-alias");
     }
   });
 
@@ -2553,7 +2951,7 @@ describe("Codex catalog routed normalization", () => {
       expect(existsSync(path)).toBe(true);
       expect(JSON.parse(readFileSync(path, "utf8")).models[0].slug).toBe("gpt-5.5");
     } finally {
-      rmSync(dir, { recursive: true, force: true });
+      removeTreeWithRetry(dir);
     }
   });
 
@@ -2731,6 +3129,20 @@ describe("Codex catalog routed normalization", () => {
     expect(sol?.multi_agent_version).toBe("v2");
     expect(terra?.multi_agent_version).toBe("v2");
     expect(luna?.multi_agent_version).toBe("v1");
+
+    const codex0151Contract = {
+      shell_type: "unified_exec",
+      node_repl_disabled: false,
+      node_repl_auto_review_required: false,
+      include_plugin_usage_instructions: true,
+      include_apps_usage_instructions: true,
+    };
+    for (const slug of ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]) {
+      expect(upstreamNativeEntry(slug)).toMatchObject(codex0151Contract);
+    }
+    for (const entry of [sol, terra, luna]) {
+      expect(entry).toMatchObject(codex0151Contract);
+    }
 
     // ocx adaptations: client-version gate stripped; ws preference gated off by default.
     for (const e of [sol, terra, luna]) {
@@ -3238,7 +3650,14 @@ describe("Codex catalog routed normalization", () => {
     ]);
 
     const routed = rows.find(row => row.slug === "deepseek/deepseek-v4-flash");
-    expect(routed?.tool_mode).toBe("code_mode_only");
+    expect(routed).toMatchObject({
+      tool_mode: "code_mode_only",
+      shell_type: "unified_exec",
+      node_repl_disabled: false,
+      node_repl_auto_review_required: false,
+      include_plugin_usage_instructions: false,
+      include_apps_usage_instructions: true,
+    });
   });
 
   test("buildCatalogEntries preserves native tool mode on account-qualified rows", () => {
@@ -3379,7 +3798,7 @@ describe("Codex catalog routed normalization", () => {
 
     expect(fetchCalls).toBe(0);
     expect(ids).toEqual([...(provider.models ?? [])].sort());
-    expect(ids).toHaveLength(6);
+    expect(ids).toHaveLength(7);
     expect(getProviderDiscoveryStatus(providerName)).toBeUndefined();
 
     markProviderDiscoveryFailed(providerName, { reason: "http", httpStatus: 404 });
@@ -3478,12 +3897,109 @@ describe("Codex catalog routed normalization", () => {
     }
   });
 
-  test("isDatedVariantId matches only <alias>-YYYYMMDD", () => {
+  test("isDatedVariantId matches only <alias>-<date>", () => {
     expect(isDatedVariantId("claude-haiku-4-5-20251001", "claude-haiku-4-5")).toBe(true);
     expect(isDatedVariantId("claude-haiku-4-5-2025", "claude-haiku-4-5")).toBe(false);
     expect(isDatedVariantId("claude-haiku-4-5-latest", "claude-haiku-4-5")).toBe(false);
     expect(isDatedVariantId("claude-haiku-4-5", "claude-haiku-4-5")).toBe(false);
     expect(isDatedVariantId("claude-haiku-4-5-20251001", "claude-haiku-4")).toBe(false);
+  });
+
+  // Real ids from a multi-provider install. A `\d{8}`-only rule matched none of them, so
+  // every one of these aliases dropped out of the authoritative live catalog (#3024).
+  test.each([
+    ["YYYYMMDD", "claude-haiku-4-5-20251001", "claude-haiku-4-5"],
+    ["YYYYMMDD leap day", "acme-model-20240229", "acme-model"],
+    ["YYMMDD", "solar-pro4-260806", "solar-pro4"],
+    ["YYMMDD", "syn-pro-251021", "syn-pro"],
+    ["YYMMDD leap day", "acme-model-240229", "acme-model"],
+    ["MMDD", "deepseek/deepseek-v4-pro-0813", "deepseek/deepseek-v4-pro"],
+    ["MMDD", "moonshotai/kimi-k2-0905", "moonshotai/kimi-k2"],
+    ["MMDD", "openai/gpt-3.5-turbo-0613", "openai/gpt-3.5-turbo"],
+    ["MMDD leap day", "acme-model-0229", "acme-model"],
+    ["YYMM", "mistralai/mistral-large-2407", "mistralai/mistral-large"],
+    ["YYMM", "qwen/qwen3-235b-a22b-2507", "qwen/qwen3-235b-a22b"],
+  ])("folds a %s dated variant: %s", (_format, liveId, configuredId) => {
+    expect(isDatedVariantId(liveId, configuredId)).toBe(true);
+  });
+
+  test.each([
+    ["a version number", "mistralai/mistral-medium-3-5", "mistralai/mistral-medium-3"],
+    ["a context size", "openai/gpt-3.5-turbo-16k", "openai/gpt-3.5-turbo"],
+    ["a variant name", "qwen/qwen3-coder-30b-a3b-instruct", "qwen/qwen3-coder"],
+    ["a batch lane of a dated id", "deepseek/deepseek-v4-pro-0813:batch", "deepseek/deepseek-v4-pro"],
+    ["a bare year", "acme-model-2025", "acme-model"],
+    ["an impossible YYMM", "acme-model-1301", "acme-model"],
+    ["a non-leap YYYYMMDD", "acme-model-20250229", "acme-model"],
+    ["a non-leap YYMMDD", "acme-model-250229", "acme-model"],
+    ["an impossible YYYYMMDD month-end", "acme-model-20240431", "acme-model"],
+    ["an impossible YYMMDD month-end", "acme-model-240431", "acme-model"],
+    ["an impossible MMDD month-end", "acme-model-0431", "acme-model"],
+    // Hyphenated ISO is ambiguous against ordinary name segments; out of scope for now.
+    ["a hyphenated ISO date", "openai/gpt-4o-2024-08-06", "openai/gpt-4o"],
+    ["a hyphenated MM-DD", "google/gemini-2.5-pro-preview-05-06", "google/gemini-2.5-pro-preview"],
+  ])("does not fold %s: %s", (_label, liveId, configuredId) => {
+    expect(isDatedVariantId(liveId, configuredId)).toBe(false);
+  });
+
+  test.each(["2048", "4096", "8192"])("a %s context suffix is not a date", suffix => {
+    expect(isDatedVariantId(`acme-model-${suffix}`, "acme-model")).toBe(false);
+  });
+
+  // Known, accepted cost of allowing MMDD: October 24th is a real date, so a `-1024`
+  // context suffix is indistinguishable from one. No month/day tightening can exclude it.
+  test("a -1024 suffix reads as MMDD and is accepted", () => {
+    expect(isDatedVariantId("acme-model-1024", "acme-model")).toBe(true);
+  });
+
+  // The fold stays one-directional: a configured id the provider no longer lists must not
+  // be retained on the strength of a format match alone (#1690 is the explicit opt-in for
+  // that). `deepseek-v4-pro-0813` configured against a live `deepseek-v4-pro` stays dropped.
+  test("does not fold configured=dated against live=base", () => {
+    expect(isDatedVariantId("deepseek-v4-pro", "deepseek-v4-pro-0813")).toBe(false);
+  });
+
+  // The predicate test above is necessary and not sufficient: it passes on any
+  // implementation, including one whose MERGE LOOP calls the predicate a second time with
+  // the arguments swapped. These three drive `mergeConfiguredModelsIntoLiveCatalog` itself,
+  // so they fail if the loop ever becomes bidirectional. Carried from #3041, where the
+  // reverse fold was proposed and then withdrawn — the guard outlives the proposal.
+  test("the merge loop does not infer a configured dated id from a live base id", () => {
+    const { models, droppedConfiguredIds } = mergeConfiguredModelsIntoLiveCatalog({
+      name: "deepseek",
+      provider: {},
+      models: [{ id: "deepseek-v4-pro" } as never],
+      configured: [{ id: "deepseek-v4-pro-0813" } as never],
+    });
+    expect(droppedConfiguredIds).toEqual(["deepseek-v4-pro-0813"]);
+    expect(models.map(m => m.id)).not.toContain("deepseek-v4-pro-0813");
+  });
+
+  test("the merge loop folds a live MMDD dated row onto its configured base", () => {
+    const { models, droppedConfiguredIds } = mergeConfiguredModelsIntoLiveCatalog({
+      name: "deepseek",
+      provider: {},
+      models: [{ id: "deepseek-v4-pro-0813" } as never],
+      configured: [{ id: "deepseek-v4-pro" } as never],
+    });
+    expect(droppedConfiguredIds).toEqual([]);
+    expect(models.map(m => m.id)).toContain("deepseek-v4-pro");
+  });
+
+  // Retention of a dated id is a decision someone made, not an inference from a name.
+  // Note what this set actually is: production fills `retainConfiguredModelIds` from combo
+  // targets, not from `providers.*.models`, so this pins the combo-target path (OCX-111).
+  // The operator-facing opt-in is #1690's `retainModels`, which does not exist yet.
+  test("a dated id named in retainConfiguredModelIds survives the drop", () => {
+    const { models, droppedConfiguredIds } = mergeConfiguredModelsIntoLiveCatalog({
+      name: "deepseek",
+      provider: {},
+      models: [{ id: "deepseek-v4-pro" } as never],
+      configured: [{ id: "deepseek-v4-pro-0813" } as never],
+      retainConfiguredModelIds: new Set(["deepseek-v4-pro-0813"]),
+    });
+    expect(droppedConfiguredIds).toEqual([]);
+    expect(models.map(m => m.id)).toContain("deepseek-v4-pro-0813");
   });
 
   test("disabled providers are excluded from routed model gathering", async () => {
@@ -3732,13 +4248,33 @@ describe("Codex catalog routed normalization", () => {
         "kimi/kimi-k2.7-code-highspeed",
         "xai/grok-4.20-0309-non-reasoning",
         "xai/grok-4.20-0309-reasoning",
+        "xai/grok-4.20-multi-agent-0309",
         "xai/grok-4.3",
         "xai/grok-4.5",
         "xai/grok-build-0.1",
         "xai/grok-composer-2.5-fast",
       ]);
       expect(models.find(model => model.provider === "kimi" && model.id === "k3[1m]")?.contextWindow).toBe(1_048_576);
-      expect(models.some(model => model.id === "grok-4.20-multi-agent-0309")).toBe(false);
+      expect(models.find(model => model.provider === "xai" && model.id === "grok-4.20-multi-agent-0309"))
+        .toMatchObject({
+          contextWindow: 1_000_000,
+          inputModalities: ["text", "image"],
+          reasoningEfforts: ["low", "medium", "high", "xhigh"],
+        });
+      const catalogEntries = buildCatalogEntries(null, [], models);
+      const multiAgentCatalog = catalogEntries.find(entry => entry.slug === "xai/grok-4.20-multi-agent-0309");
+      expect((multiAgentCatalog?.supported_reasoning_levels as { effort: string }[]).map(level => level.effort))
+        .toEqual(["low", "medium", "high", "xhigh", "max", "ultra"]);
+      expect(models.find(model => model.provider === "xai" && model.id === "grok-4.20-multi-agent-0309")?.supportsReasoningSummaries)
+        .toBeUndefined();
+      expect(getModelMetadata("xai", "grok-4.20-multi-agent-0309")).toMatchObject({
+        contextWindow: 1_000_000,
+        maxTokens: 30_000,
+        input: ["text", "image"],
+        reasoning: true,
+        cost: { input: 1.25, output: 2.5, cacheRead: 0.2, cacheWrite: 0 },
+      });
+      expect(getModelMetadata("xai", "grok-4.20-multi-agent-0309")).not.toHaveProperty("supportsReasoningSummaries");
       expect(models.some(model => model.id === "configured-ghost")).toBe(false);
       expect(warning.mock.calls.flat().join(" ")).not.toContain("omitted configured model ids");
     } finally {
@@ -4223,6 +4759,8 @@ describe("Codex catalog routed normalization", () => {
 
     expect(slugs.has("deepseek/deepseek-v4-flash")).toBe(true);
     expect(slugs.has("deepseek/deepseek-v4-pro")).toBe(true);
+    expect(models.find(model => model.id === "deepseek-v4-flash")?.maxOutputTokens)
+      .toBe(384_000);
     for (const model of models) {
       expect(model.contextWindow).toBe(1_048_576);
       expect(model.inputModalities).toEqual(["text"]);
@@ -5069,6 +5607,49 @@ describe("Codex catalog routed normalization", () => {
     expect(routed?.context_window).toBe(64_000);
   });
 
+  test("GitHub Copilot capabilities preserve the live context window (#3156)", async () => {
+    globalThis.fetch = (async () => new Response(JSON.stringify({
+      data: [{
+        id: "copilot-wide-model",
+        capabilities: {
+          limits: { max_context_window_tokens: 1_000_000 },
+        },
+      }, {
+        id: "copilot-existing-metadata",
+        metadata: { limits: { max_context_length: 256_000 } },
+        capabilities: {
+          limits: { max_context_window_tokens: 1_000_000 },
+        },
+      }, {
+        id: "copilot-invalid-window",
+        capabilities: {
+          limits: { max_context_window_tokens: -1 },
+        },
+      }],
+    }))) as typeof fetch;
+
+    const models = await gatherRoutedModels({
+      port: 10100,
+      defaultProvider: "github-copilot",
+      providers: {
+        "github-copilot": {
+          adapter: "openai-chat",
+          baseUrl: "https://api.githubcopilot.com",
+          apiKey: "sk-test",
+        },
+      },
+    });
+    const routed = buildCatalogEntries(nativeTemplate(), [], models)
+      .find(entry => entry.slug === "github-copilot/copilot-wide-model");
+
+    expect(models.find(model => model.id === "copilot-wide-model")?.contextWindow).toBe(1_000_000);
+    expect(routed?.context_window).toBe(1_000_000);
+    expect(routed?.max_context_window).toBe(1_000_000);
+    expect(routed?.auto_compact_token_limit).toBe(900_000);
+    expect(models.find(model => model.id === "copilot-existing-metadata")?.contextWindow).toBe(256_000);
+    expect(models.find(model => model.id === "copilot-invalid-window")?.contextWindow).toBeUndefined();
+  });
+
   test("liveModels false preserves configured catalog metadata without live fetch", async () => {
     let fetchCalls = 0;
     globalThis.fetch = (() => {
@@ -5142,7 +5723,9 @@ describe("Codex catalog routed normalization", () => {
     expect(models.find(m => m.id === "wide-model")).toMatchObject({
       contextWindow: 100_000,
       maxInputTokens: 100_000,
-      inputModalities: ["text"],
+      // Declared text-only modalities are sidecar-covered at runtime (isModelTextOnly),
+      // so the catalog advertises image on top of the configured base.
+      inputModalities: ["text", "image"],
     });
     expect(models.find(m => m.id === "small-model")?.contextWindow).toBe(64_000);
   });
@@ -5350,6 +5933,7 @@ describe("OpenAI API trusted catalog augmentation", () => {
     expect(rows.find(row => row.provider === "openai-apikey" && row.id === "gpt-5.6-sol")).toMatchObject({
       contextWindow: 1_050_000,
       maxInputTokens: 922_000,
+      maxOutputTokens: 128_000,
       inputModalities: ["text", "image"],
       reasoningEfforts: ["low", "medium", "high", "xhigh", "max"],
     });
@@ -5383,6 +5967,7 @@ describe("OpenAI API trusted catalog augmentation", () => {
         expect(row).toMatchObject({
           contextWindow: 1_050_000,
           maxInputTokens: 922_000,
+          maxOutputTokens: 128_000,
           inputModalities: ["text", "image"],
           reasoningEfforts: ["low", "medium", "high", "xhigh", "max"],
         });
@@ -5485,7 +6070,8 @@ describe("OpenAI API trusted catalog augmentation", () => {
     try {
       const equalDifferentOrder = {
         provider: "openai-apikey", id: "gpt-5.6-sol", contextWindow: 1_050_000, maxInputTokens: 922_000,
-        inputModalities: ["image", "text", "image"], reasoningEfforts: ["max", "low", "xhigh", "medium", "high", "low"], owned_by: "openai-apikey",
+        maxOutputTokens: 128_000, inputModalities: ["image", "text", "image"],
+        reasoningEfforts: ["max", "low", "xhigh", "medium", "high", "low"], owned_by: "openai-apikey",
       };
       augmentRoutedModelsWithRegistryOpenAiApiRows([equalDifferentOrder], openAiApiCatalogConfig());
       expect(warn).not.toHaveBeenCalled();
@@ -5861,5 +6447,148 @@ describe("#2465 model preset management routes", () => {
     };
     const { status } = await call(config, "PUT", { provider: "groq", mode: "preset" });
     expect(status).toBe(400);
+  });
+});
+
+/**
+ * #2813: a Reserve-shaped row injected by the Codex client carries `base_instructions`,
+ * so the permissive selector would let it become the template every routed model clones
+ * from. Template selection has to be strict — but catalog VALIDITY must stay permissive,
+ * or a catalog holding only a newly launched native model gets replaced by stale data.
+ * Plan review rejected restricting the shared function for exactly that reason.
+ */
+describe("routed template selection is strict, catalog validity is not", () => {
+  const unknownBareRow = (): Record<string, unknown> => ({
+    slug: "gpt-reserve",
+    display_name: "Luna Reserve",
+    description: "Reserve fallback",
+    visibility: "list",
+    base_instructions: "You are Codex.",
+    available_in_plans: ["reserve"],
+    supported_in_api: false,
+  });
+
+  test("the strict selector skips an unknown row ordered before a known one", () => {
+    // The unknown row is FIRST, so a first-match implementation would pick it.
+    const catalog = { models: [unknownBareRow(), nativeTemplate()] } as never;
+
+    expect(findSupportedNativeTemplate(catalog)?.slug).toBe("gpt-5.5");
+  });
+
+  test("the strict selector returns null rather than inheriting from an unknown row", () => {
+    const catalog = { models: [unknownBareRow()] } as never;
+
+    expect(findSupportedNativeTemplate(catalog)).toBeNull();
+  });
+
+  // The regression guard for the rejected fix: if this ever goes red, catalog validity
+  // has been narrowed and a new upstream model can invalidate a healthy catalog.
+  test("the permissive selector still accepts an unknown row, so validity stays forward-compatible", () => {
+    const catalog = { models: [unknownBareRow()] } as never;
+
+    expect(findNativeTemplate(catalog)?.slug).toBe("gpt-reserve");
+  });
+});
+
+/**
+ * Each eligibility field is asserted through `ensureStrictCatalogFields` DIRECTLY.
+ * Review found the build path cannot prove them: `deriveEntry` already neutralizes
+ * `upgrade` and `availability_nux` on its own, so a build-path assertion stays green
+ * after the corresponding sanitizer line is deleted.
+ */
+describe("routed rows never carry native eligibility metadata", () => {
+  const contaminated = (): Record<string, unknown> => ({
+    slug: "anthropic/claude-sonnet-5",
+    display_name: "claude-sonnet-5",
+    supported_in_api: false,
+    available_in_plans: ["reserve", "plus"],
+    minimal_client_version: "999.0.0",
+    availability_nux: { message: "reserve only" },
+    upgrade: { message: "subscribe" },
+  });
+
+  test("supported_in_api is forced true", () => {
+    const entry = ensureStrictCatalogFields(contaminated() as never, { isRouted: true });
+
+    expect(entry.supported_in_api).toBe(true);
+  });
+
+  test("available_in_plans is stripped", () => {
+    expect(ensureStrictCatalogFields(contaminated() as never, { isRouted: true }))
+      .not.toHaveProperty("available_in_plans");
+  });
+
+  test("minimal_client_version is stripped", () => {
+    expect(ensureStrictCatalogFields(contaminated() as never, { isRouted: true }))
+      .not.toHaveProperty("minimal_client_version");
+  });
+
+  test("availability_nux is stripped", () => {
+    expect(ensureStrictCatalogFields(contaminated() as never, { isRouted: true }))
+      .not.toHaveProperty("availability_nux");
+  });
+
+  test("upgrade is stripped", () => {
+    expect(ensureStrictCatalogFields(contaminated() as never, { isRouted: true }))
+      .not.toHaveProperty("upgrade");
+  });
+
+  // Routed-only. Native rows legitimately carry availability_nux and plan eligibility;
+  // sanitizing them here would corrupt the native picker.
+  test("a native row keeps its own eligibility metadata", () => {
+    const native = ensureStrictCatalogFields(contaminated() as never, {});
+
+    expect(native.available_in_plans).toEqual(["reserve", "plus"]);
+    expect(native.availability_nux).toEqual({ message: "reserve only" });
+    expect(native.supported_in_api).toBe(false);
+  });
+
+  // Review blocker 3: preserved degraded/foreign rows never pass through
+  // normalizeRoutedCatalogEntry, so sanitizing only there would leave rows already on
+  // disk contaminated. Both paths end in ensureStrictCatalogFields, which is why it owns
+  // the sanitation.
+  test("the routed normalizer inherits the same guarantees", () => {
+    const entry = normalizeRoutedCatalogEntry(contaminated() as never);
+
+    expect(entry.supported_in_api).toBe(true);
+    expect(entry).not.toHaveProperty("available_in_plans");
+    expect(entry).not.toHaveProperty("minimal_client_version");
+    expect(entry).not.toHaveProperty("availability_nux");
+    expect(entry).not.toHaveProperty("upgrade");
+  });
+});
+
+describe("Codex 0.151 catalog contract fields", () => {
+  test("legacy shell types canonicalize while disabled remains disabled", () => {
+    const normalizedLegacy = ["default", "local", "shell_command"].map(shell_type =>
+      ensureStrictCatalogFields({ slug: "test", shell_type }).shell_type);
+
+    expect(normalizedLegacy).toEqual(["unified_exec", "unified_exec", "unified_exec"]);
+    expect(ensureStrictCatalogFields({ slug: "test", shell_type: "disabled" }).shell_type)
+      .toBe("disabled");
+  });
+
+  test("missing booleans receive serde defaults", () => {
+    expect(ensureStrictCatalogFields({ slug: "test" })).toMatchObject({
+      node_repl_disabled: false,
+      node_repl_auto_review_required: false,
+      include_plugin_usage_instructions: false,
+      include_apps_usage_instructions: true,
+    });
+  });
+
+  test("explicit per-model booleans are never overwritten by defaults", () => {
+    expect(ensureStrictCatalogFields({
+      slug: "test",
+      node_repl_disabled: true,
+      node_repl_auto_review_required: true,
+      include_plugin_usage_instructions: true,
+      include_apps_usage_instructions: false,
+    })).toMatchObject({
+      node_repl_disabled: true,
+      node_repl_auto_review_required: true,
+      include_plugin_usage_instructions: true,
+      include_apps_usage_instructions: false,
+    });
   });
 });

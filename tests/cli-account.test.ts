@@ -1,6 +1,6 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { PassThrough, Readable } from "node:stream";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -21,6 +21,7 @@ import {
 } from "../gui/src/account-priority";
 import type { OcxConfig } from "../src/types";
 import { ACCOUNT_IMPORT_MAX_BYTES } from "../src/oauth/account-import";
+import { removeTreeWithRetry } from "./helpers/remove-tree";
 
 const RAW_SENTINEL = "test-key-rawsentinel1234567890";
 const MASKED_SENTINEL = "test****7890";
@@ -589,12 +590,15 @@ describe("ocx account CLI (issue #180 matrix)", () => {
     expect(machine.output).not.toContain(RAW_SENTINEL);
   });
 
-  test("12: list kiro prints the single-slot replacement note", async () => {
+  test("12: list kiro does not claim a single login slot", async () => {
+    // Kiro pools multiple accounts since d82b3049d (quota-aware ranking + 429 rotation), so
+    // the old replacement-style note contradicted the runtime. Asserting its ABSENCE is what
+    // keeps the CLI and the docs from drifting apart again.
     const result = await run(["list", "kiro"]);
 
     expect(result.code).toBe(0);
-    expect(result.stdout).toContain("single login slot");
-    expect(result.stdout).toContain("re-login replaces the current account");
+    expect(result.stdout).not.toContain("single login slot");
+    expect(result.stdout).not.toContain("re-login replaces the current account");
   });
 
   test("13: bare account and use without an id return usage errors", async () => {
@@ -789,7 +793,7 @@ describe("ocx account CLI (issue #180 matrix)", () => {
     const missingProvider = await run(["auto-switch"]);
 
     expect(wrongProvider.code).toBe(1);
-    expect(wrongProvider.stderr).toContain("auto-switch only applies to the openai Codex account pool");
+    expect(wrongProvider.stderr).toContain("auto-switch only applies to the openai Codex account pool or a generic OAuth provider pool");
     expect(invalidThreshold.code).toBe(1);
     expect(invalidThreshold.stderr).toContain("integer 0-100");
     expect(missingProvider.code).toBe(1);
@@ -1680,7 +1684,7 @@ describe("ocx account CLI (issue #180 matrix)", () => {
       expect(file.stdout).toContain("1 imported, 0 updated, 0 failed");
       expect(file.output).not.toContain(canary);
     } finally {
-      rmSync(directory, { recursive: true, force: true });
+      removeTreeWithRetry(directory);
     }
 
     const beforeOversized = requests.length;

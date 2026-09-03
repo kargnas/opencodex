@@ -12,7 +12,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ClientPathError, mcodeConfigPath, LOOPBACK_API_KEY_PLACEHOLDER } from "../clients/config-export";
-import { loadConfig } from "../config";
+import { getRuntimeDir, loadConfig } from "../config";
 import { clearableDeadline } from "../lib/abort";
 import { withProcessRuntimeProvenance } from "../lib/bun-runtime";
 import { selfLaunchArgv } from "../lib/self-launch-argv";
@@ -265,7 +265,10 @@ async function ensureProxy(config: OcxConfig): Promise<LiveProxy | null> {
   const live = usableMinimaxLiveProxy(await findLiveProxy());
   if (live) return live;
   const pinPort = typeof config.port === "number" && config.port > 0 ? config.port : 10100;
-  const child = spawn(process.execPath, selfLaunchArgv(["start", "--port", String(pinPort)]), {
+  const startArgs = ["start", "--port", String(pinPort)];
+  const runtimeDir = getRuntimeDir();
+  if (runtimeDir) startArgs.push("--runtime-dir", runtimeDir);
+  const child = spawn(process.execPath, selfLaunchArgv(startArgs), {
     detached: true,
     stdio: "ignore",
     windowsHide: true,

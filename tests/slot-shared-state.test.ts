@@ -26,6 +26,19 @@ const configUrl = pathToFileURL(join(import.meta.dir, "../src/config.ts")).href;
 const oauthUrl = pathToFileURL(join(import.meta.dir, "../src/oauth/store.ts")).href;
 const usageUrl = pathToFileURL(join(import.meta.dir, "../src/usage/log.ts")).href;
 
+test("detached restart callers forward the slot runtime directory", () => {
+  const sources = [
+    "../src/client/runtime.ts",
+    "../src/cli/minimax.ts",
+    "../src/update/job.ts",
+  ].map(path => readFileSync(join(import.meta.dir, path), "utf8"));
+  for (const source of sources) {
+    expect(source).toContain('startArgs.push("--runtime-dir", runtimeDir)');
+  }
+  const dispatch = readFileSync(join(import.meta.dir, "../src/cli/dispatch.ts"), "utf8");
+  expect(dispatch).toContain('setRuntimeDir(deps.args[5])');
+});
+
 beforeEach(() => {
   home = mkdtempSync(join(tmpdir(), "ocx-slot-shared-"));
   process.env.OPENCODEX_HOME = home;

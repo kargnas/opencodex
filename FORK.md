@@ -20,9 +20,9 @@ upstream을 주기적으로 merge해서 버전을 따라간다. upstream이 고�
   UI는 upstream v2.33.0의 #2530, #2534, #2540, #2543 구현을 그대로 사용한다.
 - `fix(codex): keep Darwin ps timestamps locale-independent` — macOS의 `/bin/ps lstart`
   출력을 `LC_ALL=C`로 고정해서 비영어 locale에서도 Codex 프로세스 시작 시각을 읽는다.
-- `fix(proxy): model discovery flavor + auth conflict` — `/v1/models`에서
-  anthropic/codex/openai flavor 경계를 명시하고, Bearer와 x-api-key 값이 다르면
-  우선순위 적용 전에 400으로 거부한다. OpenAI-compatible 목록의 native 행은
+- `fix(proxy): model discovery auth conflict + native namespace` — `/v1/models`에서
+  Bearer와 x-api-key 값이 다르면 우선순위 적용 전에 400으로 거부한다.
+  OpenAI-compatible 목록의 native 행은
   `openai/<id>` namespace를 유지한다 (bare slug는 Codex client_version 경로만).
 - `feat(runtime): slot-private lifecycle dir` — `--runtime-dir`로 pid/runtime-port만
   슬롯 전용 경로에 두고 OPENCODEX_HOME의 durable state는 공유한다. blue/green
@@ -34,6 +34,8 @@ upstream을 주기적으로 merge해서 버전을 따라간다. upstream이 고�
   리뷰 수정 — upstream `rebase/1487-ws-upstream` (#1558)으로 들어갔다.
 - `fix(quota): preserve additional quota windows` — upstream v2.35.0의 #2572로
   들어가 Codex WHAM·Anthropic 모델별 기간과 sparse refresh의 월간 기간을 보존한다.
+- `fix(proxy): model discovery flavor boundary` — upstream v2.41.0의 기존 통합 판정이
+  `client_version`을 Anthropic 표식보다 우선하므로 별도 helper와 단위 테스트를 제거했다.
 
 ## 동기화 이력
 
@@ -46,6 +48,9 @@ upstream을 주기적으로 merge해서 버전을 따라간다. upstream이 고�
 - 2026-08-29 — upstream `v2.35.0`을 병합했다. upstream의 OAuth login hint와
   process-state 분리를 채택하고, 명시적 OAuth 완료 판정·slot runtime·모델 discovery·
   quota window 패치를 새 구조에 맞춰 유지했다.
+- 2026-09-04 — upstream `v2.41.0`을 병합했다. upstream의 model discovery flavor 판정을
+  채택해 중복 helper를 제거하고, OAuth 완료 판정·Darwin locale·인증 충돌·native namespace·
+  slot runtime 패치를 새 client·MiniMax·GUI update worker 재시작 경로까지 유지했다.
 
 ## upstream 동기화 절차
 
